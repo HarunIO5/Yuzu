@@ -362,3 +362,50 @@ The `yuzu_inventory_stale_agents` freshness gauge is **not** yet extended to
 `device_ci` (it reads `SoftwareInventoryStore::count_stale_agents` only); the
 #1685 server-stamped `last_seen` is in place but its gauge consumer is a deferred
 follow-up (same as `app_perf`).
+
+### 2026-07-02 — blob contract v2: package-manager fields on `installed_software`
+
+The `installed_software` wire blob grows from 4 to **12 fields** per record, in
+this exact order (append-only; 0x1F between fields, 0x1E terminating a record):
+
+```
+name, version, publisher, install_date,
+kind, ecosystem, epoch, release, arch, signature_status, distro_id, distro_version
+```
+
+Motivation: the server-authoritative vulnerability-matching direction (ADR-0018)
+needs full EVR (`epoch:version-release`) + `arch` + the host's distro release for
+Lane-1 OVAL matching, and an honest `kind=app` discriminator for the Lane-3
+OS-native tail. The population contract is **honest-empty**: a field the
+ecosystem does not store is `''`, never synthesised (rpm = full NEVRA + PACKAGER
++ stored-tag signature status; deb = NEVRA + Maintainer + arch, installed AND
+held; apk = name/version/pkgrel; pacman = name/EVR; Windows/macOS = `kind=app`
+with name/version/publisher only; `distro_id`/`distro_version` from
+`/etc/os-release` stamped on every Linux row; `homebrew` is a reserved
+ecosystem value, not collected). `version` is now the upstream version with the
+release/revision split into its own field, and rpm `publisher` switches
+VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
+
+Mechanics:
+
+- The fields ride **inside** the `plugin_data["installed_software"]` blob — no
+  proto change, no gateway pb regen (§6 applies only to outer-envelope fields).
+- Collection is a new `installed_apps` action **`list_inventory`** (13-token
+  `inv|` rows); the operator-facing `list`/`query`/`list_per_user` output is a
+  stable contract and is byte-unchanged (rpm `list` keeps VENDOR).
+- Store: migration v5 adds the 8 columns as `TEXT NOT NULL DEFAULT ''`
+  (metadata-only on PG11+). REST/MCP rows carry all 12 fields.
+- Caps: unchanged (`kMaxEntries` 20k, `kMaxFieldLen` 1024, `kMaxBlobBytes`
+  3 MiB — a 20k-row v2 blob is ~2.8 MB, still under the 4 MiB gRPC ceiling).
+  The sync source passes a per-call **3.5 MiB** capture cap to
+  `LocalDispatcher` (the shared 2 MiB default would silently truncate — and
+  therefore cycle-skip — hosts above ~14k packages).
+- **One-time rekey herd (expected):** the hash reformats even when every new
+  field is empty, so each upgraded agent's first v2 report mismatches its stored
+  v1 hash → one `need_full` full resend per agent, phase-spread over the ~24 h
+  window, self-healing. Mixed-version windows settle into the bounded
+  ~2-RPC/day loop described in the "Known inherited property" paragraph above —
+  this change deliberately does NOT add a one-source compat hash; the raw-blob
+  hash / 1-byte format-version prefix remain the framework-wide follow-up.
+- The v1→v2 parse compatibility (a 4-field record reads with fields 5–12 empty)
+  is pinned by tests on both sides, as is the identical 12-field cross-pin hash.
