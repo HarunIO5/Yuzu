@@ -5,9 +5,19 @@
  *   "list"  — Lists all installed applications.
  *   "query" — Searches for a specific app by name (partial match).
  *             Params: name (required).
+ *   "list_inventory" — machine-scope software inventory for the daily sync
+ *             (blob contract v2, ADR-0016). Emits the extended 12-field rows;
+ *             fields an ecosystem does not store are EMPTY, never synthesised
+ *             (no "-" placeholders, no sentinel row on an empty result).
  *
  * Output is pipe-delimited, one record per line via write_output():
- *   app|name|version|publisher|install_date
+ *   app|name|version|publisher|install_date                       (list/query)
+ *   inv|name|version|publisher|install_date|kind|ecosystem|epoch|release|arch|
+ *       signature_status|distro_id|distro_version                 (list_inventory)
+ *
+ * `list`/`query`/`list_per_user` output is a stable operator-facing contract
+ * (content/definitions/installed_apps.yaml et al.) — extend `list_inventory`,
+ * never those.
  */
 
 #include <yuzu/plugin.hpp>
@@ -20,8 +30,16 @@
 #include <string_view>
 #include <vector>
 
+// Pure parse/format helpers for the list_inventory action (v2 rows). In a
+// header so the unit test exercises the same code (pattern: #1662).
+#include "installed_apps_inventory.hpp"
+
 #if defined(__linux__) || defined(__APPLE__)
 #include <sstream>
+#endif
+
+#ifdef __linux__
+#include <fstream>
 #endif
 
 #ifdef _WIN32
@@ -353,6 +371,130 @@ std::vector<AppInfo> get_installed_apps_macos() {
 }
 #endif
 
+// ── list_inventory collectors (blob contract v2) ──────────────────────────
+
+namespace inv = yuzu::installed_apps::inventory;
+
+#ifdef _WIN32
+std::vector<inv::InvRecord> get_inventory_windows() {
+    std::vector<inv::InvRecord> recs;
+    for (auto& app : get_installed_apps_windows()) {
+        inv::InvRecord r;
+        r.name = std::move(app.name);
+        r.version = std::move(app.version);
+        r.publisher = std::move(app.publisher);
+        r.install_date = std::move(app.install_date);
+        r.kind = "app";
+        r.ecosystem = "windows";
+        // epoch/release/signature honest-empty: the Uninstall hive stores no
+        // NEVRA and no signature. arch stays empty too — inferring x64/x86
+        // from which hive a key sat in would be synthesis, not storage.
+        recs.push_back(std::move(r));
+    }
+    return recs;
+}
+#endif
+
+#ifdef __linux__
+std::vector<inv::InvRecord> get_inventory_linux() {
+    std::vector<inv::InvRecord> recs;
+
+    const auto collect = [&recs](const char* cmd, auto parse_line) {
+        auto out = run_command(cmd);
+        std::istringstream ss(out);
+        std::string line;
+        while (std::getline(ss, line)) {
+            if (auto r = parse_line(line))
+                recs.push_back(std::move(*r));
+        }
+    };
+
+    if (command_exists("dpkg-query")) {
+        // ${db:Status-Status} keeps installed AND held packages (the legacy
+        // `list` filter "install ok installed" excludes held) — v2 spec.
+        collect("dpkg-query -W -f='${Package}\\t${db:Status-Status}\\t${Version}\\t"
+                "${Architecture}\\t${Maintainer}\\n' 2>/dev/null",
+                inv::parse_dpkg_inv_line);
+    } else if (command_exists("rpm")) {
+        // Signature comes from the STORED header tags (DSAHEADER/RSAHEADER/
+        // SIGGPG/SIGPGP presence) via queryformat conditionals — pure rpmdb
+        // formatting, never a live `rpm -K` verification. PACKAGER per the v2
+        // spec (`list` keeps VENDOR for its stable operator contract).
+        collect("rpm -qa --queryformat '%{NAME}\\t%{EPOCH}\\t%{VERSION}\\t%{RELEASE}\\t"
+                "%{ARCH}\\t%{PACKAGER}\\t%{INSTALLTIME:date}\\t"
+                "%|DSAHEADER?{signed}:{%|RSAHEADER?{signed}:{%|SIGGPG?{signed}:{"
+                "%|SIGPGP?{signed}:{unsigned}|}|}|}|\\n' 2>/dev/null",
+                inv::parse_rpm_inv_line);
+    } else if (command_exists("pacman")) {
+        collect("pacman -Q 2>/dev/null", inv::parse_pacman_inv_line);
+    } else if (command_exists("apk")) {
+        // Alpine — first apk enumeration on the sync path (the legacy `list`
+        // has no apk branch; precedent is vuln_scan's enumerator).
+        collect("apk info -v 2>/dev/null", inv::parse_apk_inv_line);
+    }
+
+    // Host-level distro identity, read once and stamped on every row (v2
+    // contract). Honest-empty when /etc/os-release is absent (minimal
+    // containers) or the keys are missing.
+    std::string osrel;
+    if (std::ifstream f{"/etc/os-release"}; f) {
+        std::ostringstream buf;
+        buf << f.rdbuf();
+        osrel = buf.str();
+    }
+    const std::string distro_id = inv::parse_os_release(osrel, "ID");
+    const std::string distro_version = inv::parse_os_release(osrel, "VERSION_ID");
+    for (auto& r : recs) {
+        r.distro_id = distro_id;
+        r.distro_version = distro_version;
+    }
+    return recs;
+}
+#endif
+
+#ifdef __APPLE__
+std::vector<inv::InvRecord> get_inventory_macos() {
+    std::vector<inv::InvRecord> recs;
+    for (auto& app : get_installed_apps_macos()) {
+        inv::InvRecord r;
+        r.name = std::move(app.name);
+        r.version = std::move(app.version);
+        // system_profiler mini exposes no publisher; the legacy collector
+        // stores a "-" placeholder which must NOT leak into v2 rows.
+        if (app.publisher != "-")
+            r.publisher = std::move(app.publisher);
+        r.install_date = std::move(app.install_date); // Last Modified
+        r.kind = "app";
+        r.ecosystem = "macos";
+        // "homebrew" stays a reserved ecosystem value: brew is per-user
+        // (list_per_user) and out of machine-scope this slice.
+        recs.push_back(std::move(r));
+    }
+    return recs;
+}
+#endif
+
+int do_list_inventory(yuzu::CommandContext& ctx) {
+#ifdef _WIN32
+    auto recs = get_inventory_windows();
+#elif defined(__linux__)
+    auto recs = get_inventory_linux();
+#elif defined(__APPLE__)
+    auto recs = get_inventory_macos();
+#else
+    std::vector<inv::InvRecord> recs;
+#endif
+
+    // No sentinel row: an empty result is empty output + rc 0. The sync
+    // source's empty-parse guard skips the cycle rather than wiping state.
+    for (const auto& r : recs) {
+        if (r.name.empty())
+            continue; // contract: row dropped if name is empty
+        ctx.write_output(sanitize_utf8(inv::format_inv_row(r)));
+    }
+    return 0;
+}
+
 // ── list action ───────────────────────────────────────────────────────────
 
 int do_list(yuzu::CommandContext& ctx) {
@@ -423,13 +565,13 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
 class InstalledAppsPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "installed_apps"; }
-    std::string_view version() const noexcept override { return "1.0.0"; }
+    std::string_view version() const noexcept override { return "1.1.0"; }
     std::string_view description() const noexcept override {
         return "Inventories installed applications and queries by name";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"list", "query", "list_per_user", nullptr};
+        static const char* acts[] = {"list", "query", "list_per_user", "list_inventory", nullptr};
         return acts;
     }
 
@@ -444,6 +586,8 @@ public:
             return do_query(ctx, params);
         if (action == "list_per_user")
             return do_list_per_user(ctx);
+        if (action == "list_inventory")
+            return do_list_inventory(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;
