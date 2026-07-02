@@ -3,6 +3,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <random>
 
@@ -125,7 +126,10 @@ void ScheduleEngine::create_tables() {
 }
 
 void ScheduleEngine::stop() {
-    // stub -- will stop the scheduler tick thread when implemented
+    // No engine-side resources to stop: the poller thread that drives
+    // evaluate_due/advance_schedule (#1191) is owned by ServerImpl
+    // (schedule_tick_thread_, joined in stop() before the stores), the same
+    // ownership shape as policy_eval_thread_ / preflight_runner_thread_.
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +182,12 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
     if (!is_valid_frequency(sched.frequency_type))
         return std::unexpected(
             "frequency_type must be one of: once, interval, daily, weekly, monthly");
+    // Floor guard: a 0/negative interval would compute next_execution_at ==
+    // now and, now that the ScheduleRunner poller drives evaluate_due
+    // (#1191), re-fire on every tick forever. advance_schedule clamps the
+    // same way for pre-floor legacy rows.
+    if (sched.frequency_type == "interval" && sched.interval_minutes < 1)
+        return std::unexpected("interval_minutes must be >= 1");
 
     auto id = sched.id.empty() ? generate_id() : sched.id;
     auto now = now_epoch();
@@ -325,7 +335,9 @@ void ScheduleEngine::advance_schedule(const std::string& id) {
     if (sched.frequency_type == "once") {
         next = 0; // disable after single execution
     } else if (sched.frequency_type == "interval") {
-        next = now + static_cast<int64_t>(sched.interval_minutes) * 60;
+        // Clamp legacy rows that predate the create-time floor: 0/negative
+        // would land next_execution_at <= now and re-fire every poller tick.
+        next = now + static_cast<int64_t>(std::max(sched.interval_minutes, 1)) * 60;
     } else if (sched.frequency_type == "daily") {
         next = now + 86400;
     } else if (sched.frequency_type == "weekly") {

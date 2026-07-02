@@ -303,6 +303,7 @@ yuzu_server_core_lib = static_library(
     'src/heartbeat_ingestion.cpp',
     'src/approval_manager.cpp',
     'src/schedule_engine.cpp',
+    'src/schedule_runner.cpp',
     'src/help_ui.cpp',
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',

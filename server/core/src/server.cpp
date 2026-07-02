@@ -91,6 +91,7 @@
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
+#include "schedule_runner.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
 #include "fleet_topology_store.hpp"
@@ -2974,6 +2975,15 @@ public:
             preflight_runner_thread_.join();
         }
         preflight_runner_.reset();
+
+        // Join the schedule tick thread (borrows schedule_engine_ + the
+        // instruction/execution/approval/audit stores via schedule_runner_ —
+        // must stop before any of them are torn down), then drop the runner
+        // so its borrowed pointers can't be ticked again.
+        if (schedule_tick_thread_.joinable()) {
+            schedule_tick_thread_.join();
+        }
+        schedule_runner_.reset();
 
         // Join the result-set maintenance thread (borrows result_set_store_,
         // execution_tracker_, response_store_ — must stop before teardown)
@@ -8550,6 +8560,61 @@ private:
             }
         });
 
+        // ScheduleRunner (#1191) — drives recurring-instruction schedules.
+        // ScheduleEngine::evaluate_due/advance_schedule had no production
+        // caller: schedules persisted and listed but never fired. Fires travel
+        // the same dispatch lambda as operator commands with tracked
+        // create-before-dispatch execution rows; approval-gated fires wait on
+        // the approvals queue (see schedule_runner.hpp). Joined BEFORE the
+        // stores in stop().
+        metrics_.describe("yuzu_schedule_fires_total",
+                          "Scheduled instruction occurrences dispatched successfully", "counter");
+        metrics_.describe("yuzu_schedule_fire_failures_total",
+                          "Scheduled occurrences skipped or failed (unknown/disabled definition, "
+                          "dispatch failure, no agents in scope, approval submit failure)",
+                          "counter");
+        metrics_.describe("yuzu_schedule_approvals_submitted_total",
+                          "Approval tickets submitted by the schedule runner for approval-gated "
+                          "occurrences",
+                          "counter");
+        metrics_.describe("yuzu_schedule_tick_errors_total",
+                          "Schedule runner tick() exceptions caught (alertable on sustained rate)",
+                          "counter");
+        schedule_runner_ = std::make_unique<ScheduleRunner>(ScheduleRunner::Deps{
+            .schedule_engine = schedule_engine_.get(),
+            .instruction_store = instruction_store_.get(),
+            .execution_tracker = execution_tracker_.get(),
+            .approval_manager = approval_manager_.get(),
+            .audit_store = audit_store_.get(),
+            .metrics = &metrics_,
+            .dispatch_fn = command_dispatch_fn,
+        });
+        schedule_tick_thread_ = std::thread([this]() {
+            spdlog::info("Schedule runner thread started (cadence=30s)");
+            while (!stop_requested_.load(std::memory_order_acquire)) {
+                for (int i = 0; i < 6 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
+                if (schedule_runner_) {
+                    // tick() touches SQLite and gRPC dispatch — either can
+                    // throw, and an exception escaping a std::thread entry
+                    // calls std::terminate, so one bad schedule must not take
+                    // the process. Catch, log, keep ticking.
+                    try {
+                        schedule_runner_->tick();
+                    } catch (const std::exception& e) {
+                        metrics_.counter("yuzu_schedule_tick_errors_total").increment();
+                        spdlog::error("schedule_runner: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        metrics_.counter("yuzu_schedule_tick_errors_total").increment();
+                        spdlog::error("schedule_runner: tick threw unknown exception — continuing");
+                    }
+                }
+            }
+        });
+
         // Result-set maintenance thread (capability §30) — materialises pending
         // result sets once their producing execution reaches a terminal state,
         // runs the GC sweep on a ~5-minute cadence, and refreshes the alive
@@ -10412,6 +10477,7 @@ private:
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;
     std::unique_ptr<PreflightRunner> preflight_runner_; // borrows run+response stores
+    std::unique_ptr<ScheduleRunner> schedule_runner_;   // borrows engine + stores (#1191)
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
     std::unique_ptr<BaselineStore> baseline_store_;
     std::unique_ptr<CaStore> ca_store_;
@@ -10561,6 +10627,7 @@ private:
     std::thread policy_eval_thread_;
     std::thread app_perf_rollup_thread_;
     std::thread preflight_runner_thread_; // joined before stores in stop()
+    std::thread schedule_tick_thread_;    // drives ScheduleRunner (#1191); joined before stores
     std::thread result_set_maint_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
