@@ -3650,6 +3650,11 @@ TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's group
     // In-scope device present; out-of-scope device filtered OUT (cross-operator isolation).
     CHECK(res->body.find("agent-in") != std::string::npos);
     CHECK(res->body.find("agent-out") == std::string::npos);
+    // Blob-v2 fields ride on every row — present even for a v1-shaped entry
+    // (empty strings, honest-empty contract).
+    CHECK(res->body.find("\\\"ecosystem\\\"") != std::string::npos);
+    CHECK(res->body.find("\\\"signature_status\\\"") != std::string::npos);
+    CHECK(res->body.find("\\\"distro_version\\\"") != std::string::npos);
     // The drop is audited distinctly as a denied event, alongside the success row.
     bool saw_denied = false, saw_success = false;
     for (const auto& a : ts.audit_log) {
