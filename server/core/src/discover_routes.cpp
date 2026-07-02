@@ -280,15 +280,28 @@ DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& ag
     int enriched = 0;
     if (instruction_store) {
         std::unordered_map<std::string, json> schema_by_action;
-        InstructionQuery q;
-        q.enabled_only = true;
-        q.limit = 5000;
-        for (const auto& d : instruction_store->query_definitions(q)) {
-            if (d.plugin.empty() || d.action.empty())
-                continue;
-            auto parsed = json::parse(d.parameter_schema, nullptr, /*allow_exceptions=*/false);
-            if (!parsed.is_discarded())
-                schema_by_action.emplace(d.plugin + "\x01" + d.action, std::move(parsed));
+        // Enrichment is BEST-EFFORT: a store read that throws (SQLite/PG error)
+        // degrades to name+description only rather than failing the whole catalog,
+        // so the MCP tool path — which has no route-level try/catch — cannot 500
+        // on it (UP-6). query_definitions returns {} on a closed handle without
+        // throwing; this guards the genuine-error case.
+        try {
+            InstructionQuery q;
+            q.enabled_only = true;
+            q.limit = 5000;
+            for (const auto& d : instruction_store->query_definitions(q)) {
+                if (d.plugin.empty() || d.action.empty())
+                    continue;
+                auto parsed = json::parse(d.parameter_schema, nullptr, /*allow_exceptions=*/false);
+                // Attach only an OBJECT schema — a stored value that parses to
+                // null/number/array/string is not a usable JSON Schema (UP-9).
+                if (!parsed.is_discarded() && parsed.is_object())
+                    schema_by_action.emplace(d.plugin + "\x01" + d.action, std::move(parsed));
+            }
+        } catch (const std::exception& ex) {
+            spdlog::warn("discover/plugins: enrichment skipped — instruction read failed: {}",
+                         ex.what());
+            schema_by_action.clear();
         }
         if (plugins.is_array()) {
             for (auto& p : plugins) {
@@ -349,7 +362,8 @@ void discover_503(httplib::Response& res, std::string_view message) {
                     "application/json");
 }
 
-void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::PermFn perm_fn, RbacStore* rbac_store,
+void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
+                      DiscoverRoutes::PermFn perm_fn, RbacStore* rbac_store,
                       InstructionStore* instruction_store,
                       yuzu::server::detail::AgentRegistry* agent_registry) {
     sink.Get("/api/v1/discover/permissions",
@@ -402,7 +416,7 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::PermFn perm_fn, RbacS
              });
 
     sink.Get("/api/v1/discover/plugins",
-             [perm_fn, agent_registry,
+             [auth_fn, perm_fn, rbac_store, agent_registry,
               instruction_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Read"))
                      return;
@@ -410,8 +424,22 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::PermFn perm_fn, RbacS
                      discover_503(res, "discovery store unavailable");
                      return;
                  }
+                 // Least-privilege (gov Gate 2 security-guardian MEDIUM / UP-7):
+                 // parameter_schema is InstructionDefinition:Read content (what
+                 // /discover/instructions gates on). Enrich only when the caller
+                 // also holds that grant — a soft, audit-free rbac check (throwaway
+                 // Response absorbs any auth deny-write). Otherwise the nullptr
+                 // path serves the name+description catalog. Mirrors the MCP tool.
+                 InstructionStore* enrich = nullptr;
+                 if (auth_fn && rbac_store && rbac_store->is_open()) {
+                     httplib::Response probe;
+                     if (auto sess = auth_fn(req, probe);
+                         sess && rbac_store->check_permission(sess->username,
+                                                              "InstructionDefinition", "Read"))
+                         enrich = instruction_store;
+                 }
                  try {
-                     serve_doc(req, res, build_plugins_catalog(*agent_registry, instruction_store));
+                     serve_doc(req, res, build_plugins_catalog(*agent_registry, enrich));
                  } catch (const std::exception&) {
                      discover_503(res, "discovery store read failed");
                  }
@@ -420,17 +448,19 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::PermFn perm_fn, RbacS
 
 } // namespace
 
-void DiscoverRoutes::register_routes(httplib::Server& svr, PermFn perm_fn, RbacStore* rbac_store,
-                                     InstructionStore* instruction_store,
+void DiscoverRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
+                                     RbacStore* rbac_store, InstructionStore* instruction_store,
                                      yuzu::server::detail::AgentRegistry* agent_registry) {
     HttplibRouteSink sink(svr);
-    register_on_sink(sink, std::move(perm_fn), rbac_store, instruction_store, agent_registry);
+    register_on_sink(sink, std::move(auth_fn), std::move(perm_fn), rbac_store, instruction_store,
+                     agent_registry);
 }
 
-void DiscoverRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, RbacStore* rbac_store,
-                                     InstructionStore* instruction_store,
+void DiscoverRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
+                                     RbacStore* rbac_store, InstructionStore* instruction_store,
                                      yuzu::server::detail::AgentRegistry* agent_registry) {
-    register_on_sink(sink, std::move(perm_fn), rbac_store, instruction_store, agent_registry);
+    register_on_sink(sink, std::move(auth_fn), std::move(perm_fn), rbac_store, instruction_store,
+                     agent_registry);
 }
 
 } // namespace yuzu::server

@@ -4952,7 +4952,20 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto doc = yuzu::server::build_plugins_catalog(*agent_registry, instruction_store);
+                // Least-privilege (gov Gate 2 security-guardian MEDIUM / UP-7):
+                // parameter_schema enrichment is InstructionDefinition:Read
+                // content (the same data /discover/instructions gates on that
+                // grant). Attach it only when the caller actually holds that
+                // grant; otherwise serve the name+description catalog (the
+                // nullptr path). Mirrors the REST /discover/plugins gate so the
+                // two surfaces cannot diverge.
+                InstructionStore* enrich_store =
+                    (rbac_store && rbac_store->is_open() && session &&
+                     rbac_store->check_permission(session->username, "InstructionDefinition",
+                                                  "Read"))
+                        ? instruction_store
+                        : nullptr;
+                auto doc = yuzu::server::build_plugins_catalog(*agent_registry, enrich_store);
                 auto result = tool_result(doc.json, kObjectOutputSchema);
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");

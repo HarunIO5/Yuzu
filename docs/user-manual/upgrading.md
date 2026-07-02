@@ -108,6 +108,32 @@ the match to `-32004` and leave `-32006` reserved for the future Phase 2 envelop
 `docs/user-manual/mcp.md` → "-32004: Tier denied (including approval-gated operations)").
 `operator`-tier executions are auto-approved and are unaffected.
 
+## Behaviour change: `POST /api/v1/tokens` now honors `mcp_tier`
+
+The token-mint endpoint now applies the `mcp_tier` field from the request body
+(`readonly` / `operator` / `supervised`). Previous releases **silently dropped**
+it: a token requested with an `mcp_tier` was stored **tier-empty** (RBAC-deferred),
+which means it was *over-privileged* relative to the tier the operator intended —
+a `readonly` request behaved as a full RBAC-scoped token, not a read-only MCP
+token. The endpoint also now validates at mint time: an unrecognised tier, or a
+tiered/service-scoped token whose `expires_at` is missing or more than 90 days
+out, returns `400` (previous releases returned a misleading `503`).
+
+**Who this affects:** any operator who minted an MCP token via `POST /api/v1/tokens`
+**before** this upgrade and relied on the `mcp_tier` to constrain it. Those tokens
+are still tier-empty and therefore broader than the requested tier.
+
+**Remediate:** **rotate any pre-upgrade `mcp_tier` tokens** — revoke the old token
+(`DELETE /api/v1/tokens/{id}`) and re-mint it; the new token stores the tier and is
+constrained as intended. Tokens minted with no `mcp_tier` are unaffected.
+
+**Additive (no operator action required):** the `discover_plugins` discovery response
+(REST `GET /api/v1/discover/plugins` and the MCP tool) is now `version: 2` — it adds an
+inline `parameter_schema` per action (where a published `InstructionDefinition` exists and
+the caller holds `InstructionDefinition:Read`) plus a top-level `actions_enriched_with_schema`
+count. The change is purely additive; any client that pinned `version == 1` should relax the
+check to a minimum (`>= 1`).
+
 ## ⚠️ Breaking: `--mfa-enforcement` now enforces
 
 Releases before this one accepted `--mfa-enforcement=admin-only` and

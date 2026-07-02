@@ -30,15 +30,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `discover_plugins` tool descriptions now spell out the async dispatch→poll pattern and
   point at the `yuzu://operating-model` resource. Measured effect: an LLM operator
   driving the fleet with no hand-fed action list made zero blind parameter guesses.
-
-### Fixed
-
-- **`POST /api/v1/tokens` now honors `mcp_tier`.** The handler documented (and
-  `create_token` already accepted) an `mcp_tier` field but silently dropped it, so a
-  requested MCP token was minted with the empty (RBAC-defer) tier — defeating
-  self-service MCP-token provisioning. The field is now passed through and validated
-  against the closed tier set (`readonly`/`operator`/`supervised`, or omitted); an
-  unrecognised value is a 400 rather than a silent privilege surprise.
 - **A4 error-envelope completion (R2).** `GET /api/v1/approvals/{id}` (the approval
   `status_url` target); the `auth_routes` denial shapes are unified into one A4
   envelope carrying `correlation_id` and the missing `securable_type:operation`; the
@@ -122,6 +113,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Upgrade note:** the `tar.purge_source` action requires an agent at this release or later; an older
   agent returns `error|unknown action: purge_source` (it does not crash), but because dispatch is
   fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome with a fresh Scan.
+
+### Fixed
+
+- **`POST /api/v1/tokens` now honors `mcp_tier`.** The handler documented (and
+  `create_token` already accepted) an `mcp_tier` field but silently dropped it, so a
+  requested MCP token was minted with the empty (RBAC-defer) tier — defeating
+  self-service MCP-token provisioning. The field is now passed through and validated
+  against the closed tier set (`readonly`/`operator`/`supervised`, or omitted); an
+  unrecognised value is a 400. A tiered/service-scoped token missing `expires_at` (or
+  over the 90-day cap) now returns a `400` instead of a misleading `503` "CSPRNG
+  unavailable" that false-paged on-call and wrote a false entropy-failure audit row.
+  The granted `mcp_tier` is recorded in the `api_token.create` audit and echoed by
+  `GET /api/v1/tokens`. **Upgrade note:** any MCP token minted before this fix was
+  stored tier-empty (RBAC-deferred = over-privileged vs intent) — rotate pre-upgrade
+  `mcp_tier` tokens (see `docs/user-manual/upgrading.md`).
 
 ## [0.13.0] - 2026-07-01
 

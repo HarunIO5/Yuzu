@@ -9739,7 +9739,7 @@ private:
         // AuditFn: these are catalog/schema reads, not per-device PII — matches the
         // GET /guaranteed-state/schemas precedent this module is modeled on.
         discover_routes_ = std::make_unique<DiscoverRoutes>();
-        discover_routes_->register_routes(*web_server_, perm_fn, rbac_store_.get(),
+        discover_routes_->register_routes(*web_server_, auth_fn, perm_fn, rbac_store_.get(),
                                           instruction_store_.get(), &registry_);
 
         // DEX app-perf-over-time read providers (slice 2). One bundle of B1/B2

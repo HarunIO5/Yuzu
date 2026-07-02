@@ -4,6 +4,7 @@
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
+#include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
 #include "guardian_rule_spec.hpp"
@@ -1773,6 +1774,11 @@ void RestApiV1::register_routes(
                          .add("revoked", t.revoked);
                      if (!t.scope_service.empty())
                          item.add("scope_service", t.scope_service);
+                     // Echo the MCP tier so an operator can verify what they
+                     // minted (authdb Q3 / consistency #6 — the field is settable
+                     // now, so it must be readable back).
+                     if (!t.mcp_tier.empty())
+                         item.add("mcp_tier", t.mcp_tier);
                      arr.add(item);
                  }
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens.size())),
@@ -1810,13 +1816,40 @@ void RestApiV1::register_routes(
         // typo can't mint an unrecognised tier (which tier_allows would treat as
         // "defer to RBAC" — a silent privilege surprise).
         auto mcp_tier = body.value("mcp_tier", "");
-        if (mcp_tier != "" && mcp_tier != "readonly" && mcp_tier != "operator" &&
-            mcp_tier != "supervised") {
+        if (!mcp_tier.empty() && !mcp::is_valid_tier(mcp_tier)) {
             res.status = 400;
             res.set_content(detail::a4_error(res, "invalid mcp_tier: must be one of readonly, "
                                                   "operator, supervised (or omitted)"),
                             "application/json");
             return;
+        }
+        // A token carrying an MCP tier or a service scope MUST have an expiration
+        // (create_token enforces this + a 90-day cap). Pre-validate here so a
+        // routine client omission / over-long TTL returns a clean 400 instead of
+        // falling through to the shared `!result` branch below, which is
+        // CSPRNG-failure-ONLY: it would 503, false-page on-call via
+        // yuzu_secure_random_failure_total, and write a false `csprng_unavailable`
+        // SOC-2 audit row for a plain input error (gov Gate: security-guardian /
+        // authdb / compliance / consistency / enterprise / happy+unhappy-path).
+        // Mirrors create_token's two expiry rules; the full de-duplication (a
+        // discriminable create_token error) is the tracked typed-error follow-up.
+        if (!mcp_tier.empty() || !scope_service.empty()) {
+            if (expires_at <= 0) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "expires_at is required for an MCP-tier or "
+                                                      "service-scoped token"),
+                                "application/json");
+                return;
+            }
+            if (!mcp_tier.empty()) {
+                const int64_t now = static_cast<int64_t>(std::time(nullptr));
+                if (expires_at - now > 90LL * 24 * 3600) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "MCP token TTL cannot exceed 90 days"),
+                                    "application/json");
+                    return;
+                }
+            }
         }
 
         // UP-H2 (gov Gate 4, unhappy-path): clamp user-controlled string
@@ -1935,7 +1968,13 @@ void RestApiV1::register_routes(
             res.set_content(envelope.str(), "application/json");
             return;
         }
-        auto detail = scope_service.empty() ? "" : "scope_service=" + scope_service;
+        // Record the granted MCP tier in the create audit — it is the privilege
+        // boundary of the credential, and a SOC-2 CC6.1/6.2 access review must be
+        // answerable from durable evidence, not the mutable api_tokens table
+        // (gov Gate 6 compliance HIGH; authdb Q4 / consistency #6).
+        std::string detail = "mcp_tier=" + (mcp_tier.empty() ? std::string("none") : mcp_tier);
+        if (!scope_service.empty())
+            detail += "; scope_service=" + scope_service;
         // Success-path audit fire-and-forget — bool intentionally discarded
         // because the response is 201 Created regardless; if the audit row
         // fails to persist, the AuditStore::emit_failed_ counter still

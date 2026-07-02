@@ -639,6 +639,16 @@ Create a new API token. The raw token is returned in the response and is never s
 | `expires_at` | integer | No | Unix epoch seconds. `0` or omitted = never expires. **Required** for MCP tokens (max 90 days). |
 | `mcp_tier` | string | No | MCP authorization tier: `"readonly"`, `"operator"`, or `"supervised"`. Omit for standard API tokens. When set, `expires_at` is mandatory. |
 
+`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at` within the 90-day cap.
+
+**Validation errors (`400`):**
+
+| Condition | Response |
+|---|---|
+| `mcp_tier` is not one of `readonly` / `operator` / `supervised` | `400` — `invalid mcp_tier: must be one of readonly, operator, supervised (or omitted)` |
+| `mcp_tier` set (or `scope_service` set) but `expires_at` omitted / `≤ 0` | `400` — `expires_at is required for an MCP-tier or service-scoped token` |
+| `mcp_tier` set and `expires_at` is more than 90 days out | `400` — `MCP token TTL cannot exceed 90 days` |
+
 **Response (201):**
 
 ```json
@@ -2681,17 +2691,22 @@ Plugin/action catalog observed across currently-connected agents (deduplicated b
 **Response:**
 ```json
 {
-  "version": 1,
+  "version": 2,
   "description": "Plugin/action catalog observed across currently-connected agents ...",
-  "limitation": "Action PARAMETER schemas are NOT available here: agents report bare action names + a human description only, no per-action JSON Schema. See GET /discover/instructions for the subset of actions that also have a published InstructionDefinition with parameter_schema.",
+  "limitation": "An action carries an inline parameter_schema only when it has a published InstructionDefinition (matched on plugin+action) AND the caller holds InstructionDefinition:Read; otherwise name+description only. GET /api/v1/discover/instructions is the full schema-bearing catalog.",
+  "actions_enriched_with_schema": 1,
   "plugins": [
-    {"name": "processes", "version": "1.0", "description": "...", "actions": [{"name": "list", "description": "..."}]}
+    {"name": "processes", "version": "1.0", "description": "...", "actions": [
+      {"name": "list", "description": "...", "parameter_schema": {"type": "object", "properties": {}}}
+    ]}
   ],
   "commands": ["processes", "processes list", "..."]
 }
 ```
 
-Read the `limitation` field: per-action parameter schemas are not available from this endpoint — cross-reference `/discover/instructions` for the subset of actions with a published `InstructionDefinition`.
+An action carries an inline `parameter_schema` **only** when it has a published `InstructionDefinition` (matched on plugin + action) **and** the caller holds `InstructionDefinition:Read`; a caller with only `Infrastructure:Read` gets each action's `name` + `description` and no schema. The top-level `actions_enriched_with_schema` counts how many actions were enriched. For the complete schema-bearing catalog, use [`GET /api/v1/discover/instructions`](#get-apiv1discoverinstructions).
+
+> **Consumer note:** this catalog is now `"version": 2` (was `1` — v2 adds the inline `parameter_schema` and top-level `actions_enriched_with_schema` fields). The revision is additive; treat `version` as a **minimum** (`>= 1`), not `== 1`, so future additive revisions do not break your client.
 
 ---
 

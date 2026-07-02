@@ -37,6 +37,8 @@
 #include "rbac_store.hpp"
 #include "scope_engine.hpp"
 
+#include <yuzu/server/auth.hpp> // auth::Session for AuthFn (least-privilege enrichment gate)
+
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -129,14 +131,20 @@ public:
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
+    /// Resolves the caller's session (no deny-write on the real response). Used
+    /// ONLY to gate `/discover/plugins` parameter_schema enrichment on the
+    /// caller's InstructionDefinition:Read grant (security-guardian MEDIUM) — a
+    /// soft, audit-free check, so it takes a throwaway Response internally.
+    using AuthFn =
+        std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
 
     /// Production overload — wraps `svr` in an HttplibRouteSink and delegates.
-    void register_routes(httplib::Server& svr, PermFn perm_fn, RbacStore* rbac_store,
+    void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, RbacStore* rbac_store,
                          InstructionStore* instruction_store,
                          yuzu::server::detail::AgentRegistry* agent_registry);
 
     /// Testable overload — register against an in-process sink (no socket).
-    void register_routes(HttpRouteSink& sink, PermFn perm_fn, RbacStore* rbac_store,
+    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, RbacStore* rbac_store,
                          InstructionStore* instruction_store,
                          yuzu::server::detail::AgentRegistry* agent_registry);
 };

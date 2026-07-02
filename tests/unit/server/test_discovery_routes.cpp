@@ -70,11 +70,28 @@ struct DiscoverHarness {
     // wire_rbac / wire_instr / wire_registry = false registers the route with a
     // null store/registry pointer, exercising the 503 degrade branch.
     explicit DiscoverHarness(bool wire_rbac = true, bool wire_instr = true,
-                             bool wire_registry = true) {
+                             bool wire_registry = true, bool grant_instr_read = false) {
         rbac = std::make_unique<RbacStore>(":memory:");
         REQUIRE(rbac->is_open());
         instr = std::make_unique<InstructionStore>(":memory:");
         REQUIRE(instr->is_open());
+
+        // The /discover/plugins parameter_schema enrichment is gated on the
+        // caller's InstructionDefinition:Read grant (security-guardian MEDIUM).
+        // Grant the synthetic "tester" principal that right (via the seeded
+        // Administrator role) only when a test opts in; default OFF so unrelated
+        // tests exercise the name+description (no-enrichment) path.
+        if (grant_instr_read)
+            (void)rbac->assign_role(PrincipalRole{"user", "tester", "Administrator"});
+
+        // Resolves the caller for the enrichment gate. Never denies (the real
+        // AuthFn writes to res on failure; here it always yields "tester").
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<auth::Session> {
+            auth::Session s;
+            s.username = "tester";
+            return s;
+        };
 
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
                               const std::string& type, const std::string& op) -> bool {
@@ -85,7 +102,7 @@ struct DiscoverHarness {
             res.status = 403;
             return false;
         };
-        routes.register_routes(sink, perm_fn, wire_rbac ? rbac.get() : nullptr,
+        routes.register_routes(sink, auth_fn, perm_fn, wire_rbac ? rbac.get() : nullptr,
                                wire_instr ? instr.get() : nullptr,
                                wire_registry ? &registry : nullptr);
     }
@@ -472,6 +489,73 @@ TEST_CASE("discover.plugins: wraps AgentRegistry::help_json with a limitation no
     auto cached = h.sink.Get("/api/v1/discover/plugins", {{"If-None-Match", etag}});
     REQUIRE(cached);
     CHECK(cached->status == 304);
+}
+
+// A published InstructionDefinition for the reported plugin/action + the caller
+// holding InstructionDefinition:Read -> the action carries its parameter_schema
+// inline and actions_enriched_with_schema counts it (the self-orientation win).
+TEST_CASE("discover.plugins: parameter_schema enriched when caller holds InstructionDefinition:Read",
+          "[discovery][plugins][enrich]") {
+    DiscoverHarness h(/*wire_rbac=*/true, /*wire_instr=*/true, /*wire_registry=*/true,
+                      /*grant_instr_read=*/true);
+    h.instr->create_definition(make_def(
+        "Query System", /*enabled=*/true,
+        R"({"type":"object","properties":{"depth":{"type":"integer"}}})")); // system_info/query
+    auto info = make_agent_info("agent-1", "windows", "WIN-TESTBOX");
+    auto* p = info.add_plugins();
+    p->set_name("system_info");
+    p->add_capabilities("query");
+    h.registry.register_agent(info);
+
+    auto res = h.sink.Get("/api/v1/discover/plugins");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["version"] == 2);
+    REQUIRE(j.contains("actions_enriched_with_schema"));
+    CHECK(j["actions_enriched_with_schema"].get<int>() >= 1);
+    bool found_schema = false;
+    for (const auto& pl : j["plugins"]) {
+        if (pl["name"] != "system_info")
+            continue;
+        for (const auto& a : pl["actions"]) {
+            if (a["name"] == "query" && a.contains("parameter_schema")) {
+                found_schema = true;
+                CHECK(a["parameter_schema"]["type"] == "object");
+            }
+        }
+    }
+    CHECK(found_schema);
+}
+
+// Least-privilege gate (security-guardian MEDIUM / UP-7): the SAME setup, but the
+// caller has Infrastructure:Read (mock perm_fn) WITHOUT InstructionDefinition:Read
+// -> enrichment is withheld; the catalog is name+description only. This proves the
+// InstructionDefinition:Read content is not leaked through the Infrastructure gate.
+TEST_CASE("discover.plugins: enrichment withheld when caller lacks InstructionDefinition:Read",
+          "[discovery][plugins][enrich]") {
+    DiscoverHarness h(/*wire_rbac=*/true, /*wire_instr=*/true, /*wire_registry=*/true,
+                      /*grant_instr_read=*/false);
+    h.instr->create_definition(make_def(
+        "Query System", /*enabled=*/true,
+        R"({"type":"object","properties":{"depth":{"type":"integer"}}})"));
+    auto info = make_agent_info("agent-1", "windows", "WIN-TESTBOX");
+    auto* p = info.add_plugins();
+    p->set_name("system_info");
+    p->add_capabilities("query");
+    h.registry.register_agent(info);
+
+    auto res = h.sink.Get("/api/v1/discover/plugins");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["actions_enriched_with_schema"].get<int>() == 0);
+    for (const auto& pl : j["plugins"]) {
+        if (pl["name"] != "system_info")
+            continue;
+        for (const auto& a : pl["actions"])
+            CHECK_FALSE(a.contains("parameter_schema"));
+    }
 }
 
 TEST_CASE("discover.plugins: null AgentRegistry -> 503", "[discovery][plugins]") {
