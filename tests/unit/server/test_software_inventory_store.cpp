@@ -33,26 +33,50 @@ namespace pg = yuzu::server::pg;
 namespace agentpb = yuzu::agent::v1;
 
 namespace {
-// THE cross-side pin (ADR-0016 §4): the agent computes the SAME hash for the
-// SAME input (see tests/unit/test_inventory_sync.cpp — identical constant). If
-// the agent's and server's canonicalisation ever drift by one byte, one of the
-// two assertions fails and the hash-skip optimisation is broken before it ships.
+// THE cross-side pin (ADR-0016 §4, blob contract v2 — 12 fields): the agent
+// computes the SAME hash for the SAME input (see tests/unit/test_inventory_sync.cpp
+// — identical constant). If the agent's and server's canonicalisation ever drift
+// by one byte, one of the two assertions fails and the hash-skip optimisation is
+// broken before it ships.
 constexpr const char* kCrossPinHash =
-    "d7a11c1cc4987d05049f7d3226b23b9324f5fa703c8474ba0c36b4807ee5f9b8";
+    "430dc97e02b5d217276a9558393d702366bcd3b5415d5867c9efd4e95a02c848";
 
-// Canonical wire blob for one entry (fields 0x1F, entry terminated 0x1E).
+// v1-form wire blob for one entry (4 fields 0x1F-separated, entry terminated
+// 0x1E). Post-v2 this doubles as the MIXED-VERSION fixture: a v1 agent's
+// record must still parse (fields 5–12 default-empty) — see the compat test.
 std::string blob1(const std::string& n, const std::string& v, const std::string& p,
                   const std::string& d) {
     return n + '\x1f' + v + '\x1f' + p + '\x1f' + d + '\x1e';
+}
+
+// Fully-populated v2 entry (every one of the 12 fields non-empty) for the
+// round-trip / hash fixtures.
+SoftwareEntry full_v2_entry() {
+    SoftwareEntry e;
+    e.name = "bash";
+    e.version = "5.2.21";
+    e.publisher = "Fedora Project";
+    e.install_date = "Mon 01 Jan 2026";
+    e.kind = "package";
+    e.ecosystem = "rpm";
+    e.epoch = "0";
+    e.release = "3.fc40";
+    e.arch = "x86_64";
+    e.signature_status = "signed";
+    e.distro_id = "fedora";
+    e.distro_version = "40";
+    return e;
 }
 } // namespace
 
 TEST_CASE("SoftwareInventoryStore canonical_hash is the cross-pinned value",
           "[software_inventory][hash]") {
-    // Deliberately unsorted + a duplicate: normalize() must sort + dedup to the
-    // same canonical bytes the constant was computed from.
+    // Deliberately unsorted + a duplicate, and one entry populating ALL 12 v2
+    // fields: normalize() must sort + dedup to the same canonical bytes the
+    // constant was computed from.
     std::vector<SoftwareEntry> e = {
         {"Zeta", "9", "", ""},
+        full_v2_entry(),
         {"Acme Reader", "1.2", "Acme", "2026-01-02"},
         {"Acme Reader", "1.2", "Acme", "2026-01-02"},
     };
@@ -182,6 +206,168 @@ TEST_CASE("ingest_inventory_report drives the seam + fills need_full",
         REQUIRE(os.has_value());
         CHECK(os->empty());
     }
+}
+
+TEST_CASE("blob contract v2: 12-field entry round-trips through store and ingest seam",
+          "[pg][software_inventory][v2]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const SoftwareEntry e = full_v2_entry();
+
+    SECTION("store round-trip hydrates every v2 column on both read paths") {
+        REQUIRE(store.apply_installed_software("agent-v2", "", std::vector<SoftwareEntry>{e},
+                                               1000) == InventoryIngestOutcome::kStored);
+        auto got = store.get_agent_software("agent-v2");
+        REQUIRE(got.has_value());
+        REQUIRE(got->size() == 1);
+        const auto& g = (*got)[0];
+        CHECK(g.kind == "package");
+        CHECK(g.ecosystem == "rpm");
+        CHECK(g.epoch == "0");
+        CHECK(g.release == "3.fc40");
+        CHECK(g.arch == "x86_64");
+        CHECK(g.signature_status == "signed");
+        CHECK(g.distro_id == "fedora");
+        CHECK(g.distro_version == "40");
+
+        SoftwareFleetQuery q;
+        q.name = "bash";
+        auto fl = store.query_software(q);
+        REQUIRE(fl.has_value());
+        REQUIRE(fl->size() == 1);
+        CHECK((*fl)[0].entry.ecosystem == "rpm");
+        CHECK((*fl)[0].entry.distro_version == "40");
+    }
+
+    SECTION("v2 wire blob (12 fields) through the ingest seam") {
+        const std::string rec = e.name + '\x1f' + e.version + '\x1f' + e.publisher + '\x1f' +
+                                e.install_date + '\x1f' + e.kind + '\x1f' + e.ecosystem + '\x1f' +
+                                e.epoch + '\x1f' + e.release + '\x1f' + e.arch + '\x1f' +
+                                e.signature_status + '\x1f' + e.distro_id + '\x1f' +
+                                e.distro_version + '\x1e';
+        agentpb::InventoryReport rep;
+        (*rep.mutable_content_hashes())["installed_software"] =
+            SoftwareInventoryStore::canonical_hash({e});
+        (*rep.mutable_plugin_data())["installed_software"] = rec;
+        agentpb::InventoryAck ack;
+        yuzu::server::ingest_inventory_report(store, "agent-v2-wire", rep, ack);
+        CHECK(ack.need_full_size() == 0);
+        auto got = store.get_agent_software("agent-v2-wire");
+        REQUIRE(got.has_value());
+        REQUIRE(got->size() == 1);
+        CHECK((*got)[0].signature_status == "signed");
+        CHECK((*got)[0].ecosystem == "rpm");
+    }
+}
+
+TEST_CASE("blob contract v2: a v1 4-field blob still ingests — fields 5-12 empty (mixed-version)",
+          "[pg][software_inventory][v2]") {
+    // The CHOSEN mixed-version behaviour, pinned so it stays a property, not an
+    // accident: an old agent's 4-field records parse with the 8 v2 fields
+    // default-empty, store cleanly, and the server hash is the v2-form recomputed
+    // over those empties (so the OLD agent's v1 claimed hash will keep
+    // mismatching → the documented bounded ~2-RPC/day loop until agent upgrade,
+    // never an error loop, never corruption).
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string v1_hash = "1111111111111111111111111111111111111111111111111111111111111111";
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = v1_hash;
+    (*rep.mutable_plugin_data())["installed_software"] =
+        blob1("Chrome", "119", "Google", "2026-01-01");
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-v1-compat", rep, ack);
+    CHECK(ack.need_full_size() == 0); // full payload stores regardless of claimed hash
+
+    auto got = store.get_agent_software("agent-v1-compat");
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 1);
+    const auto& g = (*got)[0];
+    CHECK(g.name == "Chrome");
+    CHECK(g.version == "119");
+    CHECK(g.kind.empty());
+    CHECK(g.ecosystem.empty());
+    CHECK(g.epoch.empty());
+    CHECK(g.release.empty());
+    CHECK(g.arch.empty());
+    CHECK(g.signature_status.empty());
+    CHECK(g.distro_id.empty());
+    CHECK(g.distro_version.empty());
+
+    // The stored hash is the v2-form recompute (12-field canon over the parsed
+    // rows), NOT the agent's v1 claim: a follow-up hash-only report with the v1
+    // claim must nack need_full.
+    agentpb::InventoryReport rep2;
+    (*rep2.mutable_content_hashes())["installed_software"] = v1_hash;
+    agentpb::InventoryAck ack2;
+    yuzu::server::ingest_inventory_report(store, "agent-v1-compat", rep2, ack2);
+    REQUIRE(ack2.need_full_size() == 1);
+    CHECK(ack2.need_full(0) == "installed_software");
+
+    // And a hash-only claiming the v2-form recompute is accepted (touched).
+    SoftwareEntry expect;
+    expect.name = "Chrome";
+    expect.version = "119";
+    expect.publisher = "Google";
+    expect.install_date = "2026-01-01";
+    agentpb::InventoryReport rep3;
+    (*rep3.mutable_content_hashes())["installed_software"] =
+        SoftwareInventoryStore::canonical_hash({expect});
+    agentpb::InventoryAck ack3;
+    yuzu::server::ingest_inventory_report(store, "agent-v1-compat", rep3, ack3);
+    CHECK(ack3.need_full_size() == 0);
+}
+
+TEST_CASE("migration v5 backfills '' into v2 columns for pre-existing rows and re-runs "
+          "idempotently",
+          "[pg][software_inventory][v2]") {
+    // Upgrade semantics on a live table: rows written before v5 (simulated by a
+    // 4-column INSERT — exactly the shape a v4-era server left behind) must read
+    // back with '' in every v2 column (the ADD COLUMN ... DEFAULT '' guarantee),
+    // and re-running v5 over an already-migrated table (schema_meta rewind, the
+    // partial-migration retry case) must succeed (IF NOT EXISTS, v4 precedent).
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    { // first construction applies v1..v5
+        SoftwareInventoryStore s1{pool};
+        REQUIRE(s1.is_open());
+    }
+    { // seed a legacy-shaped row + rewind the recorded version to 4
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO software_inventory_store.installed_software "
+            "(agent_id, name, version, publisher, install_date) "
+            "VALUES ('agent-legacy', 'OldApp', '1.0', 'OldCo', '2025-01-01')",
+            std::vector<std::string>{});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+        pg::PgResult back = pg::exec_params(
+            lease.get(),
+            "UPDATE public.schema_meta SET version = 4 WHERE store = 'software_inventory_store'",
+            std::vector<std::string>{});
+        REQUIRE(back.status() == PGRES_COMMAND_OK);
+    }
+    SoftwareInventoryStore store{pool}; // re-runs v5 over the live table
+    REQUIRE(store.is_open());
+
+    auto got = store.get_agent_software("agent-legacy");
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 1);
+    CHECK((*got)[0].name == "OldApp");
+    CHECK((*got)[0].kind.empty());
+    CHECK((*got)[0].ecosystem.empty());
+    CHECK((*got)[0].signature_status.empty());
+    CHECK((*got)[0].distro_version.empty());
 }
 
 TEST_CASE("ingest boundary-truncates an over-long multibyte field so PG accepts it (UP-10)",
