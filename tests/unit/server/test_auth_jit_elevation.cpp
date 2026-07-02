@@ -307,7 +307,13 @@ struct JitHarness {
     // hardening round, UP-3 guard) points the AuditStore at an unopenable
     // path — SQLITE_CANTOPEN leaves it wired-but-closed (db_==nullptr), so
     // AuditStore::log() fail-returns false without throwing, matching the
-    // idiom at test_rest_audit_sample.cpp:51.
+    // idiom at test_rest_audit_sample.cpp:51. Made HERMETIC (L5, adversarial
+    // review): rather than a hardcoded path outside the sandbox (a
+    // writable-root CI could create `/nonexistent-yuzu-test-dir/` and void
+    // the negative assertion), the unopenable directory is a subdirectory of
+    // the harness's own TempDir with its write bit stripped (mirrors the
+    // owner_read/owner_write idiom in test_cert_reloader.cpp) — SQLite can
+    // list it but can't create a file inside it.
     explicit JitHarness(bool audit_store_broken = false)
         : auth_db((fs::create_directories(tmp.path), tmp.path), 0) {
         cfg.auth_config_path = tmp.path / "auth.cfg";
@@ -326,9 +332,15 @@ struct JitHarness {
         REQUIRE(auth_db.set_elevation_eligible("bob", true).has_value());
 
         api_tokens = std::make_unique<ApiTokenStore>(tmp.path / "api_tokens.db");
-        audit_store = audit_store_broken
-                          ? std::make_unique<AuditStore>("/nonexistent-yuzu-test-dir/audit-broken.db")
-                          : std::make_unique<AuditStore>(tmp.path / "audit.db");
+        std::filesystem::path audit_path = tmp.path / "audit.db";
+        if (audit_store_broken) {
+            std::filesystem::path unopenable_dir = tmp.path / "no-write";
+            fs::create_directories(unopenable_dir);
+            fs::permissions(unopenable_dir, fs::perms::owner_read | fs::perms::owner_exec,
+                            fs::perm_options::replace);
+            audit_path = unopenable_dir / "audit-broken.db";
+        }
+        audit_store = std::make_unique<AuditStore>(audit_path);
         analytics_store = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
         REQUIRE(api_tokens->is_open());
         auth_routes = std::make_unique<AuthRoutes>(cfg, auth_mgr, /*rbac_store=*/nullptr,
@@ -399,12 +411,11 @@ TEST_CASE("POST /api/v1/elevate: eligible operator is elevated to admin", "[jit]
     CHECK(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
     // expires_in is now the TRUE remaining time (follow-up B, computed a
-    // moment after the grant) — never MORE than the requested duration, and
-    // within a second or two of it (no clamp applies: the session's absolute
-    // lifetime is 8h, far longer than 600s).
+    // moment after the grant) — no clamp applies (the session's absolute
+    // lifetime is 8h, far longer than 600s), and the ceil-based computation
+    // (HIGH, adversarial review) makes a live, unclamped window EXACT.
     int expires_in = body.value("expires_in", -1);
-    CHECK(expires_in <= 600);
-    CHECK(expires_in >= 598);
+    CHECK(expires_in == 600);
     // expires_at is the wall-clock RFC3339 UTC projection (follow-up B),
     // well-formed "YYYY-MM-DDTHH:MM:SSZ" — not just non-empty (governance
     // hardening round, format assertion).
@@ -426,6 +437,47 @@ TEST_CASE("POST /api/v1/elevate: eligible operator is elevated to admin", "[jit]
     }
 
     // The session is now effectively admin.
+    auto s = h.auth_mgr.validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK(auth::is_elevated(*s));
+    CHECK(auth::effective_role(*s) == Role::admin);
+}
+
+// HIGH (adversarial review): duration_secs:1 is a genuinely LIVE window
+// (elevate_session sets elevated_until = now+1s), but duration_cast<seconds>
+// truncates toward zero — a re-sample of the clock a moment later would
+// falsely report 0 across all three channels (grant audit, analytics event,
+// response body) instead of the correct >=1. Fails pre-fix (all three read
+// 0, and the "is_elevated right after" assertion also fails since the window
+// is already expired), passes post-fix (ceil'd remaining).
+TEST_CASE("POST /api/v1/elevate: duration_secs:1 is a live window, not "
+          "truncated to 0",
+          "[jit][routes]") {
+    JitHarness h;
+    auto token = h.session_for("alice"); // normal, full-lifetime session
+
+    auto res = h.post("/api/v1/elevate", token,
+                      R"({"justification":"x","duration_secs":1})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    int expires_in = body.value("expires_in", -1);
+    CHECK(expires_in >= 1);
+
+    AuditQuery q;
+    q.action = "role.elevation.granted";
+    q.principal = "alice";
+    auto rows = h.audit_store->query(q);
+    REQUIRE_FALSE(rows.empty());
+    const std::string& detail = rows.front().detail;
+    auto pos = detail.find("duration_secs=");
+    REQUIRE(pos != std::string::npos);
+    pos += std::string("duration_secs=").size();
+    auto endp = detail.find(' ', pos);
+    int audit_duration = std::stoi(detail.substr(pos, endp - pos));
+    CHECK(audit_duration >= 1);
+
+    // The elevation is actually live (effective_role admin) right after.
     auto s = h.auth_mgr.validate_session(token);
     REQUIRE(s.has_value());
     CHECK(auth::is_elevated(*s));
@@ -570,11 +622,11 @@ TEST_CASE("POST /api/v1/elevate: wrong-typed fields are a 400, not a 500", "[jit
                        R"({"justification":"x","duration_secs":9999999999999999})");
     REQUIRE(huge);
     CHECK(huge->status == 200);
-    // expires_in is the TRUE remaining time (follow-up B) — at most the cap,
-    // and within a second or two of it (no session-lifetime clamp applies).
+    // expires_in is the TRUE remaining time (follow-up B) — clamped to the
+    // cap only (no session-lifetime clamp applies), and EXACT under the
+    // ceil-based computation (HIGH, adversarial review).
     int huge_expires_in = nlohmann::json::parse(huge->body).value("expires_in", -1);
-    CHECK(huge_expires_in <= h.cfg.jit_max_elevation_secs);
-    CHECK(huge_expires_in >= h.cfg.jit_max_elevation_secs - 2);
+    CHECK(huge_expires_in == h.cfg.jit_max_elevation_secs);
 }
 
 TEST_CASE("POST /api/v1/elevate: duration is clamped to the cap", "[jit][routes]") {
@@ -584,9 +636,10 @@ TEST_CASE("POST /api/v1/elevate: duration is clamped to the cap", "[jit][routes]
                       R"({"justification":"x","duration_secs":999999})");
     REQUIRE(res);
     CHECK(res->status == 200);
+    // Clamped to the cap only (full-lifetime session) — EXACT under the
+    // ceil-based computation (HIGH, adversarial review).
     int expires_in = nlohmann::json::parse(res->body).value("expires_in", -1);
-    CHECK(expires_in <= h.cfg.jit_max_elevation_secs);
-    CHECK(expires_in >= h.cfg.jit_max_elevation_secs - 2);
+    CHECK(expires_in == h.cfg.jit_max_elevation_secs);
 }
 
 TEST_CASE("POST /api/v1/elevate/revoke reverts the elevation", "[jit][routes]") {

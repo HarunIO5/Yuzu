@@ -42,9 +42,13 @@ std::string iso8601_utc(std::chrono::system_clock::time_point tp) {
     std::time_t t = std::chrono::system_clock::to_time_t(tp);
     std::tm tm{};
 #if defined(_WIN32)
-    gmtime_s(&tm, &t);
+    // gmtime_s returns nonzero on failure — don't silently format a
+    // zero-inited tm as 1970-01-01 (L1, adversarial review).
+    if (gmtime_s(&tm, &t) != 0)
+        return "invalid-time";
 #else
-    gmtime_r(&t, &tm);
+    if (gmtime_r(&t, &tm) == nullptr)
+        return "invalid-time";
 #endif
     char buf[32] = {};
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
@@ -2154,13 +2158,16 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         // `until` may be CLAMPED to the session's own absolute expiry
         // (follow-up B, security review 2026-06-30) — report the TRUE
-        // remaining time, not the requested/capped `duration`. Floored at 0
-        // (never negative) in case a session on the very edge of its lifetime
-        // races between elevate_session's clamp and this read.
-        auto remaining =
-            std::chrono::duration_cast<std::chrono::seconds>(*until - std::chrono::steady_clock::now());
-        if (remaining < std::chrono::seconds(0))
-            remaining = std::chrono::seconds(0);
+        // remaining time, not the requested/capped `duration`. A live window
+        // is CEIL'd (never floor/truncated) — duration_cast truncates toward
+        // zero, so a genuinely-live sub-second remainder (e.g. duration_secs:1
+        // re-sampled a moment later) would falsely report 0 across all three
+        // channels (HIGH, adversarial review). Only a non-live/edge window
+        // (until <= now) floors to 0.
+        const auto elevate_now = std::chrono::steady_clock::now();
+        auto remaining = (*until > elevate_now)
+                              ? std::chrono::ceil<std::chrono::seconds>(*until - elevate_now)
+                              : std::chrono::seconds(0);
         // steady_clock has no wall-clock meaning across a restart/off-process,
         // so the absolute `expires_at` is a system_clock projection of the
         // steady remaining duration, taken at essentially the same instant.
@@ -2194,11 +2201,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // duration_secs here is remaining.count() (the true post-clamp value),
         // not the requested/capped `duration` — matches the audit row and the
         // JSON response so all three channels agree (governance hardening
-        // round, consistency). After the dead-window guard above, remaining is
-        // always > 0.
+        // round, consistency). With the ceil above, a live window is always
+        // >= 1 (never truncated to 0); only the dead-window edge case is 0.
+        // expires_at is carried too (L2, adversarial review) so this channel
+        // matches the audit row and the JSON response (docs/auth-architecture.md:238-240).
         emit_event("role.elevation.granted", req,
                    {{"username", session->username},
-                    {"duration_secs", std::to_string(remaining.count())}},
+                    {"duration_secs", std::to_string(remaining.count())},
+                    {"expires_at", expires_at_str}},
                    {}, Severity::kWarn);
         nlohmann::json out = {
             {"status", "ok"}, {"expires_in", remaining.count()}, {"expires_at", expires_at_str}};
