@@ -92,21 +92,25 @@ each key is `server`- (operator/API) or `agent`-sourced.
 via the REST API or MCP `set_tag` (which writes `source=server`, authoritative). Keys
 the agent reports that the operator never set are unaffected.
 
-## Behaviour change: MCP approval-gated calls now return -32004, not -32006 (#1470)
+## Behaviour change: MCP approval-gated calls use ticket-then-recall (-32006) (#289)
 
-Supervised-tier MCP tokens that attempt an approval-gated operation now receive
-JSON-RPC error code `-32004` (`TierDenied`) instead of `-32006` (`ApprovalRequired`).
-The A4 contract reserves `-32006` for a response that carries a pollable `approval_id`
-+ `status_url`; because approval re-dispatch (Phase 2) is not yet implemented,
-returning `-32006` would violate that contract. The operation is still denied and
-audited; the `error.data.remediation` field points to the REST API / dashboard
-approval workflow.
+Supervised-tier MCP tokens that attempt an approval-gated operation (e.g. `delete_tag`,
+`quarantine_device`) now run through a **ticket-then-recall** approval flow. The first
+call returns JSON-RPC error `-32006` (`ApprovalRequired`) whose `error.data` carries an
+`approval_id` and a `status_url` (`GET /api/v1/approvals/{id}`). After a second principal
+approves the ticket, the caller re-invokes the same tool with the `approval_id` and the
+operation executes (the ticket is consumed exactly once, args-bound, replay-rejected).
 
-**Who this affects:** any MCP client that explicitly matched on `-32006` to detect an
-approval-required state. After upgrade those handlers receive `-32004` instead; update
-the match to `-32004` and leave `-32006` reserved for the future Phase 2 envelope (see
-`docs/user-manual/mcp.md` → "-32004: Tier denied (including approval-gated operations)").
-`operator`-tier executions are auto-approved and are unaffected.
+> An earlier development iteration returned `-32004` (`TierDenied`) for these operations
+> because the approval re-dispatch path was unbuilt. That intermediate behaviour **never
+> shipped in a release** and is fully superseded by the flow above — there is no `-32004`
+> approval-denial in the released product.
+
+**Who this affects:** any MCP client that matched on the approval-gated denial. Match
+`-32006` and read `error.data.approval_id` / `status_url` to drive the approval workflow;
+`operator`-tier executions are auto-approved and are unaffected. On the REST transport an
+approval-gated operation by an MCP-tier token is denied (there is no JSON-RPC ticket
+channel on REST) — use the MCP `/mcp/v1/` flow or the dashboard.
 
 ## Behaviour change: `POST /api/v1/tokens` now honors `mcp_tier`
 
