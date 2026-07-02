@@ -51,9 +51,14 @@ public:
     /// Dispatch `action` on `descriptor` synchronously, in this thread.
     /// `params` is forwarded verbatim to the plugin (may be empty).
     /// Output written via `yuzu_ctx_write_output` is appended to
-    /// `result.captured`. Bounded by kCaptureMaxBytes.
+    /// `result.captured`. Bounded by `capture_cap` — defaults to
+    /// kCaptureMaxBytes so the fleet-topology snapshot contract is untouched;
+    /// a caller with a larger bounded payload (the installed_software sync's
+    /// v2 rows, whose 12-field output outgrows 2 MiB around ~14k packages)
+    /// passes its own cap explicitly rather than raising the shared default.
     Result run(const YuzuPluginDescriptor* descriptor, std::string_view action,
-               std::span<const YuzuParam> params = {});
+               std::span<const YuzuParam> params = {},
+               std::size_t capture_cap = kCaptureMaxBytes);
 };
 
 } // namespace yuzu::agent
