@@ -499,7 +499,7 @@ const std::string& openapi_spec() {
         "properties": {
           "error": {
             "type": "object",
-            "required": ["code", "message", "correlation_id"],
+            "required": ["code", "message", "correlation_id", "retry_after_ms"],
             "properties": {
               "code": {"type": "integer", "description": "HTTP status code echoed into the body for self-describing error frames."},
               "message": {"type": "string", "description": "One-sentence human-readable summary."},
@@ -3649,7 +3649,8 @@ void RestApiV1::register_routes(
     // an aged id).
     sink.Get(
         R"(/api/v1/approvals/([A-Za-z0-9_-]{1,128}))",
-        [auth_fn, perm_fn, approval_manager](const httplib::Request& req, httplib::Response& res) {
+        [auth_fn, perm_fn, audit_fn, approval_manager](const httplib::Request& req,
+                                                       httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
                 return;
@@ -3676,6 +3677,12 @@ void RestApiV1::register_routes(
                 return;
             }
             const auto& a = *approval;
+            // Audit the read (S2, adversarial review): this versioned endpoint is
+            // the A4 status_url target and returns submitted_by / reviewed_by /
+            // scope_expression. The legacy list route lacks an audit, but the
+            // stable agentic surface should leave a trail. Best-effort (success
+            // path only; not fail-closed — no new PII beyond the legacy route).
+            (void)audit_fn(req, "approval.read", "success", "Approval", id, "status=" + a.status);
             auto data = JObj()
                             .add("id", a.id)
                             .add("definition_id", a.definition_id)
@@ -3966,9 +3973,12 @@ void RestApiV1::register_routes(
 
         // Emit an A4 error with a fresh correlation id.
         auto rs_err = [](httplib::Response& res, int status, std::string_view msg) {
-            auto cid = detail::make_correlation_id();
             res.status = status;
-            res.set_content(detail::error_json_a4(status, msg, cid), "application/json");
+            // Route through a4_error so the X-Correlation-Id RESPONSE HEADER is set
+            // (via ensure_correlation_id) — error_json_a4 alone builds only the body,
+            // leaving the header absent on all 26 result-set error paths (S1,
+            // adversarial review). a4_error derives the body `code` from res.status.
+            res.set_content(detail::a4_error(res, msg), "application/json");
         };
 
         // Load a row and enforce the owner check. Returns nullopt and writes a
