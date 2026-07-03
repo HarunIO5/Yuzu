@@ -21,6 +21,13 @@ struct Approval {
     int64_t reviewed_at{0};
     std::string review_comment;
     std::string scope_expression;
+    /// Empty for an interactively-submitted ticket (workflow_routes.cpp);
+    /// set to the owning schedule's id for a scheduled-fire submission
+    /// (M-02, #1806) so ScheduleRunner::fire_with_approval can match a
+    /// ticket to the ONE schedule occurrence that asked for it, instead of
+    /// to every schedule sharing the same (submitted_by, definition_id,
+    /// scope_expression) tuple.
+    std::string schedule_id;
 };
 
 struct ApprovalQuery {
@@ -38,9 +45,13 @@ public:
 
     void create_tables();
 
+    /// `schedule_id` (M-02, #1806): empty for the interactive submit path;
+    /// the owning schedule's id for a scheduled-fire submission — see the
+    /// `Approval::schedule_id` doc comment for why this matters.
     std::expected<std::string, std::string> submit(const std::string& definition_id,
                                                    const std::string& submitted_by,
-                                                   const std::string& scope_expression);
+                                                   const std::string& scope_expression,
+                                                   const std::string& schedule_id = "");
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
 

@@ -43,8 +43,13 @@ Approval row_to_approval(sqlite3_stmt* stmt) {
     a.reviewed_at = sqlite3_column_int64(stmt, 6);
     a.review_comment = col_text(stmt, 7);
     a.scope_expression = col_text(stmt, 8);
+    a.schedule_id = col_text(stmt, 9);
     return a;
 }
+
+const char* kSelectAllCols = "id, definition_id, status, submitted_by, submitted_at, "
+                             "reviewed_by, reviewed_at, review_comment, scope_expression, "
+                             "schedule_id";
 
 } // namespace
 
@@ -74,6 +79,16 @@ void ApprovalManager::create_tables() {
             CREATE INDEX IF NOT EXISTS idx_approvals_definition
                 ON approvals(definition_id);
         )"},
+        // M-02 (#1806): discriminates a scheduled-fire submission by the
+        // owning schedule so one approval no longer matches every schedule
+        // sharing (submitted_by, definition_id, scope_expression). Empty for
+        // interactive submissions (workflow_routes.cpp), which never match a
+        // real schedule id.
+        {2, R"(
+            ALTER TABLE approvals ADD COLUMN schedule_id TEXT NOT NULL DEFAULT '';
+            CREATE INDEX IF NOT EXISTS idx_approvals_schedule_id
+                ON approvals(schedule_id);
+        )"},
     };
     if (!MigrationRunner::run(db_, "approval_manager", kMigrations)) {
         spdlog::error("ApprovalManager: schema migration failed");
@@ -86,7 +101,7 @@ void ApprovalManager::create_tables() {
 
 std::expected<std::string, std::string>
 ApprovalManager::submit(const std::string& definition_id, const std::string& submitted_by,
-                        const std::string& scope_expression) {
+                        const std::string& scope_expression, const std::string& schedule_id) {
     if (!db_)
         return std::unexpected("database not open");
     if (definition_id.empty())
@@ -137,8 +152,9 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
 
     const char* sql = R"(
         INSERT INTO approvals (id, definition_id, status, submitted_by, submitted_at,
-                               reviewed_by, reviewed_at, review_comment, scope_expression)
-        VALUES (?, ?, 'pending', ?, ?, '', 0, '', ?)
+                               reviewed_by, reviewed_at, review_comment, scope_expression,
+                               schedule_id)
+        VALUES (?, ?, 'pending', ?, ?, '', 0, '', ?, ?)
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -149,6 +165,7 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     sqlite3_bind_text(stmt, 3, submitted_by.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 4, ts);
     sqlite3_bind_text(stmt, 5, scope_expression.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, schedule_id.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         auto err = std::string(sqlite3_errmsg(db_));
@@ -171,9 +188,7 @@ std::vector<Approval> ApprovalManager::query(const ApprovalQuery& q) const {
     if (!db_)
         return results;
 
-    std::string sql = "SELECT id, definition_id, status, submitted_by, submitted_at, "
-                      "reviewed_by, reviewed_at, review_comment, scope_expression "
-                      "FROM approvals WHERE 1=1";
+    std::string sql = std::string("SELECT ") + kSelectAllCols + " FROM approvals WHERE 1=1";
     std::vector<std::string> binds;
 
     if (!q.status.empty()) {
@@ -210,12 +225,9 @@ std::optional<Approval> ApprovalManager::get(const std::string& id) const {
 
     std::lock_guard lock(mtx_);
 
+    std::string sql = std::string("SELECT ") + kSelectAllCols + " FROM approvals WHERE id = ?";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT id, definition_id, status, submitted_by, submitted_at, "
-                           "reviewed_by, reviewed_at, review_comment, scope_expression "
-                           "FROM approvals WHERE id = ?",
-                           -1, &stmt, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
         return std::nullopt;
 
     sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);

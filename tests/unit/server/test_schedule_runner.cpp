@@ -321,6 +321,53 @@ TEST_CASE("ScheduleRunner: definition approval_mode gates even without the sched
     CHECK(h.approvals.query({.status = "pending"}).size() == 1);
 }
 
+TEST_CASE("ScheduleRunner: two schedules sharing (creator,definition,scope) get independent "
+          "approval tickets — one approval fires only its own schedule (M-02, #1806)",
+          "[schedule][runner][approval][m02]") {
+    Harness h;
+    // Both due, both reference the same gated definition, both default to
+    // the same scope_expression ("") and created_by ("admin") — exactly the
+    // (submitted_by, definition_id, scope_expression) tuple M-02 found was
+    // used to match an approval BEFORE schedule_id existed.
+    auto id_a = h.make_due("test.gated", "interval");
+    auto id_b = h.make_due("test.gated", "interval");
+
+    h.runner.tick(); // both hold; each submits its OWN ticket, no dedup collapse
+
+    CHECK(h.calls.empty());
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 2); // two tickets, not one shared ticket
+
+    std::string pending_a_id, pending_b_id;
+    for (const auto& a : pending) {
+        if (a.schedule_id == id_a)
+            pending_a_id = a.id;
+        else if (a.schedule_id == id_b)
+            pending_b_id = a.id;
+    }
+    REQUIRE_FALSE(pending_a_id.empty());
+    REQUIRE_FALSE(pending_b_id.empty());
+
+    // Approve ONLY schedule A's ticket.
+    REQUIRE(h.approvals.approve(pending_a_id, "boss", "ok").has_value());
+
+    h.runner.tick();
+
+    // Exactly one fire, and it is A's — B must not be swept along just
+    // because it shares (creator, definition, scope) with A.
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.get(id_a).execution_count == 1);
+    CHECK(h.get(id_b).execution_count == 0);
+
+    // B still holds its OWN untouched pending ticket — proves no cross-talk
+    // (not merely "no double-fire"): B was never suppressed by A's ticket
+    // and never had its own ticket consumed by A's approval.
+    auto still_pending = h.approvals.query({.status = "pending"});
+    REQUIRE(still_pending.size() == 1);
+    CHECK(still_pending[0].id == pending_b_id);
+    CHECK(still_pending[0].schedule_id == id_b);
+}
+
 TEST_CASE("ScheduleEngine: interval floor rejected at create, clamped on legacy advance",
           "[schedule][runner]") {
     Harness h;

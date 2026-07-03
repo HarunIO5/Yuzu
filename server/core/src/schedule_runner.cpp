@@ -103,24 +103,31 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
 
 bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std::string& plugin,
                                         const std::string& action) {
-    // 1) An APPROVED ticket for this occurrence → fire. The caller advances
-    //    the schedule on our true return, which retires the ticket via the
-    //    occurrence anchor (see ticket_is_current) — approve == at most one
-    //    scheduled run. Single tick thread, so no concurrent-fire race.
+    // 1) An APPROVED ticket for THIS schedule's occurrence → fire. The caller
+    //    advances the schedule on our true return, which retires the ticket
+    //    via the occurrence anchor (see ticket_is_current) — approve == at
+    //    most one scheduled run. Single tick thread, so no concurrent-fire
+    //    race. Matching on a.schedule_id == s.id (M-02, #1806) is required,
+    //    not just belt-and-suspenders: without it, two schedules sharing
+    //    (creator, definition, scope) would both fire off ONE approval.
     auto approved = d_.approval_manager->query({.status = "approved", .submitted_by = s.created_by});
     for (const auto& a : approved) {
         if (a.definition_id != s.definition_id || a.scope_expression != s.scope_expression ||
-            !ticket_is_current(a, s))
+            a.schedule_id != s.id || !ticket_is_current(a, s))
             continue;
         dispatch_tracked(s, plugin, action, a.id);
         return true;
     }
 
-    // 2) A PENDING ticket for the same (definition, creator, scope) → the
-    //    occurrence waits (no advance), and we never stack a duplicate ask.
+    // 2) A PENDING ticket for THIS schedule → the occurrence waits (no
+    //    advance), and we never stack a duplicate ask. Scoped to
+    //    a.schedule_id == s.id for the same reason as (1): otherwise a
+    //    sibling schedule's pending ticket would suppress this schedule's
+    //    OWN submission in step 4, and it would never get a ticket to match.
     auto pending = d_.approval_manager->query({.status = "pending", .submitted_by = s.created_by});
     for (const auto& a : pending) {
-        if (a.definition_id == s.definition_id && a.scope_expression == s.scope_expression)
+        if (a.definition_id == s.definition_id && a.scope_expression == s.scope_expression &&
+            a.schedule_id == s.id)
             return false;
     }
 
@@ -129,7 +136,7 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
     auto rejected = d_.approval_manager->query({.status = "rejected", .submitted_by = s.created_by});
     for (const auto& a : rejected) {
         if (a.definition_id != s.definition_id || a.scope_expression != s.scope_expression ||
-            !ticket_is_current(a, s))
+            a.schedule_id != s.id || !ticket_is_current(a, s))
             continue;
         spdlog::info("schedule_runner: schedule '{}' (id={}) occurrence skipped — approval {} "
                      "rejected by {}",
@@ -139,8 +146,10 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
         return true;
     }
 
-    // 4) No ticket yet → submit one and hold the occurrence at its due time.
-    auto submitted = d_.approval_manager->submit(s.definition_id, s.created_by, s.scope_expression);
+    // 4) No ticket yet → submit one (tagged with this schedule's id, M-02)
+    //    and hold the occurrence at its due time.
+    auto submitted =
+        d_.approval_manager->submit(s.definition_id, s.created_by, s.scope_expression, s.id);
     if (!submitted) {
         // Submit failure (pending cap, store error): drop THIS occurrence
         // (advance) rather than re-submitting every tick against a full cap.
@@ -217,8 +226,31 @@ int ScheduleRunner::dispatch_tracked(const InstructionSchedule& s, const std::st
         return 0;
     }
 
-    if (d_.execution_tracker && !exec_id.empty())
-        d_.execution_tracker->set_agents_targeted(exec_id, sent);
+    if (d_.execution_tracker && !exec_id.empty()) {
+        // L-03 (#1806): dispatch has already succeeded at this point — a
+        // throw from set_agents_targeted (store error) must not leave the
+        // execution row stuck at "running" forever, since tick()'s
+        // outer catch only advances the SCHEDULE, not the execution it
+        // already created. Mark the row failed here so it can't idle to the
+        // materialise timeout while still counting the fire as a success.
+        try {
+            d_.execution_tracker->set_agents_targeted(exec_id, sent);
+        } catch (const std::exception& e) {
+            spdlog::error("schedule_runner: set_agents_targeted threw for schedule '{}' (id={}, "
+                          "execution_id={}): {}",
+                          s.name, s.id, exec_id, e.what());
+            try {
+                d_.execution_tracker->mark_cancelled(exec_id, s.created_by);
+            } catch (const std::exception& e2) {
+                spdlog::error("schedule_runner: mark_cancelled also threw for execution_id={}: {}",
+                              exec_id, e2.what());
+            }
+            audit(s, "instruction.schedule_fired", "failure",
+                  "set_agents_targeted_failed schedule_id=" + s.id + " execution_id=" + exec_id);
+            count("yuzu_schedule_fire_failures_total");
+            return sent;
+        }
+    }
 
     count("yuzu_schedule_fires_total");
     spdlog::info("schedule_runner: schedule '{}' (id={}) fired — command_id={} execution_id={} "

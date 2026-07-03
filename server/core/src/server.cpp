@@ -92,6 +92,7 @@
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
+#include "schedule_routes.hpp"
 #include "schedule_runner.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -7670,47 +7671,10 @@ private:
 
         web_server_->Post("/api/schedules", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
-            if (!require_permission(req, res, "Schedule", "Write"))
-                return;
-            if (!schedule_engine_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            try {
-                auto j = nlohmann::json::parse(req.body);
-                InstructionSchedule sched;
-                sched.name = j.value("name", "");
-                sched.definition_id = j.value("definition_id", "");
-                sched.frequency_type = j.value("frequency_type", "once");
-                sched.interval_minutes = j.value("interval_minutes", 60);
-                sched.time_of_day = j.value("time_of_day", "00:00");
-                sched.day_of_week = j.value("day_of_week", 0);
-                sched.day_of_month = j.value("day_of_month", 1);
-                sched.scope_expression = j.value("scope_expression", "");
-                sched.requires_approval = j.value("requires_approval", false);
-
-                if (auto session = auth_routes_->resolve_session(req))
-                    sched.created_by = session->username;
-
-                auto result = schedule_engine_->create_schedule(sched);
-                if (!result) {
-                    res.status = 400;
-                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
-                                    "application/json");
-                    return;
-                }
-                (void)audit_log(req, "schedule.create", "success", "schedule", *result, sched.name);
-                res.set_header("HX-Trigger",
-                               R"({"showToast":{"message":"Schedule created","level":"success"}})");
-                res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
-            } catch (const std::exception& e) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
-            }
+            // Extracted to schedule_routes.cpp (H-01, #1806): the
+            // Schedule:Write + Execution:Execute gate ordering needs direct
+            // unit coverage that a bare inline lambda cannot get.
+            handle_create_schedule(*auth_routes_, schedule_engine_.get(), req, res);
         });
 
         web_server_->Delete(R"(/api/schedules/([^/]+))", [this](const httplib::Request& req,
@@ -7726,7 +7690,14 @@ private:
             }
 
             auto id = req.matches[1].str();
-            bool deleted = schedule_engine_->delete_schedule(id);
+            // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
+            // deletes only schedules the caller created, not the whole
+            // fleet's. auth_routes_->resolve_session, not require_permission's
+            // session (already consumed) — this call cannot fail auth since
+            // require_permission above already proved a valid session exists.
+            auto session = auth_routes_->resolve_session(req);
+            auto user = session ? session->username : std::string();
+            bool deleted = schedule_engine_->delete_schedule(id, user);
             if (deleted) {
                 (void)audit_log(req, "schedule.delete", "success", "schedule", id);
                 res.set_header("HX-Trigger",
@@ -7750,7 +7721,24 @@ private:
             auto id = req.matches[1].str();
             auto enabled_str = extract_json_string(req.body, "enabled");
             bool enabled = (enabled_str != "false");
-            schedule_engine_->set_enabled(id, enabled);
+            // H-01 (#1806): re-enabling arms the schedule to fire unattended
+            // through ScheduleRunner — the same fleet-wide-dispatch concern
+            // as create, so it needs the same Execution:Execute gate.
+            // Disabling only ever stops a schedule, so it stays gated on
+            // Schedule:Write alone — an operator must be able to kill a
+            // runaway schedule even without Execution:Execute.
+            if (enabled && !require_permission(req, res, "Execution", "Execute"))
+                return;
+
+            // M-01 (#1806): owner-scoped enable/disable, same as delete above.
+            auto session = auth_routes_->resolve_session(req);
+            auto user = session ? session->username : std::string();
+            bool changed = schedule_engine_->set_enabled(id, enabled, user);
+            if (changed) {
+                // L-04 (#1806): enable/disable had no audit trail at all.
+                (void)audit_log(req, enabled ? "schedule.enable" : "schedule.disable", "success",
+                                "schedule", id);
+            }
             res.set_content(nlohmann::json({{"enabled", enabled}}).dump(), "application/json");
         });
 
