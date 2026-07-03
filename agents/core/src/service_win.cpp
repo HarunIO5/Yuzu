@@ -143,19 +143,36 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
             return;
         }
 
+        bool stop_already_requested = false;
         {
             std::lock_guard<std::mutex> lock(g_agent_mu);
             g_agent = agent.get();
+            // Catch up on a SERVICE_CONTROL_STOP that arrived while g_factory()
+            // was still running: handler_ex would have found g_agent==nullptr
+            // (not yet published) and silently skipped calling stop(), which --
+            // left unhandled -- would let the service unconditionally report
+            // RUNNING below and un-stop itself from the SCM's perspective (Gate-4
+            // UP-1). Both this check and handler_ex's read of g_agent are under
+            // the same g_agent_mu, so the two can't both miss each other: either
+            // handler_ex sees the just-published pointer and stops it directly,
+            // or it ran first and set g_stop_requested, which we observe here.
+            stop_already_requested = g_stop_requested.load(std::memory_order_relaxed);
+            if (stop_already_requested)
+                g_agent->stop();
         }
         AgentUnpublisher unpublisher; // destructs before `agent` on every exit below
 
         // Report RUNNING now, before run() -- run()'s reconnect loop is unbounded
         // while the server is unreachable (agent.cpp), so waiting for it to return
         // would itself time out the SCM start (parity with the systemd
-        // Type=simple unit, which has no readiness protocol either).
-        report_status(SERVICE_RUNNING);
+        // Type=simple unit, which has no readiness protocol either). Skipped if a
+        // stop already landed above: the last report the SCM should see before
+        // STOPPED is handler_ex's STOP_PENDING, not a RUNNING that immediately
+        // reverses it.
+        if (!stop_already_requested)
+            report_status(SERVICE_RUNNING);
 
-        agent->run(); // blocks until stop() (via handler_ex) or a fatal startup error
+        agent->run(); // blocks until stop() (via handler_ex, or the catch-up above) or a fatal startup error
 
         spdlog::default_logger()->flush();
 

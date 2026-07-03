@@ -103,8 +103,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "Program Files") and adds `SERVICE_CONFIG_FAILURE_ACTIONS_FLAG` so the existing restart-on-failure
   actions also fire on a clean exit with an error (e.g. the #1303 fail-closed TLS refusal), not just
   a crash. Re-running `--install-service` over an existing (possibly stale/broken) registration now
-  updates it in place instead of failing with "service already exists". The installer's
-  `PrepareToInstall` stop-before-upgrade step now polls for `STOPPED` instead of a blind 2-second
+  updates it in place instead of failing with "service already exists" — note this resets binPath to
+  the bare exe + `--service` marker, so a manual re-run must be followed by `sc config` to restore any
+  previously-applied `--server`/`--data-dir`/`--log-file` args, same as the installer's own sequence.
+  The installer's `PrepareToInstall` stop-before-upgrade step now polls for `STOPPED` (skipped entirely
+  on a fresh install with no prior service, to avoid a needless wait) instead of a blind 2-second
   delay, since `sc stop` only actually completes with this fix. The service still registers to run
   as LocalSystem (unchanged from before this fix) — migrating it to the least-privilege
   `NT SERVICE\YuzuAgent` virtual account per `docs/agent-privilege-model.md` is tracked as a

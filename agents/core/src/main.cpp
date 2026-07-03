@@ -275,11 +275,22 @@ int main(int argc, char* argv[]) {
                 updated_existing = true;
             }
 
+            // Each of these is best-effort hardening on top of the core binPath fix
+            // (description / delayed-start / crash-and-error recovery) -- a failure
+            // here must not abort the install (the service is already usable
+            // without it), but silently swallowing it would leave e.g. the
+            // recovery-actions guarantee unconfigured while still printing
+            // "installed successfully" (Gate-4 UP-6). Warn, don't abort.
             SERVICE_DESCRIPTIONW desc;
             desc.lpDescription = const_cast<wchar_t*>(L"Yuzu endpoint management agent");
-            ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_DESCRIPTION, &desc);
+            if (!ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_DESCRIPTION, &desc))
+                std::cerr << "Warning: failed to set service description (" << GetLastError()
+                          << ")\n";
             SERVICE_DELAYED_AUTO_START_INFO delayed = {TRUE};
-            ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed);
+            if (!ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+                                       &delayed))
+                std::cerr << "Warning: failed to set delayed auto-start (" << GetLastError()
+                          << ")\n";
             SC_ACTION actions[3] = {
                 {SC_ACTION_RESTART, 60000},
                 {SC_ACTION_RESTART, 60000},
@@ -288,12 +299,16 @@ int main(int argc, char* argv[]) {
             failure.dwResetPeriod = 86400;
             failure.cActions = 3;
             failure.lpsaActions = actions;
-            ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_FAILURE_ACTIONS, &failure);
+            if (!ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_FAILURE_ACTIONS, &failure))
+                std::cerr << "Warning: failed to configure crash-recovery actions ("
+                          << GetLastError() << ")\n";
             // #1822: recovery actions only fire on a crash by default -- also fire
             // them on a clean exit with an error (e.g. the #1303 fail-closed
             // startup refusal), approximating systemd's Restart=always.
             SERVICE_FAILURE_ACTIONS_FLAG flag{TRUE};
-            ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &flag);
+            if (!ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &flag))
+                std::cerr << "Warning: failed to enable recovery-on-error-exit ("
+                          << GetLastError() << ")\n";
 
             std::cout << (updated_existing ? "Service 'YuzuAgent' updated\n"
                                            : "Service 'YuzuAgent' installed successfully\n");
