@@ -571,7 +571,23 @@ AuthManager::elevate_session(const std::string& token, std::chrono::seconds dura
     auto it = sessions_.find(token);
     if (it == sessions_.end())
         return std::nullopt;
-    const auto until = std::chrono::steady_clock::now() + duration;
+    // Clamp to the session's own absolute lifetime — an elevation can never
+    // outlive the cookie session that carries it (follow-up B, security review
+    // 2026-06-30). (std::min) parenthesised to dodge the <windows.h> `min`
+    // function-like macro on MSVC (see the note at validate_session below).
+    const auto now = std::chrono::steady_clock::now();
+    const auto until = (std::min)(now + duration, it->second.expires_at);
+    // Dead-window guard (governance hardening round, UP-1/UP-4): a session
+    // that crosses its own absolute expires_at between validate_session and
+    // this call clamps to `until <= now` — a window already in the past. Do
+    // NOT mutate the session or report success for that: no granted audit, no
+    // "200 ok" that misleads a scripted caller into believing it holds admin,
+    // and no later spurious `role.elevation.expired` for a window that never
+    // conferred privilege. The caller (POST /api/v1/elevate) already treats
+    // nullopt as "session vanished between validate and elevate" → 401, which
+    // is the correct outcome here too.
+    if (until <= now)
+        return std::nullopt;
     it->second.elevated_until = until;
     return until;
 }
@@ -586,6 +602,53 @@ bool AuthManager::revoke_elevation(const std::string& token) {
     const bool was_elevated = is_elevated(it->second);
     it->second.elevated_until = {}; // clear → effective role reverts to base
     return was_elevated;
+}
+
+std::optional<std::string> AuthManager::reap_expired_elevation(const std::string& token) {
+    if (token.size() > auth::kMaxSessionTokenLength)
+        return std::nullopt;
+
+    // Shared-lock-first (governance UP-1): this runs on EVERY authenticated
+    // cookie request via AuthRoutes::resolve_session, so it must match
+    // validate_session's discipline of staying on the shared lock in the
+    // overwhelmingly common case (no lapsed elevation to reap) — an
+    // unconditional exclusive lock here would reintroduce the full
+    // serialisation of dashboard auth on `mu_` that validate_session's
+    // need_write dance was built to avoid.
+    {
+        std::shared_lock lock(mu_);
+        auto it = sessions_.find(token);
+        if (it == sessions_.end())
+            return std::nullopt;
+        // Sentinel (epoch) means "never elevated" OR "already reaped/revoked"
+        // — nothing to report. Still-live means nothing to report yet either.
+        if (it->second.elevated_until.time_since_epoch().count() == 0 ||
+            std::chrono::steady_clock::now() < it->second.elevated_until)
+            return std::nullopt;
+    }
+
+    // A lapsed, non-sentinel elevation was observed — escalate to the
+    // exclusive lock to clear it. Re-find and re-check under the new lock
+    // (TOCTOU): another thread may have reaped, manually revoked
+    // (revoke_elevation / revoke_user_elevations), or invalidated the session
+    // entirely between the two locks. The exactly-once / no-double-emit
+    // guarantee is preserved by this re-check, not by the shared-lock probe.
+    std::unique_lock lock(mu_);
+    auto it = sessions_.find(token);
+    if (it == sessions_.end())
+        return std::nullopt;
+    if (it->second.elevated_until.time_since_epoch().count() != 0 &&
+        std::chrono::steady_clock::now() >= it->second.elevated_until) {
+        it->second.elevated_until = {};
+        return it->second.username;
+    }
+    return std::nullopt;
+}
+
+void AuthManager::expire_session_for_test(const std::string& token, std::chrono::seconds offset) {
+    std::unique_lock lock(mu_);
+    if (auto it = sessions_.find(token); it != sessions_.end())
+        it->second.expires_at -= offset;
 }
 
 int AuthManager::revoke_user_elevations(const std::string& username) {
@@ -932,6 +995,30 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     spdlog::info("OIDC session created for '{}' (email={}, sub={}, role={})",
                  display_name.empty() ? email : display_name, email, oidc_sub,
                  role_to_string(role));
+    return token;
+}
+
+// ── SAML session creation ───────────────────────────────────────────────────
+
+std::string AuthManager::create_saml_session(const std::string& name_id) {
+    std::unique_lock lock(mu_);
+
+    // Thin slice: role defaults to user — no group→role mapping (deferred).
+    // Security: admin role is NEVER granted from SAML without explicit group
+    // mapping (analogous to the OIDC admin_group_id guard — see C3 fix comment
+    // in create_oidc_session). Do not change this default without adding group
+    // mapping that is reviewed by security-guardian.
+    auto token = generate_session_token();
+    Session s;
+    s.username                   = name_id;
+    s.role                       = Role::user;
+    s.expires_at                 = std::chrono::steady_clock::now() + kSessionDuration;
+    s.auth_source                = "saml";
+    s.last_activity_at           = std::chrono::steady_clock::now();
+    s.last_activity_persisted_at = s.last_activity_at;
+    sessions_[token]             = std::move(s);
+
+    spdlog::info("SAML session created for '{}'", name_id);
     return token;
 }
 

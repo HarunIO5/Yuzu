@@ -219,6 +219,57 @@ TEST_CASE("REST inventory/software: fleet read returns rows, count, devices_omit
     CHECK_FALSE(h.has_audit("denied"));
 }
 
+TEST_CASE("REST inventory/software: rows carry the blob-v2 package fields",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    SoftwareEntry rpm;
+    rpm.name = "bash";
+    rpm.version = "5.2.21";
+    rpm.publisher = "Fedora Project";
+    rpm.install_date = "Mon 01 Jan 2026";
+    rpm.kind = "package";
+    rpm.ecosystem = "rpm";
+    rpm.epoch = "0";
+    rpm.release = "3.fc40";
+    rpm.arch = "x86_64";
+    rpm.signature_status = "signed";
+    rpm.distro_id = "fedora";
+    rpm.distro_version = "40";
+    // A v1-shaped row (only the 4 legacy fields) beside it: the v2 keys must
+    // still be present in the JSON, as empty strings (honest-empty contract).
+    seed(store, "dev-v2", {rpm, {"Google Chrome", "126", "Google", ""}});
+
+    InvHarness h{&store};
+    auto res = h.sink.Get("/api/v1/inventory/software?name=bash");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    const auto& sw = body.at("data").at("software");
+    REQUIRE(sw.size() == 1);
+    const auto& row = sw.at(0);
+    CHECK(row.at("kind").get<std::string>() == "package");
+    CHECK(row.at("ecosystem").get<std::string>() == "rpm");
+    CHECK(row.at("epoch").get<std::string>() == "0");
+    CHECK(row.at("release").get<std::string>() == "3.fc40");
+    CHECK(row.at("arch").get<std::string>() == "x86_64");
+    CHECK(row.at("signature_status").get<std::string>() == "signed");
+    CHECK(row.at("distro_id").get<std::string>() == "fedora");
+    CHECK(row.at("distro_version").get<std::string>() == "40");
+
+    auto res2 = h.sink.Get("/api/v1/inventory/software?name=Google Chrome");
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    const auto& row2 = body2.at("data").at("software").at(0);
+    CHECK(row2.at("kind").get<std::string>().empty());
+    CHECK(row2.at("ecosystem").get<std::string>().empty());
+    CHECK(row2.at("signature_status").get<std::string>().empty());
+    CHECK(row2.at("distro_version").get<std::string>().empty());
+}
+
 TEST_CASE("REST inventory/software: name filter narrows the fleet result",
           "[pg][rest][inventory_software]") {
     YUZU_REQUIRE_PG_DB(db);

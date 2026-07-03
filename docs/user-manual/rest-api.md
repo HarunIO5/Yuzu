@@ -151,21 +151,34 @@ All REST API v1 responses use a standard JSON envelope.
 }
 ```
 
-**Error:**
+**Error (A4 envelope):**
 
 ```json
 {
   "error": {
-    "code": 503,
-    "message": "human-readable message"
+    "code": 403,
+    "message": "human-readable message",
+    "correlation_id": "req-18f2a1c3d-2a",
+    "retry_after_ms": null,
+    "permission": "GuaranteedState:Read"
   },
   "meta": { "api_version": "v1" }
 }
 ```
 
-HTTP status codes follow standard conventions: `200` for success, `201` for resource creation, `400` for bad requests, `401` for unauthenticated, `403` for forbidden, `404` for not found, `503` for service unavailable. All error responses include the structured error envelope shown above, with the `code` field matching the HTTP status.
+HTTP status codes follow standard conventions: `200` for success, `201` for resource creation, `400` for bad requests, `401` for unauthenticated, `403` for forbidden, `404` for not found, `503` for service unavailable. Every `/api/v1/*` error response uses the structured **A4 error envelope** (per [`docs/agentic-first-principle.md`](../agentic-first-principle.md) §A4), with the `code` field matching the HTTP status. The envelope's fields:
 
-Newer agentic-first surfaces enrich `error` with two optional fields: `correlation_id` (a `req-<hex>` token also echoed on the `X-Correlation-Id` response header, for joining the response to server logs/audit rows) and, on `401`/`403` denials from per-device scoped-permission gates, `permission` — the `"SecurableType:Operation"` the caller was denied (e.g. `"GuaranteedState:Read"`). These fields are **additive**; clients parsing only `code`/`message` are unaffected. They are not yet emitted on every denial path (the admin-only / unscoped gates still return the bare envelope — a tracked follow-up), so automation must treat `correlation_id`/`permission` as present-when-available, not guaranteed.
+| Field | Always present | Meaning |
+|---|---|---|
+| `code` | yes | HTTP status echoed into the body for self-describing frames. |
+| `message` | yes | One-sentence human-readable summary. |
+| `correlation_id` | yes | A `req-<hex-ms>-<hex-seq>` token, also echoed on the `X-Correlation-Id` response header — join the response to server logs / audit rows by grepping this token. |
+| `retry_after_ms` | yes (nullable) | `null` unless the condition is retryable, in which case it advises how many milliseconds to back off (e.g. a `503` warm-up returns `5000`). |
+| `remediation` | when a hint exists | Natural-language self-recovery hint. Key is **omitted** when there is no hint (absence carries the same "no recovery available" meaning). |
+| `permission` | on permission denials | The `"SecurableType:Operation"` the caller was denied (e.g. `"Tag:Write"`) — the §A4 *kPermissionDenied* specialisation. Absent on whole-route admin gates that are not tied to a single securable. |
+| `approval_id` + `status_url` | reserved | The §A4 *kApprovalRequired* specialisation. Reserved for the Phase-2 approval re-dispatch flow; not populated by current denials (an approval-gated operation is denied with `permission` + `remediation` today, because no pollable approval exists yet). `status_url` points at `GET /api/v1/approvals/{id}`. |
+
+As of the R2 A4 completion (2026-07) **every** `/api/v1/*` error path — including the `require_admin`, `require_permission`, and service-scope denials in the auth layer — emits this envelope; the previous "bare `{error:{code,message}}`" and `{"error":"forbidden"}` shapes are gone. Clients parsing only `code`/`message` remain unaffected (the extra keys are additive). Denials from **other** (non-`/api/v1`) surfaces may still use legacy shapes (tracked as #1552), so automation crossing surfaces should treat the enrichment fields as present-when-available.
 
 ---
 
@@ -2668,15 +2681,23 @@ Omit both `name` and `agent_id` for a fleet-wide scan.
 {
   "data": {
     "software": [
-      {"agent_id": "agent-001", "name": "Google Chrome", "version": "124.0", "publisher": "Google LLC", "install_date": "2024-01-15"}
+      {"agent_id": "agent-001", "name": "bash", "version": "5.2.21", "publisher": "Fedora Project",
+       "install_date": "2026-01-15", "kind": "package", "ecosystem": "rpm", "epoch": "0",
+       "release": "3.fc40", "arch": "x86_64", "signature_status": "signed",
+       "distro_id": "fedora", "distro_version": "40"},
+      {"agent_id": "agent-002", "name": "Google Chrome", "version": "124.0", "publisher": "Google LLC",
+       "install_date": "2026-01-15", "kind": "app", "ecosystem": "windows", "epoch": "",
+       "release": "", "arch": "", "signature_status": "", "distro_id": "", "distro_version": ""}
     ],
-    "count": 1,
+    "count": 2,
     "devices_omitted": 0,
     "result_truncated_by_cap": true
   },
   "meta": { "api_version": "v1" }
 }
 ```
+
+Every row carries the **blob-v2 package fields** (`kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`) alongside the original four. A field the source ecosystem does not store is `""` — **never synthesised** (a Windows/macOS app row is honestly empty on every NEVRA/signature/distro field, as in the second example above). These 8 keys are **always present in every row** (never absent) — integration code should test for an empty-string value, not key absence. See `docs/user-manual/inventory.md` for the full per-ecosystem availability matrix.
 
 `devices_omitted` is always present (0 when no scope filtering occurred). `result_truncated_by_cap` is present only when `count == limit` and more rows may exist past the cap (keyset pagination is a follow-up, #1634). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
 
@@ -4512,6 +4533,33 @@ Enable or disable a schedule.
 
 ### Approvals
 
+#### `GET /api/v1/approvals/{id}`
+
+Fetch a single approval by id. This is the **A4 `status_url` target**: when an operation is denied with an approval-required envelope, a worker polls this endpoint for the current status rather than re-issuing the gated request. Requires `Approval:Read`. Read-only — it never mutates the approval lifecycle.
+
+**Response (200):** the standard v1 envelope wrapping an `Approval` object:
+
+```json
+{
+  "data": {
+    "id": "…",
+    "definition_id": "…",
+    "status": "pending",
+    "submitted_by": "alice",
+    "submitted_at": 1735689600,
+    "reviewed_by": "",
+    "reviewed_at": 0,
+    "review_comment": "",
+    "scope_expression": "tag:prod"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`status` is one of `pending` | `approved` | `rejected` | `expired`. The response always carries an `X-Correlation-Id` header.
+
+**Errors:** `404` (no approval matches the id — A4 envelope), `503` (approval store not initialised — A4 envelope with `retry_after_ms: 5000`).
+
 #### `GET /api/approvals`
 
 List approvals. Accepts `status` and `submitted_by` as query parameters.
@@ -5377,7 +5425,10 @@ Activate a time-boxed admin elevation (SOC 2 CC6.3/CC6.6) — see `docs/auth-arc
 
 Promote the **current cookie session** to admin for a bounded window. The session's effective role becomes `admin` until the window lapses, then auto-reverts.
 
-**Permission:** an authenticated **cookie** session only (a Bearer/MCP-token caller gets `401` — automation credentials can never elevate); the caller must be `elevation_eligible`; **MFA must be enrolled** (unconditionally, not gated on `--mfa-enforcement`) and a fresh MFA step-up is required.
+**Permission:** an authenticated **cookie** session only (a Bearer/MCP-token caller gets `401` — automation credentials can never elevate); the caller must be `elevation_eligible` (eligibility is keyed on a `users` table row — an OIDC identity with no such row is denied here, not later; provision it first via `POST /api/v1/users`). A second factor is mandatory, branched strictly on the session's identity source (never a local namesake's enrollment for an OIDC caller):
+
+- **Local session:** MFA must be enrolled (unconditionally, not gated on `--mfa-enforcement`) and a fresh MFA step-up (TOTP) is required.
+- **OIDC session:** a seeded `amr`-asserted MFA proof from the *current* IdP login satisfies the second-factor requirement — no local TOTP enrollment is consulted (default `--jit-oidc-amr-elevation=true`). A single-factor (no-`amr`) OIDC session is denied (`"no MFA in SSO login"`), and a seeded-but-stale proof still triggers the step-up challenge rather than a silent grant. With `--no-jit-oidc-amr-elevation`, OIDC sessions cannot elevate at all (`"OIDC-amr elevation is disabled"`) — they cannot present a local TOTP step-up (their step-up challenge is re-SSO), so the operator must switch to a local-authenticated session with local TOTP.
 
 **Body:** `{"justification": "<string, required>", "duration_secs": <int, optional>}`. `justification` must be non-empty (control bytes are sanitised to space; capped to 1 KiB). `duration_secs` defaults to `--jit-max-elevation-secs` when absent or `0`; a value above the cap is clamped; a negative value is a `400`.
 
@@ -5388,11 +5439,11 @@ curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
   "https://yuzu.example.com/api/v1/elevate"
 ```
 
-**Response (200):** `{"status":"ok","expires_in":<effective_secs>}`.
+**Response (200):** `{"status":"ok","expires_in":<seconds>,"expires_at":"<RFC3339 UTC>"}`. `expires_in` is the TRUE remaining time computed after the grant (not an echo of the requested `duration_secs`) — the window is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute expiry (an elevation can never outlive the cookie session that carries it), so `expires_in` is always `<=` the requested duration. `expires_at` is the wall-clock projection of that same window.
 
-**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), or the session dissolved mid-request; `403` — not eligible, eligibility read failed (fail-closed), **or no MFA enrolled**; the MFA step-up itself returns the standard step-up `401` challenge envelope (see `/login/mfa/stepup`); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — no `auth.db`.
+**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"); `403` — not eligible, eligibility read failed (fail-closed), **no MFA enrolled** (local session), **no MFA in the SSO login** (OIDC session with no `amr` proof), or **OIDC-amr elevation is disabled** (`--jit-oidc-amr-elevation` off); the MFA step-up itself returns the standard step-up `401` challenge envelope (see `/login/mfa/stepup`); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — no `auth.db`.
 
-**Audit:** `role.elevation.granted` (`detail=duration_secs=<N> justification=<sanitised>`) on success; `role.elevation.denied` on a `403`.
+**Audit:** `role.elevation.granted` (`detail=duration_secs=<N> mfa=<oidc_amr|local_totp> expires_at=<RFC3339 UTC> justification=<sanitised>` — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the free-text `justification=` field so a crafted justification can't forge either) on success; `role.elevation.denied` on a `403`, with a distinct `detail` reason per cause (not eligible / no MFA enrolled / no MFA in SSO login / OIDC-amr elevation disabled / mfa_step_up_refused). A window that later lapses PASSIVELY (no manual revoke) is audited lazily as `role.elevation.expired` on the operator's next authenticated request — see `docs/user-manual/audit-log.md`.
 
 #### `POST /api/v1/elevate/revoke`
 
@@ -5409,6 +5460,14 @@ Begin the OIDC SSO login flow. Redirects to the configured identity provider.
 #### `GET /auth/callback`
 
 OIDC callback endpoint. The identity provider redirects here after authentication. Exchanges the authorization code for tokens and creates a local session.
+
+#### `GET /auth/saml/start`
+
+Begin the SAML 2.0 SP-initiated login flow. Builds an `<samlp:AuthnRequest>` and redirects the browser to the configured IdP via HTTP-Redirect binding. Available only when all five `--saml-*` flags are set and the server is running on Linux or macOS.
+
+#### `POST /saml/acs`
+
+SAML Assertion Consumer Service endpoint. The IdP POSTs the `<samlp:Response>` here after authentication (HTTP-POST binding). The server validates the signed assertion (signature, audience, recipient, expiry, `InResponseTo` single-use) and mints a session cookie on success. On validation failure, the browser is redirected to `/login` with an error. Available only when SAML is enabled (see `GET /auth/saml/start`).
 
 ---
 

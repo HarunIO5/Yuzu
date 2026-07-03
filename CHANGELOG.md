@@ -9,6 +9,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Installed-software inventory gains package-manager fields (blob contract v2, ADR-0016).**
+  Every row in `GET /api/v1/inventory/software` and the `query_installed_software` MCP tool
+  now carries `kind` (package|app), `ecosystem` (rpm|deb|apk|pacman|windows|macos|homebrew),
+  `epoch`, `release`, `arch`, `signature_status` (rpm only, from stored rpm header tags —
+  never a live `rpm -K` verification), `distro_id`, and `distro_version`, alongside the
+  original name/version/publisher/install_date. A field the ecosystem does not store is
+  `""`, never synthesised — see `docs/user-manual/inventory.md` for the full per-ecosystem
+  matrix. Collection is a new `installed_apps` plugin action, `list_inventory`; the
+  operator-facing `list`/`query`/`list_per_user` actions are unchanged. New `apk`
+  (Alpine) package enumeration on the sync path. **Breaking — data shift on Linux
+  rpm fleets:** `publisher` now reflects the rpm PACKAGER tag (was VENDOR), and `version`
+  is upstream-only with the release moved to its own column (was fused
+  `VERSION-RELEASE`). A saved query/dashboard filter against the old `publisher` or
+  fused `version` shape on rpm hosts will silently stop matching post-upgrade — see
+  `docs/user-manual/inventory.md` before relying on either field in existing
+  automation. No wire-protocol or gateway change (the fields ride inside the
+  existing opaque sync blob). **Upgrade note:** deploy the server before agents; each
+  agent's first post-upgrade sync triggers one expected full resend (`need_full`),
+  phase-spread across the daily sync window, self-healing.
+- **JIT elevation: OIDC amr-asserted MFA satisfies the second-factor
+  requirement.** An OIDC operator can now activate `POST /api/v1/elevate`
+  when their SSO session was authenticated with IdP MFA — asserted via the
+  OIDC `amr` claim and seeded into `Session::mfa_verified_at` at
+  `/auth/callback` (the same mechanism OIDC login step-up already used).
+  Closes the v1 limitation tracked in
+  `docs/security-reviews/jit-elevation-2026-06-30.md`. Eligibility and MFA
+  status are both keyed on a `users` table row, which OIDC login does not
+  create — a federated-only identity needs one provisioned first (e.g.
+  `POST /api/v1/users`). The mandatory-MFA gate branches EXPLICITLY on
+  identity source: an OIDC session's only acceptable factor is a **seeded**
+  proof (`mfa_verified_at != epoch`, never merely `auth_source == "oidc"`,
+  security-F1) with the toggle on, and it can **never** fall through to a
+  local namesake account's TOTP enrollment (a hardening-round fix — the first
+  cut's single-flag guard allowed exactly that fallthrough, mislabeling the
+  audit trail). A single-factor (no-`amr`) SSO session is hard-denied with
+  its own distinct reason; a stale seeded proof still falls through to the
+  existing step-up freshness challenge rather than a silent grant. New toggle
+  `--jit-oidc-amr-elevation` / `YUZU_JIT_OIDC_AMR_ELEVATION` (default true;
+  `--no-jit-oidc-amr-elevation` disables JIT elevation for OIDC sessions
+  entirely — they cannot fall back to a local TOTP step-up, since their
+  step-up challenge is re-SSO, not a TOTP code). A one-time INFO log line
+  announces the posture at boot when OIDC is configured. The
+  `role.elevation.granted` audit detail records the factor source
+  (`duration_secs=<n> mfa=<oidc_amr|local_totp> expires_at=<rfc3339> justification=<text>`
+  — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the
+  free-text `justification=` field so a crafted justification can't forge either).
+- **JIT admin elevation follow-ups: passive-lapse audit + absolute `expires_at` (SOC 2
+  CC6.3/CC6.6).** Closes the two residual risks tracked in
+  `docs/security-reviews/jit-elevation-2026-06-30.md`. (A) A JIT elevation window that
+  lapses PASSIVELY (no manual `POST /api/v1/elevate/revoke`) is now audited as
+  `role.elevation.expired` — emitted LAZILY (no new background thread) by
+  `AuthManager::reap_expired_elevation`, called from the `AuthRoutes::resolve_session`
+  cookie chokepoint on the operator's first authenticated request after the window
+  elapses; exactly-once, and a manual revoke never also produces a spurious `expired`
+  row. (B) `POST /api/v1/elevate`'s window is now clamped to the session's own absolute
+  expiry (`AuthManager::elevate_session`), so an elevation can never outlive its cookie
+  session; the response reports the TRUE remaining time as `expires_in` plus a new
+  wall-clock `expires_at` (RFC3339 UTC), and the `role.elevation.granted` audit detail
+  carries `expires_at` too.
+- **SAML 2.0 SP — thin first slice.** SP-initiated login against a single, statically-pinned IdP.
+  HTTP-Redirect binding for the `AuthnRequest`; HTTP-POST binding at the Assertion Consumer Service
+  (`POST /saml/acs`). Assertion signature is validated against the pinned IdP cert (in-document
+  `<KeyInfo>` ignored); XML signature-wrapping attacks are defended; audience, recipient, and
+  expiry are validated; `InResponseTo` is solicited-only and single-use (replay-protected). Sessions
+  are ephemeral (`auth_source="saml"`, `role=user`). **Linux and macOS only** — Windows fails closed
+  at startup. Five new flags / env vars: `--saml-idp-entity-id` (`YUZU_SAML_IDP_ENTITY_ID`),
+  `--saml-idp-sso-url` (`YUZU_SAML_IDP_SSO_URL`), `--saml-idp-cert` (`YUZU_SAML_IDP_CERT`),
+  `--saml-sp-entity-id` (`YUZU_SAML_SP_ENTITY_ID`), `--saml-sp-acs-url` (`YUZU_SAML_SP_ACS_URL`).
+  Audit: `auth.saml_login` (result=ok) / `auth.saml_login_failed` (result=error). Partially closes
+  `/auth-and-authz` gap-matrix P1 #6. Fast-follow work (observability, proxy-TLS/HA, IdP metadata,
+  group→role mapping, AuthnRequest signing, hardening) is tracked in #1789. See
+  `docs/auth-architecture.md` "SAML 2.0 SP", `docs/user-manual/authentication.md` "SAML 2.0 SSO",
+  and the security review `docs/security-reviews/saml-sp-2026-07-01.md`.
 - **`/inventory` Devices tab shows real device-CI data.** The Serial/Model/CPU-RAM
   columns (previously greyed placeholders) now read from `DeviceInventoryStore`, and
   the per-device drill grows a full CI-record panel (manufacturer, model, serial,
@@ -299,6 +372,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   degraded (pool/query failure), so a fleet vulnerability query can never read a transient backend
   hiccup as "installed nowhere". An ingest report carrying an implausibly large source map is rejected
   wholesale, and concurrent-replace serialization uses a 64-bit advisory-lock key.
+
+### Changed
+
+- **`POST /api/v1/elevate` response contract: `expires_in` now reports TRUE remaining seconds, not
+  the requested duration.** Previously `expires_in` echoed the requested/capped `duration_secs`
+  verbatim. It now reflects the actual remaining window computed after the grant (always `<=` the
+  requested duration — the window is clamped both to `--jit-max-elevation-secs` and to the calling
+  session's own absolute expiry) and is accompanied by a new `expires_at` (RFC3339 UTC) field.
+  Integrators comparing `expires_in` for exact equality against their requested `duration_secs` should
+  switch to a `<=` comparison. A session already at/past its own absolute lifetime is now rejected
+  `401` rather than granted a zero-length window (governance hardening round, UP-1/UP-4).
 
 ### Security
 
