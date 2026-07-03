@@ -552,17 +552,22 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 Eligibility is the per-user `users.elevation_eligible` flag — distinct from holding standing admin, and enumerable for access reviews. An admin **cannot** grant their own eligibility (another admin must). Revoking it (`{"eligible":false}`) immediately ends any elevation the user currently holds.
 
-**2. The eligible operator elevates** when they need admin. The operator must have **MFA enrolled** (a second factor is mandatory to elevate, regardless of `--mfa-enforcement`) and will be challenged for a fresh TOTP code:
+**Prerequisite for a federated (OIDC/SSO) operator:** eligibility is keyed on a Yuzu `users` table row, and signing in via OIDC does **not** create one. A federated-only identity must already have a `users` row — provision it first (e.g. `POST /api/v1/users`) — or the eligibility call above 404s. This is a known limitation; auto-provisioning eligibility by OIDC identity is tracked as a follow-up, not yet implemented.
+
+**2. The eligible operator elevates** when they need admin. A second factor is mandatory to elevate, regardless of `--mfa-enforcement`, and satisfied one of two ways depending on how the operator is currently authenticated (their identity SOURCE, not their username — an OIDC session never consults a local namesake account's TOTP enrollment):
+
+- **Local account:** the operator must have **MFA enrolled** and will be challenged for a fresh TOTP code.
+- **OIDC/SSO account:** if the operator's *current* SSO login was authenticated with IdP MFA (asserted via the OIDC `amr` claim), that assertion satisfies the second-factor requirement — **no local TOTP enrollment needed**. A single-factor SSO login (no IdP MFA) is still denied. This is controlled by `--jit-oidc-amr-elevation` (default enabled). Disabling it (`--no-jit-oidc-amr-elevation`) means **OIDC sessions cannot use JIT elevation at all** — an OIDC session cannot present a local TOTP step-up (its step-up challenge is re-authenticating via SSO, not a TOTP code), so the operator must elevate from a local-authenticated session with local TOTP instead.
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"justification":"prod incident #42","duration_secs":600}' \
   https://yuzu.example.com/api/v1/elevate
-# -> {"status":"ok","expires_in":600}
+# -> {"status":"ok","expires_in":598,"expires_at":"2026-07-02T13:10:00Z"}
 ```
 
-The session is now admin for the window (capped by `--jit-max-elevation-secs`, default 1h). It **auto-reverts** when the window lapses, on logout, or on a server restart — the elevation is never persisted. Step down early with `POST /api/v1/elevate/revoke`. Every step (`role.elevation.granted`/`denied`/`revoked`, `user.elevation_eligibility.set`) is audited. Technical invariants: `docs/auth-architecture.md` "JIT admin elevation".
+`expires_in` is the TRUE remaining seconds computed after the grant (always `<=` the requested `duration_secs` — it is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute lifetime, so it is never an exact echo of the request), and `expires_at` is the same window as a wall-clock RFC3339 UTC timestamp. The session is now admin for the window (capped by `--jit-max-elevation-secs`, default 1h). It **auto-reverts** when the window lapses, on logout, or on a server restart — the elevation is never persisted. Step down early with `POST /api/v1/elevate/revoke`. Every step (`role.elevation.granted`/`denied`/`revoked`/`expired`, `user.elevation_eligibility.set`) is audited — the `granted` row's detail records which factor was used (`mfa=local_totp` or `mfa=oidc_amr`). Technical invariants: `docs/auth-architecture.md` "JIT admin elevation".
 
 ## MCP Tokens
 
