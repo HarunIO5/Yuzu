@@ -110,8 +110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on a fresh install with no prior service, to avoid a needless wait) instead of a blind 2-second
   delay, since `sc stop` only actually completes with this fix. The service still registers to run
   as LocalSystem (unchanged from before this fix) — migrating it to the least-privilege
-  `NT SERVICE\YuzuAgent` virtual account per `docs/agent-privilege-model.md` is tracked as a
-  follow-up, not part of this fix.
+  `NT SERVICE\YuzuAgent` virtual account is the existing, already-tracked #1442, not part of
+  this fix; see `docs/agent-privilege-model.md`.
 
 ## [0.13.0] - 2026-07-01
 

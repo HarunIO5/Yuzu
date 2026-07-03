@@ -1200,7 +1200,7 @@ REM Remove it
 yuzu-agent.exe --remove-service
 ```
 
-The service currently registers to run as **LocalSystem** (unchanged by the #1822 SCM-protocol fix). Moving it to a least-privilege account requires a manual post-install `sc.exe config obj= "NT SERVICE\YuzuAgent"` plus directory ACLs the installer doesn't set today — see `docs/agent-privilege-model.md` for the tracked follow-up and the [Service Account](#service-account) guidance below (written for the server, but the same `obj=` mechanism applies).
+The service currently registers to run as **LocalSystem** (unchanged by the #1822 SCM-protocol fix — tracked separately as #1442). Moving it to a least-privilege account requires a manual post-install `sc.exe config obj= "NT SERVICE\YuzuAgent"` plus directory ACLs the installer doesn't set today — see `docs/agent-privilege-model.md` and #1442 for the tracked follow-up, and the [Service Account](#service-account) guidance below (written for the server, but the same `obj=` mechanism applies).
 
 Re-running `--install-service` is idempotent — it updates an existing registration's binPath in place rather than failing with "service already exists", so it's safe to re-run after an upgrade. **It resets binPath to the bare exe + `--service` marker** (the same minimal form shown above), dropping any `--server`/`--data-dir`/`--plugin-dir`/`--log-file` a prior `sc config` had applied — always follow it with `sc.exe config` to restore your runtime args, exactly as the installer's own `[Run]` sequence does (`--install-service` then `sc config` then `sc start`). Recovery actions (3 restarts, 60s apart, resetting after 24h) are configured automatically and fire on both crashes and clean-exit-with-error.
 
@@ -1236,7 +1236,7 @@ nssm install YuzuAgent "C:\Yuzu\yuzu-agent.exe"
 
 REM Set arguments (no --service for the NSSM-wrapped agent)
 nssm set YuzuServer AppParameters "--https-cert C:\Yuzu\certs\server.crt --https-key C:\Yuzu\certs\server.key"
-nssm set YuzuAgent AppParameters "--server-address yuzu.example.com:50051"
+nssm set YuzuAgent AppParameters "--server yuzu.example.com:50051"
 
 REM Configure startup and recovery
 nssm set YuzuServer Start SERVICE_DELAYED_AUTO_START

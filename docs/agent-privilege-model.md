@@ -9,7 +9,7 @@
 
 ## TL;DR
 
-The Yuzu agent runs under a dedicated unprivileged account (`yuzu` on Linux, `YuzuAgent` or virtual `NT SERVICE\YuzuAgent` on Windows). Plugins that need privileged operations shell out via narrow `sudo NOPASSWD` entries (Linux) or rely on the service account's pre-granted LSA privileges (Windows). On **Linux and Windows** the agent's own process **never runs as root or LocalSystem**.
+The Yuzu agent is *designed* to run under a dedicated unprivileged account (`yuzu` on Linux, `YuzuAgent` or virtual `NT SERVICE\YuzuAgent` on Windows). Plugins that need privileged operations shell out via narrow `sudo NOPASSWD` entries (Linux) or rely on the service account's pre-granted LSA privileges (Windows). On **Linux** the agent's own process never runs as root. **On Windows this is not yet true in practice** — see the Correction below and tracked issue **#1442**: the Windows service currently registers and runs as **LocalSystem**, not the virtual service account.
 
 **macOS is the current exception.** The shipped LaunchDaemon (`deploy/packaging/macos/com.yuzu.agent.plist`) has no `UserName` key, so launchd runs the agent as **root**. This is required today: the TAR process stream's Endpoint Security client (`es_new_client`) needs root + the `com.apple.developer.endpoint-security.client` entitlement, and several macOS collectors read system-wide state. The `_yuzu` unprivileged-account model is therefore **not yet applied on macOS** — narrowing macOS to a non-root, ES-entitled account is tracked as future hardening in **#1455** (the ESF programming model generally requires root). Until then, treat the macOS agent as root-privileged.
 
@@ -67,7 +67,7 @@ The chosen model also lets `script_exec.exec` / `script_exec.bash` / `script_exe
 
 The production virtual-service-account path is preferred wherever it can be used. The local-user path exists for dev environments where the service hasn't been registered yet (typically during `/test` runs that exercise the agent binary directly).
 
-**Correction (2026-07-03, #1822):** the table above describes the intended target, not what's registered today. `CreateServiceW`'s `lpServiceStartName` (`agents/core/src/main.cpp`, the `--install-service` handler) is `nullptr`, and the installer's `sc config` only ever sets `binPath=` — neither ever passes `obj= "NT SERVICE\YuzuAgent"`. The service therefore registers and runs as **LocalSystem**, not the virtual service account, on every build to date. #1822 fixed the separate (and more urgent) bug that the service couldn't start *at all* (error 1053, missing `ServiceMain`/SCM control protocol) without touching the account — LocalSystem was left as-is deliberately, so the account fix could land as its own reviewable change against a service that actually starts and stops. Wiring the virtual account is tracked as a follow-up (also needs `NT SERVICE\YuzuAgent` ACLs on the data/log directories, which the installer doesn't set today either).
+**Correction (2026-07-03, #1822):** the table above describes the intended target, not what's registered today. `CreateServiceW`'s `lpServiceStartName` (`agents/core/src/main.cpp`, the `--install-service` handler) is `nullptr`, and the installer's `sc config` only ever sets `binPath=` — neither ever passes `obj= "NT SERVICE\YuzuAgent"`. The service therefore registers and runs as **LocalSystem**, not the virtual service account, on every build to date. This is the existing, already-tracked **#1442** ("Windows agent service registered as LocalSystem — violates dedicated service-account privilege model"), open since 2026-06-15. #1822 fixed the separate (and more urgent) bug that the service couldn't start *at all* (error 1053, missing `ServiceMain`/SCM control protocol) without touching the account — LocalSystem was left as-is deliberately, so #1442's account fix can land as its own reviewable change against a service that actually starts and stops. #1442 also needs `NT SERVICE\YuzuAgent` ACLs on the data/log directories, which the installer doesn't set today either.
 
 ---
 
@@ -231,7 +231,7 @@ Windows LSA grants leave no on-disk artifact equivalent to a sudoers file. The `
 For a periodic audit, a `security-guardian` agent should:
 - Diff `/etc/sudoers.d/yuzu-agent` against the install script's `generate_sudoers_content` output. Any drift means an operator hand-edited the file (a violation of the model).
 - Diff the live policy's USER_RIGHTS section against this doc's matrix. Any privilege not listed here means an operator hand-granted via `secedit` or the Group Policy Editor.
-- Confirm the agent process is not running as root / LocalSystem (unless it's a deliberate development override; production images should refuse to start as root, see future hardening).
+- Confirm the agent process is not running as root on Linux (unless it's a deliberate development override; production images should refuse to start as root, see future hardening). On Windows, confirm the running account against #1442's status — as of this doc's last update the service still registers as LocalSystem (a KNOWN, tracked gap, not a fresh finding to re-escalate) until #1442 lands.
 
 ---
 
