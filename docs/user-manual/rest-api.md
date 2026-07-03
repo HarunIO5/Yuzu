@@ -4677,21 +4677,34 @@ Cancel a running execution.
 
 ### Schedules
 
+A schedule fires unattended through the background `ScheduleRunner` poller with no
+further permission check at fire time — so schedule creation, and re-enabling a
+disabled schedule, are the only gates against a Schedule:Write-only principal reaching
+fleet-wide command dispatch. Delete and enable/disable are owner-scoped: they only
+affect a schedule whose `created_by` matches the caller.
+
 #### `GET /api/schedules`
 
-List schedules. Accepts `definition_id` and `enabled_only` as query parameters.
+List schedules. Accepts `definition_id` and `enabled_only` as query parameters. Requires `Schedule:Read`.
 
 #### `POST /api/schedules`
 
-Create a recurring schedule for an instruction definition. Supports cron expressions.
+Create a recurring schedule for an instruction definition. Requires **both**
+`Schedule:Write` and `Execution:Execute` — a schedule is a fleet-wide command-dispatch
+primitive (empty `scope_expression` targets every agent; `requires_approval` defaults to
+`false`).
 
 #### `DELETE /api/schedules/{id}`
 
-Delete a schedule.
+Delete a schedule you created. Requires `Schedule:Delete`; a schedule created by another
+principal is left untouched (reports `deleted: false`, same as a nonexistent id).
 
 #### `POST /api/schedules/{id}/enable`
 
-Enable or disable a schedule.
+Enable or disable a schedule you created. Requires `Schedule:Write`; enabling (but not
+disabling) additionally requires `Execution:Execute`, since enabling arms the schedule to
+fire — an operator can always disable a schedule to stop it even without
+`Execution:Execute`.
 
 ---
 

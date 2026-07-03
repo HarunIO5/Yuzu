@@ -93,6 +93,8 @@
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
+#include "schedule_routes.hpp"
+#include "schedule_runner.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
 #include "fleet_topology_store.hpp"
@@ -3061,6 +3063,15 @@ public:
             preflight_runner_thread_.join();
         }
         preflight_runner_.reset();
+
+        // Join the schedule tick thread (borrows schedule_engine_ + the
+        // instruction/execution/approval/audit stores via schedule_runner_ —
+        // must stop before any of them are torn down), then drop the runner
+        // so its borrowed pointers can't be ticked again.
+        if (schedule_tick_thread_.joinable()) {
+            schedule_tick_thread_.join();
+        }
+        schedule_runner_.reset();
 
         // Join the result-set maintenance thread (borrows result_set_store_,
         // execution_tracker_, response_store_ — must stop before teardown)
@@ -7667,47 +7678,10 @@ private:
 
         web_server_->Post("/api/schedules", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
-            if (!require_permission(req, res, "Schedule", "Write"))
-                return;
-            if (!schedule_engine_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            try {
-                auto j = nlohmann::json::parse(req.body);
-                InstructionSchedule sched;
-                sched.name = j.value("name", "");
-                sched.definition_id = j.value("definition_id", "");
-                sched.frequency_type = j.value("frequency_type", "once");
-                sched.interval_minutes = j.value("interval_minutes", 60);
-                sched.time_of_day = j.value("time_of_day", "00:00");
-                sched.day_of_week = j.value("day_of_week", 0);
-                sched.day_of_month = j.value("day_of_month", 1);
-                sched.scope_expression = j.value("scope_expression", "");
-                sched.requires_approval = j.value("requires_approval", false);
-
-                if (auto session = auth_routes_->resolve_session(req))
-                    sched.created_by = session->username;
-
-                auto result = schedule_engine_->create_schedule(sched);
-                if (!result) {
-                    res.status = 400;
-                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
-                                    "application/json");
-                    return;
-                }
-                (void)audit_log(req, "schedule.create", "success", "schedule", *result, sched.name);
-                res.set_header("HX-Trigger",
-                               R"({"showToast":{"message":"Schedule created","level":"success"}})");
-                res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
-            } catch (const std::exception& e) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
-            }
+            // Extracted to schedule_routes.cpp (H-01, #1806): the
+            // Schedule:Write + Execution:Execute gate ordering needs direct
+            // unit coverage that a bare inline lambda cannot get.
+            handle_create_schedule(*auth_routes_, schedule_engine_.get(), req, res);
         });
 
         web_server_->Delete(R"(/api/schedules/([^/]+))", [this](const httplib::Request& req,
@@ -7723,7 +7697,14 @@ private:
             }
 
             auto id = req.matches[1].str();
-            bool deleted = schedule_engine_->delete_schedule(id);
+            // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
+            // deletes only schedules the caller created, not the whole
+            // fleet's. auth_routes_->resolve_session, not require_permission's
+            // session (already consumed) — this call cannot fail auth since
+            // require_permission above already proved a valid session exists.
+            auto session = auth_routes_->resolve_session(req);
+            auto user = session ? session->username : std::string();
+            bool deleted = schedule_engine_->delete_schedule(id, user);
             if (deleted) {
                 (void)audit_log(req, "schedule.delete", "success", "schedule", id);
                 res.set_header("HX-Trigger",
@@ -7747,7 +7728,24 @@ private:
             auto id = req.matches[1].str();
             auto enabled_str = extract_json_string(req.body, "enabled");
             bool enabled = (enabled_str != "false");
-            schedule_engine_->set_enabled(id, enabled);
+            // H-01 (#1806): re-enabling arms the schedule to fire unattended
+            // through ScheduleRunner — the same fleet-wide-dispatch concern
+            // as create, so it needs the same Execution:Execute gate.
+            // Disabling only ever stops a schedule, so it stays gated on
+            // Schedule:Write alone — an operator must be able to kill a
+            // runaway schedule even without Execution:Execute.
+            if (enabled && !require_permission(req, res, "Execution", "Execute"))
+                return;
+
+            // M-01 (#1806): owner-scoped enable/disable, same as delete above.
+            auto session = auth_routes_->resolve_session(req);
+            auto user = session ? session->username : std::string();
+            bool changed = schedule_engine_->set_enabled(id, enabled, user);
+            if (changed) {
+                // L-04 (#1806): enable/disable had no audit trail at all.
+                (void)audit_log(req, enabled ? "schedule.enable" : "schedule.disable", "success",
+                                "schedule", id);
+            }
             res.set_content(nlohmann::json({{"enabled", enabled}}).dump(), "application/json");
         });
 
@@ -8653,6 +8651,61 @@ private:
                         spdlog::error("deployment prune threw ({}) — thread continuing", e.what());
                     } catch (...) {
                         spdlog::error("deployment prune threw unknown exception — continuing");
+                    }
+                }
+            }
+        });
+
+        // ScheduleRunner (#1191) — drives recurring-instruction schedules.
+        // ScheduleEngine::evaluate_due/advance_schedule had no production
+        // caller: schedules persisted and listed but never fired. Fires travel
+        // the same dispatch lambda as operator commands with tracked
+        // create-before-dispatch execution rows; approval-gated fires wait on
+        // the approvals queue (see schedule_runner.hpp). Joined BEFORE the
+        // stores in stop().
+        metrics_.describe("yuzu_schedule_fires_total",
+                          "Scheduled instruction occurrences dispatched successfully", "counter");
+        metrics_.describe("yuzu_schedule_fire_failures_total",
+                          "Scheduled occurrences skipped or failed (unknown/disabled definition, "
+                          "dispatch failure, no agents in scope, approval submit failure)",
+                          "counter");
+        metrics_.describe("yuzu_schedule_approvals_submitted_total",
+                          "Approval tickets submitted by the schedule runner for approval-gated "
+                          "occurrences",
+                          "counter");
+        metrics_.describe("yuzu_schedule_tick_errors_total",
+                          "Schedule runner tick() exceptions caught (alertable on sustained rate)",
+                          "counter");
+        schedule_runner_ = std::make_unique<ScheduleRunner>(ScheduleRunner::Deps{
+            .schedule_engine = schedule_engine_.get(),
+            .instruction_store = instruction_store_.get(),
+            .execution_tracker = execution_tracker_.get(),
+            .approval_manager = approval_manager_.get(),
+            .audit_store = audit_store_.get(),
+            .metrics = &metrics_,
+            .dispatch_fn = command_dispatch_fn,
+        });
+        schedule_tick_thread_ = std::thread([this]() {
+            spdlog::info("Schedule runner thread started (cadence=30s)");
+            while (!stop_requested_.load(std::memory_order_acquire)) {
+                for (int i = 0; i < 6 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
+                if (schedule_runner_) {
+                    // tick() touches SQLite and gRPC dispatch — either can
+                    // throw, and an exception escaping a std::thread entry
+                    // calls std::terminate, so one bad schedule must not take
+                    // the process. Catch, log, keep ticking.
+                    try {
+                        schedule_runner_->tick();
+                    } catch (const std::exception& e) {
+                        metrics_.counter("yuzu_schedule_tick_errors_total").increment();
+                        spdlog::error("schedule_runner: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        metrics_.counter("yuzu_schedule_tick_errors_total").increment();
+                        spdlog::error("schedule_runner: tick threw unknown exception — continuing");
                     }
                 }
             }
@@ -10567,6 +10620,7 @@ private:
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;
     std::unique_ptr<PreflightRunner> preflight_runner_; // borrows run+response stores
+    std::unique_ptr<ScheduleRunner> schedule_runner_;   // borrows engine + stores (#1191)
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
     std::unique_ptr<BaselineStore> baseline_store_;
     std::unique_ptr<CaStore> ca_store_;
@@ -10717,6 +10771,7 @@ private:
     std::thread policy_eval_thread_;
     std::thread app_perf_rollup_thread_;
     std::thread preflight_runner_thread_; // joined before stores in stop()
+    std::thread schedule_tick_thread_;    // drives ScheduleRunner (#1191); joined before stores
     std::thread result_set_maint_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
