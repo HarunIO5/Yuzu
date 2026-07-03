@@ -1060,11 +1060,13 @@ private:
     int do_collect_perf(yuzu::CommandContext& ctx) {
         int rc = 0;
         if (!source_enabled(*db_, "perf")) {
-            ctx.write_output("tar|collect_perf|0|source_disabled");
+            ctx.write_output(std::format("tar|collect_perf|0|{}",
+                                         yuzu::tar::kCollectStatusSourceDisabled));
         } else {
             const auto cur = yuzu::tar::read_perf_counters(); // syscalls, no lock held
             if (!cur.valid) {
-                ctx.write_output("tar|collect_perf|0|unsupported_platform");
+                ctx.write_output(std::format("tar|collect_perf|0|{}",
+                                             yuzu::tar::kCollectStatusUnsupportedPlatform));
             } else {
                 bool perf_enabled_now = true;
                 yuzu::tar::PerfSample sample;
@@ -1082,9 +1084,11 @@ private:
                     }
                 }
                 if (!perf_enabled_now) {
-                    ctx.write_output("tar|collect_perf|0|source_disabled");
+                    ctx.write_output(std::format("tar|collect_perf|0|{}",
+                                                 yuzu::tar::kCollectStatusSourceDisabled));
                 } else if (!sample.valid) {
-                    ctx.write_output("tar|collect_perf|0|baseline");
+                    ctx.write_output(std::format("tar|collect_perf|0|{}",
+                                                 yuzu::tar::kCollectStatusBaseline));
                 } else {
                     yuzu::tar::PerfRow row;
                     row.ts = cur.ts_epoch;
@@ -1102,7 +1106,8 @@ private:
                         ctx.write_output("error|perf insert failed");
                         rc = 1;
                     } else {
-                        ctx.write_output("tar|collect_perf|1|sample_recorded");
+                        ctx.write_output(std::format("tar|collect_perf|1|{}",
+                                                     yuzu::tar::kCollectStatusSampleRecorded));
                     }
                 }
             }
@@ -1119,12 +1124,14 @@ private:
         // defaults missing keys to enabled). See docs/dex-brd-coverage.md and
         // memory project-telemetry-privacy-works-council.
         if (db_->get_config("procperf_enabled", "false") != "true") {
-            ctx.write_output("tar|collect_procperf|0|source_disabled");
+            ctx.write_output(std::format("tar|collect_procperf|0|{}",
+                                         yuzu::tar::kCollectStatusSourceDisabled));
             return rc;
         }
         auto proc_cur = yuzu::tar::read_proc_counters(); // one snapshot, no lock held
         if (!proc_cur.valid) {
-            ctx.write_output("tar|collect_procperf|0|unsupported_platform");
+            ctx.write_output(std::format("tar|collect_procperf|0|{}",
+                                         yuzu::tar::kCollectStatusUnsupportedPlatform));
             return rc;
         }
         const auto ts = proc_cur.ts_epoch; // before the move; never read prev_proc_ unlocked
@@ -1145,11 +1152,13 @@ private:
             }
         }
         if (!procperf_enabled_now) {
-            ctx.write_output("tar|collect_procperf|0|source_disabled");
+            ctx.write_output(std::format("tar|collect_procperf|0|{}",
+                                         yuzu::tar::kCollectStatusSourceDisabled));
             return rc;
         }
         if (samples.empty()) {
-            ctx.write_output("tar|collect_procperf|0|baseline");
+            ctx.write_output(std::format("tar|collect_procperf|0|{}",
+                                         yuzu::tar::kCollectStatusBaseline));
             return rc;
         }
         // Resolve each app's on-disk file version OUTSIDE collect_mu_ — the
@@ -1177,7 +1186,8 @@ private:
             ctx.write_output("error|procperf insert failed");
             return 1;
         }
-        ctx.write_output(std::format("tar|collect_procperf|{}|apps_recorded", rows.size()));
+        ctx.write_output(std::format("tar|collect_procperf|{}|{}", rows.size(),
+                                     yuzu::tar::kCollectStatusAppsRecorded));
         return rc;
     }
 

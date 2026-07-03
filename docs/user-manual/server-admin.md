@@ -183,7 +183,11 @@ working set, by image name) to the TAR edge warehouse. **It is off by default**
 (`procperf_enabled=false`) and collects nothing until an operator opts in — it
 is a distinct, usage-class telemetry category subject to works-council / DPA
 review, separate from the device-level performance sampling (`perf_enabled`,
-on by default, no per-app identity) that shipped in the prior release. To
+on by default, no per-app identity) that shipped in the prior release **on
+Windows** — on Linux, device-level sampling starts automatically **on upgrade
+to this release** (see the upgrade checklist in the user manual's
+[Upgrading](upgrading.md) page and the TAR manual's upgrade note; opt out per
+host with `perf_enabled=false`). To
 enable per-app sampling, set `procperf_enabled=true` via a TAR `configure`
 instruction (fleet-wide or per-device). The data is image names only (no
 command lines), 7-day raw / 31-day hourly retention, and is captured in the

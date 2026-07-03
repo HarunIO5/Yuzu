@@ -13,6 +13,7 @@
  * rest runs on every host.
  */
 
+#include "tar_collectors.hpp" // kCollectStatus* — the operator-facing token contract
 #include "tar_perf.hpp"
 #include "tar_schema_registry.hpp"
 
@@ -399,6 +400,18 @@ TEST_CASE("perf: Linux end-to-end — two parsed instants through derive_sample"
     CHECK(s.disk_write_lat_us == 250);
     CHECK(s.net_rx_bps == 100'000);
     CHECK(s.net_tx_bps == 50'000);
+}
+
+TEST_CASE("perf: collect-status tokens are a pinned operator contract", "[tar][perf]") {
+    // The emit sites in tar_plugin.cpp use these constants, so together with
+    // this pin the documented tokens (yaml-dsl-spec.md tar.collect_perf;
+    // operator dashboards parse them) cannot drift silently — renaming one is
+    // a deliberate contract change that must update doc + pin together.
+    CHECK(kCollectStatusSourceDisabled == "source_disabled");
+    CHECK(kCollectStatusUnsupportedPlatform == "unsupported_platform");
+    CHECK(kCollectStatusBaseline == "baseline");
+    CHECK(kCollectStatusSampleRecorded == "sample_recorded");
+    CHECK(kCollectStatusAppsRecorded == "apps_recorded");
 }
 
 // ── Schema registry pins ─────────────────────────────────────────────────────
