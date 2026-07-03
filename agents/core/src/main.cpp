@@ -385,13 +385,18 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    // Signal handling
-    std::signal(SIGINT, on_signal);
-    std::signal(SIGTERM, on_signal);
-
     auto agent = make_agent(std::move(cfg));
     if (!agent)
         return EXIT_FAILURE;
+
+    // Signal handling — installed only once `agent` exists, so on_signal (which
+    // no-ops when g_agent is null) never silently swallows a Ctrl-C/SIGTERM that
+    // arrives during make_agent()'s work (plugin load, KV/TAR store open):
+    // extracting that work into make_agent() moved it to run *after* this
+    // registration point, which would otherwise widen the pre-existing signal
+    // gap to cover it too (Gate 3 cpp-expert finding, governance re-run).
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
     g_agent.store(agent.get(), std::memory_order_release);
     agent->run();
 

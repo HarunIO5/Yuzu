@@ -1190,8 +1190,11 @@ REM Register the service (binPath is written for you, including the internal
 REM --service marker the agent needs to run under the SCM control protocol)
 yuzu-agent.exe --install-service
 
-REM Point it at your server / data dir / log file via sc config, same as the installer does
-sc.exe config YuzuAgent binPath= "C:\Yuzu\bin\yuzu-agent.exe --service --server yuzu.example.com:50051 --data-dir C:\ProgramData\Yuzu --log-file C:\Yuzu\logs\yuzu-agent.log"
+REM Point it at your server / data dir / log file via sc config, same as the installer does.
+REM Quote the executable path ON ITS OWN (nested "" inside the outer quotes) --
+REM only the exe needs quoting, not the whole binPath -- so this still works
+REM unmodified if you install under a spaced path like "Program Files".
+sc.exe config YuzuAgent binPath= "\"C:\Yuzu\bin\yuzu-agent.exe\" --service --server yuzu.example.com:50051 --data-dir C:\ProgramData\Yuzu --log-file C:\Yuzu\logs\yuzu-agent.log"
 
 sc.exe start YuzuAgent
 sc.exe stop YuzuAgent

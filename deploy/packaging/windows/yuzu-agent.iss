@@ -145,9 +145,15 @@ Filename: "sc.exe"; Parameters: "start YuzuAgent"; StatusMsg: "Starting Yuzu Age
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; New-AutologgerConfig -Name YuzuProcBoot -LogFileMode 0x2 -LocalFilePath '{commonappdata}\Yuzu\procboot.etl' -MaximumFileSize 16 -ClockType System -FlushTimer 1 -ErrorAction SilentlyContinue | Out-Null; Add-EtwTraceProvider -AutologgerName YuzuProcBoot -Guid '{{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}' -Level 4 -MatchAnyKeyword ([uint64]0x10) -ErrorAction SilentlyContinue | Out-Null; exit 0"""; StatusMsg: "Configuring boot process-capture AutoLogger..."; Flags: runhidden waituntilterminated; Components: plugins\advanced
 
 [UninstallRun]
-Filename: "sc.exe"; Parameters: "stop YuzuAgent"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
-; Small delay to let service stop
-Filename: "cmd.exe"; Parameters: "/c timeout /t 3 /nobreak >nul"; Flags: runhidden waituntilterminated; RunOnceId: "WaitStop"
+; #1822 fix means `sc stop` now genuinely stops a running process holding open
+; handles (exe, log file, network stream) instead of a no-op against a service
+; that was never actually startable, so a flat delay is no longer sufficient --
+; poll for STOPPED (bounded to 15s, same pattern as PrepareToInstall's install-
+; time poll) instead of a fixed 3s wait (Gate 3 release-deploy finding,
+; governance re-run). Falls through regardless of outcome: --remove-service and
+; file deletion below are safe even if the process is still exiting (marks for
+; delete / falls back to delete-on-reboot for a locked exe), same as before.
+Filename: "cmd.exe"; Parameters: "/c sc stop YuzuAgent >nul 2>&1 & for /l %i in (1,1,15) do (sc query YuzuAgent | find ""STOPPED"" >nul && exit /b 0 || timeout /t 1 /nobreak >nul)"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
 Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--remove-service"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
 ; Tear down the boot AutoLogger + its .etl on uninstall. Remove-AutologgerConfig
 ; drops only the boot-start config — it does NOT stop a session already running
@@ -298,12 +304,18 @@ begin
     indefinitely if something else goes wrong.
     sc.exe's exit code IS the underlying Win32 error (confirmed empirically:
     1060 = ERROR_SERVICE_DOES_NOT_EXIST on a fresh install, no prior service).
-    Only poll when the stop was actually ACCEPTED (0) -- gating on that, not
-    unconditionally, is load-bearing: a fresh install (the dominant case, no
+    Skip the poll ONLY on 1060 -- a fresh install (the dominant case, no
     YuzuAgent service yet) would otherwise burn the full 15s poll for nothing
-    every single time, a real regression against the old flat 2s wait. }
+    every single time, a real regression against the old flat 2s wait. Any
+    OTHER non-zero code (e.g. 1061 ERROR_SERVICE_CANNOT_ACCEPT_CTRL, hit if the
+    service is mid-transition -- already STOP_PENDING from a hung prior
+    uninstall, or still START_PENDING) still means a real service that will
+    eventually reach STOPPED, so it must still poll -- treating every non-zero
+    code like "doesn't exist" would silently reproduce the old blind-race
+    behavior for exactly the case this fix targets (Gate 3 release-deploy
+    finding, governance re-run). }
   Exec('sc.exe', 'stop YuzuAgent', '', SW_HIDE, ewWaitUntilTerminated, StopResultCode);
-  if StopResultCode = 0 then
+  if StopResultCode <> 1060 then
   begin
     for i := 1 to 15 do
     begin

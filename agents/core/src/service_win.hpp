@@ -20,12 +20,14 @@
 #endif
 #include <windows.h>
 
-#include <yuzu/agent/agent.hpp>
-
 #include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
+
+namespace yuzu::agent {
+class Agent; // full definition only needed in service_win.cpp
+}
 
 namespace yuzu::agent::win {
 

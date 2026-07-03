@@ -1,12 +1,12 @@
 # Test Coverage Tracking
 
-Last updated: 2026-06-26
+Last updated: 2026-07-03
 
 ## Overview
 
 | Suite | Executable | Test Files | Status |
 |-------|-----------|------------|--------|
-| Agent unit tests | `yuzu_agent_tests` | 16 files | Active |
+| Agent unit tests | `yuzu_agent_tests` | 17 files | Active |
 | Server unit tests | `yuzu_server_tests` | 38 files | Active (requires `build_server=true`) |
 
 **Totals:** 48 test files. Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests.
@@ -38,6 +38,7 @@ Run all tests: `meson test -C build-linux --print-errorlogs`
 | `test_fleet_snapshot.cpp` | TAR fleet_snapshot.v1 JSON builder | Envelope shape, processes/connections round-trip with `remote_host`, default + custom redaction patterns, truncation flags, `process_source_paused` / `tcp_source_paused` markers, `schema_minor` field, payload size bound at full cap (12 cases) |
 | `test_inventory_sync.cpp` | Agent daily-sync (ADR-0016): `sync_scheduler`, `sync_source_installed_software` | Canonical-hash cross-pin; SyncScheduler first-run jitter / hash-skip / change / need_full / phase-spread / weekly full-floor / consecutive-need_full backoff; installed_apps parse; `clamp_field` separator-strip + codepoint-boundary truncation (UP-10) + invalid-UTF-8 scrub to U+FFFD (UP-IN1); empty-name drop (UP-1); empty-inventory skip (UP-IN6); invalid-UTF-8 parity vector (16 cases) |
 | `test_win_str_utils.cpp` _(Windows-only)_ | Shared `yuzu::win` wide<->UTF-8 helpers (#1681): `agents/shared/win_str.hpp` | `to_wide`/`from_wide` round-trip preserving "Café"; empty + null input; 512-wchar value with no terminator (#652); lone surrogate → U+FFFD; `reg_sz_to_utf8` trailing-NUL strip (none/one/two), embedded-NUL first-stop (#1682 R6), entry-level full-512 no-terminator, non-wchar-multiple size floor, null buffer + empty payload |
+| `test_service_binpath.cpp` _(Windows-only)_ | SCM `--service` binPath quoting (#1822): `agents/core/src/service_win.hpp` `make_service_binpath` | Spaceless path; `Program Files`-style path (exe-only quoting); exact ` --service` suffix (3 cases) |
 
 ### Untested Agent Components
 
@@ -49,6 +50,8 @@ Run all tests: `meson test -C build-linux --print-errorlogs`
 | **Certificate discovery** | Windows-specific CryptoAPI | Low |
 | **Cloud identity** | Requires cloud environment | Low |
 | **Identity store** | File I/O, low logic density | Low |
+| **SCM dispatcher** (#1822, `service_win.cpp` `service_main`/`handler_ex`/`run_service`) | Requires a real SCM-launched process (`StartServiceCtrlDispatcherW`); verified via live Windows-service testing instead (install/start/stop/crash-recovery/fail-closed-exit, documented on issue #1822) — see #1840 for a proposed testable-seam extraction | Low |
+| **`win_sc_handle.hpp` `ScHandle`** (RAII SC_HANDLE, move-only) | No dedicated move-semantics unit test yet (same gap as the pre-existing local copy in `guard_service.cpp`) — see #1840 | Low |
 
 ### Untested Plugin Runtime Logic
 

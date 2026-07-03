@@ -2,6 +2,8 @@
 
 #include "service_win.hpp"
 
+#include <yuzu/agent/agent.hpp>
+
 #include <spdlog/spdlog.h>
 
 #include <atomic>
@@ -15,7 +17,13 @@ using yuzu::agent::Agent;
 // SERVICE_TABLE_ENTRYW's ServiceMain callback takes no user context parameter, so
 // the factory and mutable service state are process-global. This is fine: a given
 // process hosts exactly one service (SERVICE_WIN32_OWN_PROCESS), so there is only
-// ever one ServiceMain/handler pair alive.
+// ever one ServiceMain/handler pair alive. Plain (not atomic/mutex-guarded)
+// because the only write happens in run_service() strictly before it calls
+// StartServiceCtrlDispatcherW, and the only read happens in service_main() on the
+// thread the SCM spawns as a *result* of that same call -- Windows thread
+// creation provides the needed happens-before edge (unlike g_status_handle
+// below, which is genuinely read/written from two independently-running,
+// concurrently-active threads once the service is up).
 std::move_only_function<std::unique_ptr<Agent>()> g_factory;
 
 // atomic, not a plain pointer guarded by g_status_mu below: it's published once
