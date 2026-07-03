@@ -779,17 +779,25 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     // dispatch is Execution:Execute, collate is Response:Read.
     {"execute_bundle", {"Execution", "Execute"}},
     {"get_bundle_result", {"Response", "Read"}},
-    // Write tools (#289). NOTE (governance S3/UP-3): the op here drives the C8
-    // TIER gate (tier_allows / requires_approval), NOT per-handler RBAC — each
-    // handler separately calls perm_fn with its REST-verified op (approve/reject →
-    // Approval:Approve, quarantine → Security:Execute). quarantine_device is mapped
-    // to Security:WRITE deliberately, because requires_approval() keys the
-    // supervised approval gate on Security:Write (mcp_policy.hpp); "aligning" this
-    // to Security:Execute would SILENTLY disable the approval gate on live device
-    // isolation. Do not change without re-checking mcp_policy.hpp::requires_approval.
+    // Write tools (#289). NOTE (governance S3/UP-3, revised for PR #1796 review
+    // C2): the op here drives the C8 TIER gate (tier_allows / requires_approval),
+    // NOT per-handler RBAC — each handler separately calls perm_fn with its
+    // REST-verified op (approve/reject → Approval:Approve, quarantine →
+    // Security:Execute). INVARIANT: this mapping and mcp_policy.hpp's
+    // requires_approval() move TOGETHER. quarantine_device maps to
+    // Security:Execute — the SAME (securable, op) its handler and the REST
+    // POST/DELETE /api/v1/quarantine routes check — and requires_approval()
+    // gates supervised Security:Execute, so BOTH transports agree: the C8 gate
+    // tickets the MCP call, and AuthRoutes::require_permission mirror-denies the
+    // REST route for a supervised token (#520). The previous Security:Write
+    // mapping (paired with a Write-keyed policy rule) left the REST route — which
+    // checks Execute — with requires_approval()==false: a supervised token could
+    // quarantine via REST with NO approval. If you change a tool's mapping OR a
+    // requires_approval() rule, re-check the OTHER side and every REST route that
+    // shares the (securable, op) pair.
     {"approve_request", {"Approval", "Write"}},
     {"reject_request", {"Approval", "Write"}},
-    {"quarantine_device", {"Security", "Write"}},
+    {"quarantine_device", {"Security", "Execute"}},
     // PKI CA tools (PR4 B-2 — MCP/REST parity for the /api/v1/ca/* surface).
     {"list_issued_certs", {"Security", "Read"}},
     {"revoke_certificate", {"Security", "Delete"}},
@@ -908,7 +916,7 @@ McpServer::HandlerFn McpServer::build_handler(
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
     yuzu::MetricsRegistry* metrics, AppPerfProviders app_perf_providers,
     QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
-    yuzu::server::detail::AgentRegistry* agent_registry) {
+    yuzu::server::detail::AgentRegistry* agent_registry, ScopedPermFn scoped_perm_fn) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
     // take effect without server restart. The references point to cfg_ members
@@ -1569,6 +1577,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     const std::string definition_id = "mcp." + tool_name;
                     const std::string canon = canonical_args(args);
                     const std::string supplied_id = param_str(args, "approval_id");
+                    // M2 (PR #1796): device-targeted tools prefix the pending
+                    // audit detail with the endpoint so SIEM can filter
+                    // mcp.<tool>|pending by agent_id (the success audit already
+                    // carries it; the mint audit did not).
+                    const std::string audit_agent = param_str(args, "agent_id");
+                    const std::string mint_detail_prefix =
+                        audit_agent.empty() ? std::string{} : "agent_id=" + audit_agent + " ";
 
                     if (supplied_id.empty()) {
                         // First call → mint a ticket, but DEDUP first (governance
@@ -1582,7 +1597,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         // attempt cost remains, but no unbounded row growth.
                         if (auto existing = approval_manager->find_pending(
                                 definition_id, session->username, canon)) {
-                            mcp_audit("pending", "approval_id=" + existing->id + " (deduped)");
+                            mcp_audit("pending",
+                                      mint_detail_prefix + "approval_id=" + existing->id +
+                                          " (deduped)");
                             res.set_content(
                                 approval_required_error(
                                     existing->id,
@@ -1618,7 +1635,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                             return;
                         }
-                        mcp_audit("pending", "approval_id=" + *submitted);
+                        mcp_audit("pending", mint_detail_prefix + "approval_id=" + *submitted);
                         res.set_content(
                             approval_required_error(
                                 *submitted,
@@ -1667,7 +1684,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     // rejects a replay of an already-consumed ticket and wins the
                     // race against a concurrent recall, so a mutating tool runs at
                     // most once per ticket).
-                    if (auto consumed = approval_manager->consume_ticket(supplied_id); !consumed) {
+                    // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
+                    // authenticated principal recalling the tool.
+                    if (auto consumed =
+                            approval_manager->consume_ticket(supplied_id, session->username);
+                        !consumed) {
                         mcp_audit("denied", "approval " + supplied_id + " already used");
                         res.set_content(
                             a4_error(kPermissionDenied,
@@ -4018,8 +4039,6 @@ McpServer::HandlerFn McpServer::build_handler(
             // PUT /api/v1/tags: category-key normalisation + set_tag_checked +
             // agent tag-push (D4).
             if (tool_name == "set_tag") {
-                if (!perm_fn(req, res, "Tag", "Write"))
-                    return;
                 if (!tag_store) {
                     res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
                                     "application/json");
@@ -4039,6 +4058,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (agent_id.empty() || key.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "agent_id and key are required"),
                                     "application/json");
+                    return;
+                }
+                // H1 (PR #1796): per-device scope gate — a management-group-
+                // confined operator may tag only devices inside their groups.
+                // Runs AFTER agent_id parse (the scope needs the target); falls
+                // back to the global perm_fn when unwired (test harness).
+                if (scoped_perm_fn) {
+                    if (!scoped_perm_fn(req, res, "Tag", "Write", agent_id))
+                        return;
+                } else if (!perm_fn(req, res, "Tag", "Write")) {
                     return;
                 }
                 auto set_res = tag_store->set_tag_checked(agent_id, key, value, "mcp");
@@ -4066,8 +4095,6 @@ McpServer::HandlerFn McpServer::build_handler(
             // Mirrors DELETE /api/v1/tags/{agent_id}/{key} + the revoke_certificate
             // audit-and-surface template (#1240).
             if (tool_name == "delete_tag") {
-                if (!perm_fn(req, res, "Tag", "Delete"))
-                    return;
                 if (!tag_store) {
                     res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
                                     "application/json");
@@ -4085,6 +4112,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (agent_id.empty() || key.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "agent_id and key are required"),
                                     "application/json");
+                    return;
+                }
+                // H1 (PR #1796): per-device scope gate (see set_tag above).
+                if (scoped_perm_fn) {
+                    if (!scoped_perm_fn(req, res, "Tag", "Delete", agent_id))
+                        return;
+                } else if (!perm_fn(req, res, "Tag", "Delete")) {
                     return;
                 }
                 bool deleted = tag_store->delete_tag(agent_id, key);
@@ -4151,8 +4185,6 @@ McpServer::HandlerFn McpServer::build_handler(
             // quarantine (mirror POST /api/v1/quarantine) AND dispatches the live
             // quarantine-plugin isolation via the same DispatchFn chain.
             if (tool_name == "quarantine_device") {
-                if (!perm_fn(req, res, "Security", "Execute"))
-                    return;
                 if (!quarantine_store) {
                     res.set_content(
                         error_response(id, kInternalError, "Quarantine store unavailable"),
@@ -4165,6 +4197,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (agent_id.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
                                     "application/json");
+                    return;
+                }
+                // H1 (PR #1796): per-device scope gate — a management-group-
+                // confined operator may isolate only devices inside their groups.
+                // Falls back to the global perm_fn when unwired (test harness).
+                if (scoped_perm_fn) {
+                    if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
+                        return;
+                } else if (!perm_fn(req, res, "Security", "Execute")) {
                     return;
                 }
                 // Server-side input validation BEFORE any store write or dispatch
@@ -5020,7 +5061,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 yuzu::MetricsRegistry* metrics,
                                 AppPerfProviders app_perf_providers,
                                 QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
-                                yuzu::server::detail::AgentRegistry* agent_registry) {
+                                yuzu::server::detail::AgentRegistry* agent_registry,
+                                ScopedPermFn scoped_perm_fn) {
     svr.Post("/mcp/v1/",
              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -5032,7 +5074,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(response_scope_fn), software_inventory_store,
                            std::move(inventory_scope_fn), metrics,
                            std::move(app_perf_providers), quarantine_store,
-                           std::move(tag_push_fn), agent_registry));
+                           std::move(tag_push_fn), agent_registry,
+                           std::move(scoped_perm_fn)));
 
     spdlog::info(
         "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",

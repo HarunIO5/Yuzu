@@ -55,6 +55,28 @@ public:
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
+
+    /// Per-device tier + management-group scope gate (PR #1796 review H1) — same
+    /// shape as DeviceRoutes::ScopedPermFn. Production wires it to
+    /// AuthRoutes::require_scoped_permission (the single per-device authz
+    /// chokepoint), so the device-targeted write tools (set_tag / delete_tag /
+    /// quarantine_device) hold an operator to their management-group scope: a
+    /// group-confined operator can act on in-scope devices and is denied on
+    /// out-of-scope ones, instead of the global perm_fn's all-or-nothing answer
+    /// (#1522 precedent — under the global gate a confined-but-globally-granted
+    /// operator could tag/quarantine devices fleet-wide).
+    ///
+    /// FALLBACK-WHEN-UNWIRED, deliberately: the default `= {}` makes the three
+    /// device-targeted handlers fall back to the global perm_fn (the pre-H1
+    /// behavior) — NOT fail-open — because build_handler/register_routes carry a
+    /// long tail of optional `= {}` deps and C++ forbids a required param after
+    /// a defaulted one. The SOLE production caller (server.cpp) always wires it;
+    /// the unwired path is a test-only affordance. Do not add a new production
+    /// registration without wiring this.
+    using ScopedPermFn =
+        std::function<bool(const httplib::Request&, httplib::Response&,
+                           const std::string& securable_type, const std::string& operation,
+                           const std::string& agent_id)>;
     // Returns false if the audit row could not be persisted. Most MCP call sites
     // discard the result (the generic mcp_audit helper), but destructive tools
     // (e.g. revoke_certificate) observe it to surface an evidence-chain gap in the
@@ -187,7 +209,10 @@ public:
                             // A2 discovery (roadmap Issue 17.1): backs discover_plugins.
                             // Trailing optional dep, like the rest of this parameter tail —
                             // `nullptr` = discover_plugins answers 503 (unwired).
-                            yuzu::server::detail::AgentRegistry* agent_registry = nullptr);
+                            yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
+                            // H1 (PR #1796): per-device scope gate for the
+                            // device-targeted write tools; see ScopedPermFn above.
+                            ScopedPermFn scoped_perm_fn = {});
 
     /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
     /// Production callers use this; tests prefer build_handler() above.
@@ -210,7 +235,8 @@ public:
                          AppPerfProviders app_perf_providers = {},
                          QuarantineStore* quarantine_store = nullptr,
                          TagPushFn tag_push_fn = {},
-                         yuzu::server::detail::AgentRegistry* agent_registry = nullptr);
+                         yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
+                         ScopedPermFn scoped_perm_fn = {});
 };
 
 } // namespace yuzu::server::mcp

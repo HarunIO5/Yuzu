@@ -26,6 +26,11 @@ struct Approval {
     // 0 while unconsumed. Additive column (migration v2) — keeps the eventual
     // Postgres port trivial.
     int64_t consumed_at{0};
+    // WHO consumed the ticket (PR #1796 review H3/N2, SOC-2 CC7.2): the
+    // principal whose recall executed the gated tool. Empty while unconsumed.
+    // Additive column (migration v3). Completes the ticket's evidence chain:
+    // submitted_by → reviewed_by → consumed_by.
+    std::string consumed_by;
 };
 
 struct ApprovalQuery {
@@ -95,7 +100,12 @@ public:
     /// returns unexpected. The caller validates definition_id + args BEFORE
     /// calling; this method guards the double-consume (concurrent-recall) race so
     /// a mutating tool executes at most once per ticket.
-    std::expected<void, std::string> consume_ticket(const std::string& id);
+    ///
+    /// `consumed_by` records WHO recalled the ticket (PR #1796 H3/N2, SOC-2
+    /// CC7.2) — the caller passes the authenticated principal; it is stored in
+    /// the same CAS UPDATE so the who and the when can never disagree.
+    std::expected<void, std::string> consume_ticket(const std::string& id,
+                                                    const std::string& consumed_by);
 
 private:
     std::expected<void, std::string> set_review_status(const std::string& id,

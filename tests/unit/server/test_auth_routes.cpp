@@ -435,6 +435,55 @@ TEST_CASE("AuthRoutes::require_permission — approval gate is skipped on the MC
     CHECK(res.body.find("approval") == std::string::npos); // the approval gate did not fire
 }
 
+// PR #1796 review C2: quarantine is Security:Execute on BOTH transports. The
+// kToolSecurity mapping and requires_approval("supervised","Security","Execute")
+// move together (see the invariant note above kToolSecurity in mcp_server.cpp),
+// so the REST POST/DELETE /api/v1/quarantine routes — which gate on
+// perm_fn("Security","Execute") — are mirror-denied here for a supervised token.
+// Before the fix the mapping said Security:Write while the routes checked
+// Execute, so requires_approval() was false for the REST pair and a supervised
+// MCP token could quarantine (and release) via REST with NO approval (#520).
+TEST_CASE("AuthRoutes::require_permission — supervised token mirror-denied on REST quarantine POST",
+          "[auth_routes][scope][mcp][quarantine]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-sup-quar-post", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.method = "POST";
+    req.path = "/api/v1/quarantine"; // the exact route the REST quarantine gate runs on
+    httplib::Response res;
+
+    // tier_allows("supervised", Security, Execute) → true
+    // requires_approval("supervised", Security, Execute) → true (the C2 rule)
+    // → non-MCP transport ⇒ the approval mirror-denial fires (#520).
+    bool ok = fix.ar->require_permission(req, res, "Security", "Execute");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("approval") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_permission — supervised token mirror-denied on REST quarantine DELETE",
+          "[auth_routes][scope][mcp][quarantine]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-sup-quar-del", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.method = "DELETE";
+    req.path = "/api/v1/quarantine/agent-1"; // release route — same Security:Execute gate
+    httplib::Response res;
+
+    bool ok = fix.ar->require_permission(req, res, "Security", "Execute");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("approval") != std::string::npos);
+}
+
 TEST_CASE("AuthRoutes::require_scoped_permission — supervised MCP token blocked from approval-gated Delete",
           "[auth_routes][scope][mcp]") {
     AuthRoutesFixture fix;

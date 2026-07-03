@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   principal approves, the caller re-invokes with the `approval_id` and the ticket is
   consumed exactly once (args-bound, replay-rejected). Approval ids are CSPRNG-drawn;
   the mint is deduplicated so a token cannot flood the shared pending-approval queue.
+  Review-round hardening (PR #1796): `quarantine_device` is `Security:Execute` on BOTH
+  transports and the supervised approval-policy rule moved with it — closing a mismatch
+  that let a supervised token quarantine via REST `POST /api/v1/quarantine` with no
+  approval (the REST POST/DELETE routes now mirror-deny, #520); the three
+  device-targeted write tools (`set_tag`/`delete_tag`/`quarantine_device`) authorize
+  through the per-device management-group scope gate (`require_scoped_permission`), so
+  a group-confined operator cannot tag or isolate out-of-scope devices;
+  approved-but-unconsumed tickets expire after 7 days (a forgotten approval is no
+  longer a forever-valid capability); the approvals store records `consumed_by`
+  (SOC 2 CC7.2 evidence chain: submitted_by → reviewed_by → consumed_by); and the
+  device-targeted ticket-mint audit rows carry `agent_id=` so SIEM can filter pending
+  isolation requests by endpoint.
 - **A2 discovery surface (Issue 17.1, #1794).** `GET /api/v1/discover/{permissions,
   instructions,routes,scope-kinds,plugins}` plus five mirrored read-only MCP tools let
   an agentic worker enumerate RBAC permissions, instruction schemas, REST routes,

@@ -47,6 +47,7 @@ Approval row_to_approval(sqlite3_stmt* stmt) {
     a.review_comment = col_text(stmt, 7);
     a.scope_expression = col_text(stmt, 8);
     a.consumed_at = sqlite3_column_int64(stmt, 9);
+    a.consumed_by = col_text(stmt, 10);
     return a;
 }
 
@@ -84,6 +85,14 @@ void ApprovalManager::create_tables() {
         // eventual Postgres port a trivial ADD COLUMN.
         {2, R"(
             ALTER TABLE approvals ADD COLUMN consumed_at INTEGER NOT NULL DEFAULT 0;
+        )"},
+        // v3 (PR #1796 review H3/N2, SOC-2 CC7.2): WHO consumed the ticket.
+        // consume_ticket() stamps the recalling principal in the same CAS
+        // UPDATE that sets consumed_at, completing the evidence chain
+        // submitted_by → reviewed_by → consumed_by. Additive, '' = unconsumed
+        // (back-fills pre-existing rows; consistent with the v2 pattern).
+        {3, R"(
+            ALTER TABLE approvals ADD COLUMN consumed_by TEXT NOT NULL DEFAULT '';
         )"},
     };
     if (!MigrationRunner::run(db_, "approval_manager", kMigrations)) {
@@ -133,21 +142,51 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
         }
     }
 
-    // Expire stale pending approvals older than 7 days
+    // Lazy expiry sweep (runs on every mint, under mtx_). One shared 7-day
+    // window, deliberately simple:
+    //   * PENDING tickets nobody reviewed within 7 days of submission expire.
+    //   * APPROVED-but-unconsumed tickets expire 7 days after their review
+    //     (PR #1796 review N3): an approved ticket is a live one-time
+    //     capability — the recall executes the gated tool with no further
+    //     human step — so without a TTL a forgotten approval leaks a
+    //     forever-valid capability token into backups/log dumps. The recall
+    //     path treats an expired ticket exactly like a rejected one (submit a
+    //     fresh request); consumed tickets (consumed_at != 0) are history, not
+    //     capabilities, and are never touched.
+    // Counts come from stepping RETURNING rows on the statement itself —
+    // NEVER sqlite3_changes() after step on this shared FULLMUTEX connection
+    // (#1033; the L2 convention finding on PR #1796).
     constexpr int64_t k7Days = 7 * 24 * 3600;
     {
         auto cutoff = now_epoch() - k7Days;
         sqlite3_stmt* exp = nullptr;
         if (sqlite3_prepare_v2(db_,
                                "UPDATE approvals SET status = 'expired' "
-                               "WHERE status = 'pending' AND submitted_at < ?",
+                               "WHERE status = 'pending' AND submitted_at < ? "
+                               "RETURNING 1",
                                -1, &exp, nullptr) == SQLITE_OK) {
             sqlite3_bind_int64(exp, 1, cutoff);
-            sqlite3_step(exp);
-            auto expired = sqlite3_changes(db_);
+            int expired = 0;
+            while (sqlite3_step(exp) == SQLITE_ROW)
+                ++expired;
             sqlite3_finalize(exp);
             if (expired > 0)
                 spdlog::info("ApprovalManager: expired {} stale pending approvals", expired);
+        }
+        sqlite3_stmt* expa = nullptr;
+        if (sqlite3_prepare_v2(db_,
+                               "UPDATE approvals SET status = 'expired' "
+                               "WHERE status = 'approved' AND consumed_at = 0 "
+                               "AND reviewed_at < ? RETURNING 1",
+                               -1, &expa, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int64(expa, 1, cutoff);
+            int expired = 0;
+            while (sqlite3_step(expa) == SQLITE_ROW)
+                ++expired;
+            sqlite3_finalize(expa);
+            if (expired > 0)
+                spdlog::info("ApprovalManager: expired {} approved-but-unconsumed approval tickets",
+                             expired);
         }
     }
 
@@ -194,7 +233,8 @@ std::vector<Approval> ApprovalManager::query(const ApprovalQuery& q) const {
         return results;
 
     std::string sql = "SELECT id, definition_id, status, submitted_by, submitted_at, "
-                      "reviewed_by, reviewed_at, review_comment, scope_expression, consumed_at "
+                      "reviewed_by, reviewed_at, review_comment, scope_expression, consumed_at, "
+                      "consumed_by "
                       "FROM approvals WHERE 1=1";
     std::vector<std::string> binds;
 
@@ -274,7 +314,8 @@ std::optional<Approval> ApprovalManager::get(const std::string& id) const {
     std::lock_guard lock(mtx_);
 
     const char* sql = "SELECT id, definition_id, status, submitted_by, submitted_at, "
-                      "reviewed_by, reviewed_at, review_comment, scope_expression, consumed_at "
+                      "reviewed_by, reviewed_at, review_comment, scope_expression, consumed_at, "
+                      "consumed_by "
                       "FROM approvals WHERE id = ?";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -308,7 +349,8 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
     std::lock_guard lock(mtx_);
 
     const char* sql = "SELECT id, definition_id, status, submitted_by, submitted_at, "
-                      "reviewed_by, reviewed_at, review_comment, scope_expression, consumed_at "
+                      "reviewed_by, reviewed_at, review_comment, scope_expression, consumed_at, "
+                      "consumed_by "
                       "FROM approvals WHERE definition_id = ? AND submitted_by = ? "
                       "AND scope_expression = ? AND status = 'pending' "
                       "ORDER BY submitted_at DESC LIMIT 1";
@@ -332,11 +374,16 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
 // Consume (#289 — one-time MCP approval ticket)
 // ---------------------------------------------------------------------------
 
-std::expected<void, std::string> ApprovalManager::consume_ticket(const std::string& id) {
+std::expected<void, std::string> ApprovalManager::consume_ticket(const std::string& id,
+                                                                 const std::string& consumed_by) {
     if (!db_)
         return std::unexpected("database not open");
     if (id.empty())
         return std::unexpected("approval id is required");
+    // SOC-2 CC7.2 (PR #1796 H3/N2): a consumption with no attributable principal
+    // would be an evidence-chain hole — fail the recall closed instead.
+    if (consumed_by.empty())
+        return std::unexpected("consumed_by is required");
 
     std::lock_guard lock(mtx_);
 
@@ -345,8 +392,9 @@ std::expected<void, std::string> ApprovalManager::consume_ticket(const std::stri
     // never call sqlite3_changes() on the shared FULLMUTEX connection (#1033).
     // SQLITE_ROW == this call consumed it; SQLITE_DONE == already used / not
     // approved / absent (replay-safe: a second concurrent recall loses here).
+    // consumed_by rides the same UPDATE so who/when can never disagree.
     const char* sql = R"(
-        UPDATE approvals SET consumed_at = ?
+        UPDATE approvals SET consumed_at = ?, consumed_by = ?
         WHERE id = ? AND status = 'approved' AND consumed_at = 0
         RETURNING 1
     )";
@@ -355,13 +403,14 @@ std::expected<void, std::string> ApprovalManager::consume_ticket(const std::stri
         return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
 
     sqlite3_bind_int64(stmt, 1, now_epoch());
-    sqlite3_bind_text(stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, consumed_by.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, id.c_str(), -1, SQLITE_TRANSIENT);
 
     auto rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
 
     if (rc == SQLITE_ROW) {
-        spdlog::info("ApprovalManager: consumed approval ticket {}", id);
+        spdlog::info("ApprovalManager: consumed approval ticket {} by {}", id, consumed_by);
         return {};
     }
     if (rc == SQLITE_DONE)

@@ -10269,7 +10269,17 @@ private:
                 // A2 discovery (roadmap Issue 17.1): backs the discover_plugins tool
                 // via the SAME AgentRegistry::help_json() the REST /discover/plugins
                 // route reads (discover_routes_ above).
-                &registry_);
+                &registry_,
+                // H1 (PR #1796): per-device scope gate for the device-targeted MCP
+                // write tools (set_tag / delete_tag / quarantine_device) — the SAME
+                // require_scoped_permission chokepoint the dashboard device routes
+                // and REST per-device endpoints use, so a management-group-confined
+                // operator cannot tag or isolate devices outside their groups.
+                [this](const httplib::Request& req, httplib::Response& res,
+                       const std::string& type, const std::string& op,
+                       const std::string& agent_id) -> bool {
+                    return require_scoped_permission(req, res, type, op, agent_id);
+                });
         }
 
         // -- Listen -----------------------------------------------------------

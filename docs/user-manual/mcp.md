@@ -177,6 +177,9 @@ require admin approval before taking effect. This includes:
 - Any delete operation
 - Policy writes
 - Security setting writes
+- Security executions (device quarantine) — enforced identically on the REST
+  `POST`/`DELETE /api/v1/quarantine` routes, so a supervised token cannot
+  bypass the approval gate by switching transports
 - User management writes
 - Management group writes
 

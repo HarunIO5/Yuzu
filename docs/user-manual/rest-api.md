@@ -921,6 +921,13 @@ Quarantine a device.
 
 **Permission:** `Security:Execute`
 
+> **Supervised MCP tokens are approval-gated here too.** A bearer token minted
+> with `mcp_tier: "supervised"` gets `403` on this route (and on the `DELETE`
+> release below): supervised `Security:Execute` requires an approval ticket,
+> and the ticket-then-recall flow exists only on the MCP transport
+> (`quarantine_device`). The REST route mirrors the denial so switching
+> transports cannot bypass the approval gate (#520).
+
 **Request body:**
 
 ```json

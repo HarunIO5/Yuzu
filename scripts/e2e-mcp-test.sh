@@ -315,7 +315,7 @@ if isinstance(r, str):
     r = json.loads(r)
 print(len(r.get('resources', [])))
 " 2>/dev/null || echo "0")
-assert_eq "resources/list returns 3 resources" "3" "$RES_COUNT"
+assert_eq "resources/list returns 9 resources" "9" "$RES_COUNT"
 
 for uri in "yuzu://server/health" "yuzu://compliance/fleet" "yuzu://audit/recent"; do
     if echo "$MCP_BODY" | grep -q "$uri"; then
@@ -345,7 +345,7 @@ if isinstance(r, str):
     r = json.loads(r)
 print(len(r.get('prompts', [])))
 " 2>/dev/null || echo "0")
-assert_eq "prompts/list returns 4 prompts" "4" "$PROMPT_COUNT"
+assert_eq "prompts/list returns 13 prompts" "13" "$PROMPT_COUNT"
 
 for pname in "fleet_overview" "investigate_agent" "compliance_report" "audit_investigation"; do
     if echo "$MCP_BODY" | grep -q "\"$pname\""; then

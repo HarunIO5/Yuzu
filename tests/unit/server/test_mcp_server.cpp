@@ -14,8 +14,11 @@
 #include "mcp_policy.hpp"
 
 #include "agent_registry.hpp"
+#include "analytics_event_store.hpp" // real-AuthRoutes integration test (C1)
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
+#include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
+#include <yuzu/server/server.hpp>     // Config (real-AuthRoutes integration test)
 #include "audit_store.hpp"
 #include "ca_store.hpp"
 #include "discover_routes.hpp"     // A2 discovery builders (Issue 17.1)
@@ -43,6 +46,7 @@
 #include <functional>
 #include <memory>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -182,6 +186,9 @@ TEST_CASE("MCP Policy: supervised tier allows everything", "[mcp][policy]") {
     CHECK(tier_allows("supervised", "Policy", "Delete"));
     CHECK(tier_allows("supervised", "UserManagement", "Write"));
     CHECK(tier_allows("supervised", "Security", "Write"));
+    // Supervised admits Security:Execute (quarantine) — the C8 approval gate,
+    // not the tier, is what stands between the token and live isolation (C2).
+    CHECK(tier_allows("supervised", "Security", "Execute"));
 }
 
 TEST_CASE("MCP Policy: unknown tier denies everything", "[mcp][policy]") {
@@ -206,6 +213,10 @@ TEST_CASE("MCP Policy: supervised requires approval for destructive ops", "[mcp]
     CHECK(requires_approval("supervised", "Execution", "Execute"));
     CHECK(requires_approval("supervised", "Policy", "Write"));
     CHECK(requires_approval("supervised", "Security", "Write"));
+    // PR #1796 review C2: live device isolation (quarantine) is Security:Execute
+    // on BOTH transports (kToolSecurity + REST /api/v1/quarantine) — the policy
+    // rule and the mapping move together so neither transport can skip the gate.
+    CHECK(requires_approval("supervised", "Security", "Execute"));
     CHECK(requires_approval("supervised", "UserManagement", "Write"));
     CHECK(requires_approval("supervised", "ManagementGroup", "Write"));
 
@@ -545,6 +556,7 @@ struct McpTestServer {
     std::string mock_tier;              // MCP tier for mock auth
     bool mock_auth_enabled{true};       // false -> auth_fn returns nullopt (401)
     std::vector<std::string> audit_log; // records "action|result" pairs
+    std::vector<std::string> audit_details; // records the detail string per audit call (M2)
     bool audit_succeeds_{true};         // false → AuditFn returns false (dropped row)
     bool audit_throws_{false};          // true → AuditFn throws (bad_alloc-class) (#1647)
     bool read_only_mode_{false};        // captured by ref by build_handler
@@ -645,6 +657,12 @@ struct McpTestServer {
     yuzu::server::InstructionStore* instruction_store_for_test{nullptr};
     yuzu::server::detail::AgentRegistry* agent_registry_for_test{nullptr};
 
+    /// H1 (PR #1796): optionally wire a per-device scope gate so the device-
+    /// targeted write tools (set_tag / delete_tag / quarantine_device) exercise
+    /// the management-group confinement path. Default empty = handlers fall back
+    /// to the global perm_fn (the pre-H1 behavior every existing test relies on).
+    yuzu::server::mcp::McpServer::ScopedPermFn scoped_perm_fn_for_test{};
+
     /// Auth identity the mock auth_fn returns. Read at CALL time (not install
     /// time) so a test can change the principal between two calls — used to drive
     /// the bundle collate IDOR path (dispatch as owner, collate as a stranger).
@@ -723,8 +741,9 @@ private:
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& /*target_type*/,
                                const std::string& /*target_id*/,
-                               const std::string& /*detail*/) -> bool {
+                               const std::string& detail) -> bool {
             audit_log.push_back(action + "|" + result);
+            audit_details.push_back(detail);
             if (audit_throws_)
                 throw std::runtime_error("audit DB write blew up"); // bad_alloc-class (#1647)
             return audit_succeeds_;
@@ -778,7 +797,8 @@ private:
             [this](const std::string& agent_id, const std::string& key) {
                 tag_pushes.emplace_back(agent_id, key);
             },
-            /*agent_registry=*/agent_registry_for_test);
+            /*agent_registry=*/agent_registry_for_test,
+            /*scoped_perm_fn=*/scoped_perm_fn_for_test);
     }
 };
 
@@ -4489,7 +4509,7 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
         ts.last_dispatch_params = params;
         return {"cmd-quar", 1};
     };
-    ts.start_with_dispatch(dispatch, "supervised"); // Security:Write requires approval
+    ts.start_with_dispatch(dispatch, "supervised"); // Security:Execute requires approval (C2)
 
     // 1. First call → ticket, no isolation yet.
     auto res1 = ts.call(
@@ -4500,6 +4520,20 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     std::string approval_id = body1["error"]["data"]["approval_id"].get<std::string>();
     CHECK(ts.last_dispatch_plugin.empty()); // not dispatched yet
     CHECK_FALSE(quar.get_status("agent-q").has_value());
+    // M2 (PR #1796): the ticket-mint audit detail names the endpoint so SIEM can
+    // filter mcp.quarantine_device|pending by agent_id.
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("agent_id=agent-q") != std::string::npos);
+    CHECK(ts.audit_details.back().find("approval_id=" + approval_id) != std::string::npos);
+
+    // 1b. Identical re-mint dedups to the SAME ticket — and its audit detail
+    // carries the endpoint too.
+    auto res1b = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2400,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-q","reason":"malware","whitelist":"10.0.0.1"}}})");
+    auto body1b = nlohmann::json::parse(res1b->body);
+    CHECK(body1b["error"]["data"]["approval_id"].get<std::string>() == approval_id);
+    CHECK(ts.audit_details.back().find("agent_id=agent-q") != std::string::npos);
+    CHECK(ts.audit_details.back().find("(deduped)") != std::string::npos);
 
     // 2. Approve as a different principal.
     REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
@@ -4538,4 +4572,304 @@ TEST_CASE("MCP write tools are advertised in tools/list", "[mcp][integration][ta
     CHECK(names.count("approve_request") == 1);
     CHECK(names.count("reject_request") == 1);
     CHECK(names.count("quarantine_device") == 1);
+}
+
+// ── H1 (PR #1796): per-device scope gate on device-targeted write tools ─────
+// A management-group-confined operator must not tag or isolate devices outside
+// their groups. The three device-targeted handlers route through ScopedPermFn
+// (production: AuthRoutes::require_scoped_permission — its RBAC semantics are
+// covered in test_auth_routes.cpp); these tests prove the MCP wiring threads
+// the right (securable, op, agent_id) into the gate and honors its verdict.
+
+namespace {
+struct ScopeGateCall {
+    std::string securable;
+    std::string op;
+    std::string agent_id;
+};
+} // namespace
+
+TEST_CASE("MCP set_tag enforces the per-device scope gate",
+          "[mcp][integration][tag][scope]") {
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags(tagdb.path);
+
+    std::vector<ScopeGateCall> calls;
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response& res,
+                                     const std::string& sec, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+        calls.push_back({sec, op, agent_id});
+        if (agent_id == "agent-outside") { // mimic require_scoped_permission's 403
+            res.status = 403;
+            res.set_content(R"({"error":"forbidden"})", "application/json");
+            return false;
+        }
+        return true;
+    };
+    ts.start(); // non-MCP-tier session: C8 is permissive, the scope gate decides
+
+    // Out-of-scope device → denied, nothing written.
+    auto denied = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":260,"params":{"name":"set_tag","arguments":{"agent_id":"agent-outside","key":"role","value":"web"}}})");
+    CHECK(denied->status == 403);
+    CHECK(tags.get_tag("agent-outside", "role").empty());
+    REQUIRE(calls.size() == 1);
+    CHECK(calls[0].securable == "Tag");
+    CHECK(calls[0].op == "Write");
+    CHECK(calls[0].agent_id == "agent-outside"); // the gate saw the real target
+
+    // In-scope device → allowed.
+    auto ok = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":261,"params":{"name":"set_tag","arguments":{"agent_id":"agent-inside","key":"role","value":"web"}}})");
+    CHECK(write_tool_payload(ok)["set"] == true);
+    CHECK(tags.get_tag("agent-inside", "role") == "web");
+}
+
+TEST_CASE("MCP delete_tag enforces the per-device scope gate",
+          "[mcp][integration][tag][scope]") {
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-outside", "role", "web", "server");
+    tags.set_tag("agent-inside", "role", "web", "server");
+
+    std::vector<ScopeGateCall> calls;
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response& res,
+                                     const std::string& sec, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+        calls.push_back({sec, op, agent_id});
+        if (agent_id == "agent-outside") {
+            res.status = 403;
+            res.set_content(R"({"error":"forbidden"})", "application/json");
+            return false;
+        }
+        return true;
+    };
+    ts.start();
+
+    auto denied = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":262,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-outside","key":"role"}}})");
+    CHECK(denied->status == 403);
+    CHECK(tags.get_tag("agent-outside", "role") == "web"); // still there
+    REQUIRE(calls.size() == 1);
+    CHECK(calls[0].securable == "Tag");
+    CHECK(calls[0].op == "Delete");
+    CHECK(calls[0].agent_id == "agent-outside");
+
+    auto ok = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":263,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-inside","key":"role"}}})");
+    CHECK(write_tool_payload(ok)["deleted"] == true);
+    CHECK(tags.get_tag("agent-inside", "role").empty());
+}
+
+TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
+          "[mcp][integration][quarantine][scope]") {
+    yuzu::test::TempDbFile qdb{std::string_view{"mcp-quar-"}};
+    yuzu::server::QuarantineStore quar(qdb.path);
+    REQUIRE(quar.is_open());
+
+    std::vector<ScopeGateCall> calls;
+    McpTestServer ts;
+    ts.quarantine_store_for_test = &quar;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response& res,
+                                     const std::string& sec, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+        calls.push_back({sec, op, agent_id});
+        if (agent_id == "agent-outside") {
+            res.status = 403;
+            res.set_content(R"({"error":"forbidden"})", "application/json");
+            return false;
+        }
+        return true;
+    };
+    ts.start();
+
+    // Out-of-scope device → denied, no record, no isolation.
+    auto denied = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":264,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-outside","reason":"sus"}}})");
+    CHECK(denied->status == 403);
+    CHECK_FALSE(quar.get_status("agent-outside").has_value());
+    REQUIRE(calls.size() == 1);
+    CHECK(calls[0].securable == "Security");
+    CHECK(calls[0].op == "Execute");
+    CHECK(calls[0].agent_id == "agent-outside");
+
+    // In-scope device → recorded (no dispatch_fn wired → record-only).
+    auto ok = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":265,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-inside","reason":"sus"}}})");
+    auto payload = write_tool_payload(ok);
+    CHECK(payload["quarantine_record"]["agent_id"] == "agent-inside");
+    REQUIRE(quar.get_status("agent-inside").has_value());
+}
+
+// ── M1 (PR #1796): reviewer == submitter surfaces through the MCP error path ─
+// approval_manager.cpp enforces "reviewer cannot be the same as the submitter"
+// at the store; this proves the FULL MCP path: a ticket minted via the C8 gate
+// by principal X, then approve_request called by the SAME principal X, comes
+// back as a JSON-RPC error carrying the store's rejection.
+
+TEST_CASE("MCP approve_request rejects the ticket's own submitter as reviewer",
+          "[mcp][integration][approval]") {
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised"); // delete_tag is approval-gated → C8 mints as mock_username
+
+    // Mint as the default principal ("test-user").
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":270,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+
+    // Same principal tries to approve their own request → store rejection
+    // surfaced through the MCP error envelope.
+    std::string self_approve =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":271,"params":{"name":"approve_request","arguments":{"approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(self_approve);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find(
+              "reviewer cannot be the same as the submitter") != std::string::npos);
+
+    // The ticket is still pending — a second principal can review it.
+    auto row = appr.get(approval_id);
+    REQUIRE(row);
+    CHECK(row->status == "pending");
+    sqlite3_close(raw);
+}
+
+// ── C1 residue (PR #1796): the recall executes through the REAL auth layer ──
+// Every other MCP test mocks perm_fn, which is exactly how the C1 consume-then-
+// deny bug shipped: the production AuthRoutes::require_permission was never on
+// the MCP unit path. This test wires a REAL AuthRoutes (real ApiTokenStore
+// bearer token, real tier + approval-mirror logic in require_permission) as the
+// handler's auth_fn/perm_fn and proves the full ticket flow end-to-end:
+// mint (-32006) → approve as a second principal → recall EXECUTES (the auth
+// layer must not re-deny on /mcp/v1/ after the C8 gate consumed the ticket) →
+// replay is rejected. Locks the a28deae0 fix at the integration level.
+
+TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_permission",
+          "[mcp][integration][approval][auth_routes]") {
+    namespace fs = std::filesystem;
+    // Per-test unique dir for the AuthRoutes stores (mirrors AuthRoutesFixture
+    // in test_auth_routes.cpp).
+    auto tmp_dir = yuzu::test::unique_temp_path("mcp-real-auth-");
+    fs::create_directories(tmp_dir);
+
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    REQUIRE(auth_mgr.upsert_user("real_mcp_user", "test_password", auth::Role::admin));
+
+    ApiTokenStore api_tokens(tmp_dir / "api_tokens.db");
+    AnalyticsEventStore analytics(tmp_dir / "analytics.db");
+    REQUIRE(api_tokens.is_open());
+    REQUIRE(analytics.is_open());
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
+    AuthRoutes ar(cfg, auth_mgr, /*rbac_store=*/nullptr, &api_tokens,
+                  /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr,
+                  /*tag_store=*/nullptr, &analytics, oidc_mu, oidc_provider);
+
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw_token = api_tokens.create_token("c1-integration", "real_mcp_user",
+                                             now + 3600, "", "supervised");
+    REQUIRE(raw_token.has_value());
+
+    // Real write-tool stores.
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw_db = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw_db) == SQLITE_OK);
+    ApprovalManager appr(raw_db);
+    appr.create_tables();
+
+    // Build the handler with the REAL auth layer — no mocks on auth/perm.
+    mcp::McpServer mcp_srv;
+    bool read_only = false;
+    bool disabled = false;
+    auto handler = mcp_srv.build_handler(
+        [&](const httplib::Request& rq, httplib::Response& rs) { return ar.require_auth(rq, rs); },
+        [&](const httplib::Request& rq, httplib::Response& rs, const std::string& type,
+            const std::string& op) { return ar.require_permission(rq, rs, type, op); },
+        [](const httplib::Request&, const std::string&, const std::string&, const std::string&,
+           const std::string&, const std::string&) { return true; },
+        []() { return nlohmann::json::array(); },
+        /*rbac_store=*/nullptr, /*instruction_store=*/nullptr, /*execution_tracker=*/nullptr,
+        /*response_store=*/nullptr, /*audit_store=*/nullptr, &tags,
+        /*inventory_store=*/nullptr, /*policy_store=*/nullptr, /*mgmt_store=*/nullptr, &appr,
+        /*schedule_engine=*/nullptr, read_only, disabled);
+
+    auto call = [&](const std::string& body) {
+        httplib::Request rq;
+        rq.method = "POST";
+        rq.path = "/mcp/v1/"; // the transport the auth layer's approval-skip keys on
+        rq.body = body;
+        rq.set_header("Content-Type", "application/json");
+        rq.set_header("Authorization", "Bearer " + *raw_token);
+        httplib::Response rs;
+        rs.status = 200;
+        handler(rq, rs);
+        return rs;
+    };
+
+    // 1. Mint: supervised + Tag:Delete → the C8 gate tickets it (-32006).
+    auto mint = call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":300,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    auto mint_body = nlohmann::json::parse(mint.body);
+    REQUIRE(mint_body.contains("error"));
+    CHECK(mint_body["error"]["code"] == mcp::kApprovalRequired);
+    std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+    CHECK(tags.get_tag("agent-1", "role") == "web"); // nothing executed yet
+
+    // 2. A second principal approves.
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok").has_value());
+
+    // 3. Recall: the C8 gate consumes the ticket, then the tool handler calls
+    //    the REAL require_permission — which must NOT re-deny on /mcp/v1/
+    //    (the C1 consume-then-deny bug). The tool must actually EXECUTE.
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":301,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+        approval_id + R"("}}})";
+    auto ok = call(recall);
+    auto ok_body = nlohmann::json::parse(ok.body);
+    REQUIRE_FALSE(ok_body.contains("error")); // not consume-then-deny
+    auto payload = nlohmann::json::parse(
+        ok_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["deleted"] == true);
+    CHECK(tags.get_tag("agent-1", "role").empty()); // the tag is REALLY gone
+
+    // 4. The consumption is attributed to the recalling principal (H3/N2).
+    auto row = appr.get(approval_id);
+    REQUIRE(row);
+    CHECK(row->consumed_at > 0);
+    CHECK(row->consumed_by == "real_mcp_user");
+
+    // 5. Replay of the burned ticket is rejected.
+    auto replay = call(recall);
+    auto replay_body = nlohmann::json::parse(replay.body);
+    REQUIRE(replay_body.contains("error"));
+    CHECK(replay_body["error"]["code"] == mcp::kPermissionDenied);
+
+    sqlite3_close(raw_db);
+    std::error_code ec;
+    fs::remove_all(tmp_dir, ec);
 }
