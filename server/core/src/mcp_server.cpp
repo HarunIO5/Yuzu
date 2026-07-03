@@ -296,8 +296,13 @@ static const ToolDef kTools[] = {
 
     {"query_installed_software",
      "Query the typed installed-software inventory collected by the agent daily-sync framework "
-     "(ADR-0016) — machine-wide installed packages (name, version, publisher, install_date) per "
-     "device, fleet-wide. Filter by software `name` and/or `agent_id`. This is DISTINCT from "
+     "(ADR-0016) — machine-wide installed packages per device, fleet-wide. Each row carries name, "
+     "version (upstream, release stripped), publisher (rpm PACKAGER / deb Maintainer / Windows "
+     "Publisher), install_date, kind (package|app), ecosystem (rpm|deb|apk|pacman|windows|macos|"
+     "homebrew), epoch, release, arch, signature_status (rpm only, from stored header tags), "
+     "distro_id and distro_version (/etc/os-release, Linux rows); fields an ecosystem does not "
+     "store are empty strings, never synthesised. Filter by software `name` and/or `agent_id`. "
+     "This is DISTINCT from "
      "query_inventory/get_agent_inventory, which read the generic per-source blob store on "
      "Infrastructure:Read. Requires Inventory:Read. Returns up to `limit` rows (max 1000); when "
      "result_truncated_by_cap is true more rows exist past the cap (keyset pagination is a "
@@ -2156,12 +2161,22 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 JArr arr;
                 for (const auto& r : rows) {
+                    // Blob contract v2 fields ride along; a field the ecosystem
+                    // does not store is "" (honest-empty, never synthesised).
                     arr.add(JObj()
                                 .add("agent_id", r.agent_id)
                                 .add("name", r.entry.name)
                                 .add("version", r.entry.version)
                                 .add("publisher", r.entry.publisher)
-                                .add("install_date", r.entry.install_date));
+                                .add("install_date", r.entry.install_date)
+                                .add("kind", r.entry.kind)
+                                .add("ecosystem", r.entry.ecosystem)
+                                .add("epoch", r.entry.epoch)
+                                .add("release", r.entry.release)
+                                .add("arch", r.entry.arch)
+                                .add("signature_status", r.entry.signature_status)
+                                .add("distro_id", r.entry.distro_id)
+                                .add("distro_version", r.entry.distro_version));
                 }
                 // A scope-dropped read is security-relevant — audit it distinctly (mirrors
                 // #1634) with the DISTINCT dropped-device count, and fold its persistence

@@ -43,9 +43,14 @@ constexpr std::size_t kMaxFieldLen = 1024;
 constexpr int kMaxSources = 64;
 
 // Parse the canonical wire blob into rows: entries are 0x1E-separated; each is
-// 0x1F-separated (name, version, publisher, install_date) — the same byte form
-// the agent hashes (ADR-0016 §4), so the server re-hash matches. nullopt only
-// when the blob exceeds the cap; an empty list is a legitimate "nothing here".
+// 0x1F-separated in blob contract v2 field order (name, version, publisher,
+// install_date, kind, ecosystem, epoch, release, arch, signature_status,
+// distro_id, distro_version) — the same byte form the agent hashes (ADR-0016
+// §4), so the server re-hash matches. A v1 4-field record parses fine: the
+// token walk stops at the record's end, leaving fields 5–12 default-empty (the
+// documented mixed-version behaviour — an old agent's rows store with empty v2
+// columns). Tokens beyond the 12th are dropped. nullopt only when the blob
+// exceeds the cap; an empty list is a legitimate "nothing here".
 std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string& blob) {
     if (blob.size() > kMaxBlobBytes)
         return std::nullopt;
@@ -58,10 +63,21 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
         std::string_view rec(blob.data() + i, rec_end - i);
         if (!rec.empty()) {
             SoftwareEntry e;
-            std::string* fields[4] = {&e.name, &e.version, &e.publisher, &e.install_date};
+            std::string* fields[12] = {&e.name,
+                                       &e.version,
+                                       &e.publisher,
+                                       &e.install_date,
+                                       &e.kind,
+                                       &e.ecosystem,
+                                       &e.epoch,
+                                       &e.release,
+                                       &e.arch,
+                                       &e.signature_status,
+                                       &e.distro_id,
+                                       &e.distro_version};
             std::size_t fi = 0;
             std::size_t p = 0;
-            while (fi < 4) {
+            while (fi < 12) {
                 std::size_t f_end = rec.find('\x1f', p);
                 if (f_end == std::string_view::npos)
                     f_end = rec.size();

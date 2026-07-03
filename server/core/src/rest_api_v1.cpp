@@ -501,7 +501,7 @@ const std::string& openapi_spec() {
         "properties": {
           "error": {
             "type": "object",
-            "required": ["code", "message", "correlation_id"],
+            "required": ["code", "message", "correlation_id", "retry_after_ms"],
             "properties": {
               "code": {"type": "integer", "description": "HTTP status code echoed into the body for self-describing error frames."},
               "message": {"type": "string", "description": "One-sentence human-readable summary."},
@@ -635,7 +635,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Query inventory across agents with filter expression", "tags": ["Inventory"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Filter by agent ID"}, "plugin": {"type": "string", "description": "Filter by plugin name"}, "since": {"type": "integer", "description": "Only records after this epoch"}, "until": {"type": "integer", "description": "Only records before this epoch"}, "limit": {"type": "integer", "default": 100}}}}}}, "responses": {"200": {"description": "Matching inventory records"}}}
     },
     "/inventory/software": {
-      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Requires Inventory:Read. Results are scoped to the caller's management groups; out-of-scope devices are dropped and counted in devices_omitted (a positive value means matching software exists outside your scope — an empty/short result does NOT mean the software is absent fleet-wide). Capped at limit rows (max 1000); result_truncated_by_cap=true means more exist past the cap (keyset pagination is a follow-up). On store degradation the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Unauthenticated"}, "403": {"description": "Requires Inventory:Read"}, "503": {"description": "Software inventory store unavailable or degraded"}}}
+      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app), ecosystem (rpm|deb|apk|pacman|windows|macos|homebrew), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version — fields an ecosystem does not store are empty, never synthesised. Requires Inventory:Read. Results are scoped to the caller's management groups; out-of-scope devices are dropped and counted in devices_omitted (a positive value means matching software exists outside your scope — an empty/short result does NOT mean the software is absent fleet-wide). Capped at limit rows (max 1000); result_truncated_by_cap=true means more exist past the cap (keyset pagination is a follow-up). On store degradation the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Unauthenticated"}, "403": {"description": "Requires Inventory:Read"}, "503": {"description": "Software inventory store unavailable or degraded"}}}
     },)json"
         // Split again (MSVC C2026 16,380-byte cap); concatenated at compile time.
         // NOTE: the preceding literal segment (incl. /inventory/software) is ~12 KB —
@@ -654,7 +654,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Grant or revoke a user's JIT-admin-elevation eligibility (SOC 2 CC6.3/CC6.6)", "tags": ["Users"], "description": "Admin (or an active elevation) + MFA step-up. Sets the per-user users.elevation_eligible flag. Self-grant is blocked. Setting eligible=false also terminates any in-flight elevation for that user. Errors use the A4 envelope (correlation_id + remediation).", "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["eligible"], "properties": {"eligible": {"type": "boolean"}}}}}}, "responses": {"200": {"description": "{status: ok}"}, "400": {"description": "Invalid username or non-boolean body"}, "401": {"description": "Not authenticated"}, "403": {"description": "Not admin, MFA step-up refused, or self-grant"}, "404": {"description": "User not found"}, "503": {"description": "No auth.db (--data-dir unset)"}}}
     },
     "/elevate": {
-      "post": {"summary": "Activate a time-boxed JIT admin elevation on the current cookie session (SOC 2 CC6.3/CC6.6)", "tags": ["Authentication"], "description": "Cookie session only (API/MCP tokens get 401 and can never elevate). Caller must be elevation_eligible, have MFA enrolled (mandatory regardless of --mfa-enforcement), and pass a fresh MFA step-up. duration_secs defaults to and is clamped by --jit-max-elevation-secs; a negative value is 400. The grant audit is fail-closed. Errors use the A4 envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["justification"], "properties": {"justification": {"type": "string", "description": "Required, non-empty; control bytes sanitised; truncated to 1 KiB at a UTF-8 code-point boundary"}, "duration_secs": {"type": "integer", "minimum": 1}}}}}}, "responses": {"200": {"description": "{status: ok, expires_in}"}, "400": {"description": "Blank/missing justification, wrong-typed field, or negative duration"}, "401": {"description": "Not authenticated, no cookie (token caller), or session dissolved mid-request"}, "403": {"description": "Not eligible, eligibility read failed, or no MFA enrolled"}, "500": {"description": "Grant audit unrecordable — elevation rolled back (Sec-Audit-Failed header)"}, "503": {"description": "No auth.db"}}}
+      "post": {"summary": "Activate a time-boxed JIT admin elevation on the current cookie session (SOC 2 CC6.3/CC6.6)", "tags": ["Authentication"], "description": "Cookie session only (API/MCP tokens get 401 and can never elevate). Caller must be elevation_eligible, have MFA enrolled (mandatory regardless of --mfa-enforcement), and pass a fresh MFA step-up. duration_secs defaults to and is clamped by --jit-max-elevation-secs; a negative value is 400. The grant audit is fail-closed. Errors use the A4 envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["justification"], "properties": {"justification": {"type": "string", "description": "Required, non-empty; control bytes sanitised; truncated to 1 KiB at a UTF-8 code-point boundary"}, "duration_secs": {"type": "integer", "minimum": 1}}}}}}, "responses": {"200": {"description": "{status: ok, expires_in: <true remaining seconds, clamped to the session's own absolute expiry>, expires_at: <RFC3339 UTC timestamp>}"}, "400": {"description": "Blank/missing justification, wrong-typed field, or negative duration"}, "401": {"description": "Not authenticated, no cookie (token caller), session dissolved mid-request, or the session is already at/past its own absolute expiry (dead-window guard)"}, "403": {"description": "Not eligible, eligibility read failed, or no MFA enrolled"}, "500": {"description": "Grant audit unrecordable — elevation rolled back (Sec-Audit-Failed header)"}, "503": {"description": "No auth.db"}}}
     },
     "/elevate/revoke": {
       "post": {"summary": "Step an active JIT elevation down early", "tags": ["Authentication"], "description": "Cookie session only; no MFA step-up (reduces privilege). Always 200; whether a window was active is recorded in the role.elevation.revoked audit detail.", "responses": {"200": {"description": "{status: ok}"}, "401": {"description": "Not authenticated"}}}
@@ -3518,12 +3518,22 @@ void RestApiV1::register_routes(
 
                  JArr arr;
                  for (const auto& r : rows) {
+                     // Blob contract v2 fields ride along; a field the ecosystem
+                     // does not store is "" (honest-empty, never synthesised).
                      arr.add(JObj()
                                  .add("agent_id", r.agent_id)
                                  .add("name", r.entry.name)
                                  .add("version", r.entry.version)
                                  .add("publisher", r.entry.publisher)
-                                 .add("install_date", r.entry.install_date));
+                                 .add("install_date", r.entry.install_date)
+                                 .add("kind", r.entry.kind)
+                                 .add("ecosystem", r.entry.ecosystem)
+                                 .add("epoch", r.entry.epoch)
+                                 .add("release", r.entry.release)
+                                 .add("arch", r.entry.arch)
+                                 .add("signature_status", r.entry.signature_status)
+                                 .add("distro_id", r.entry.distro_id)
+                                 .add("distro_version", r.entry.distro_version));
                  }
 
                  // Audit posture: SET-AND-PROCEED (see route header) — capture the persist
@@ -3727,7 +3737,8 @@ void RestApiV1::register_routes(
     // an aged id).
     sink.Get(
         R"(/api/v1/approvals/([A-Za-z0-9_-]{1,128}))",
-        [auth_fn, perm_fn, approval_manager](const httplib::Request& req, httplib::Response& res) {
+        [auth_fn, perm_fn, audit_fn, approval_manager](const httplib::Request& req,
+                                                       httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
                 return;
@@ -3754,6 +3765,12 @@ void RestApiV1::register_routes(
                 return;
             }
             const auto& a = *approval;
+            // Audit the read (S2, adversarial review): this versioned endpoint is
+            // the A4 status_url target and returns submitted_by / reviewed_by /
+            // scope_expression. The legacy list route lacks an audit, but the
+            // stable agentic surface should leave a trail. Best-effort (success
+            // path only; not fail-closed — no new PII beyond the legacy route).
+            (void)audit_fn(req, "approval.read", "success", "Approval", id, "status=" + a.status);
             auto data = JObj()
                             .add("id", a.id)
                             .add("definition_id", a.definition_id)
@@ -4044,9 +4061,12 @@ void RestApiV1::register_routes(
 
         // Emit an A4 error with a fresh correlation id.
         auto rs_err = [](httplib::Response& res, int status, std::string_view msg) {
-            auto cid = detail::make_correlation_id();
             res.status = status;
-            res.set_content(detail::error_json_a4(status, msg, cid), "application/json");
+            // Route through a4_error so the X-Correlation-Id RESPONSE HEADER is set
+            // (via ensure_correlation_id) — error_json_a4 alone builds only the body,
+            // leaving the header absent on all 26 result-set error paths (S1,
+            // adversarial review). a4_error derives the body `code` from res.status.
+            res.set_content(detail::a4_error(res, msg), "application/json");
         };
 
         // Load a row and enforce the owner check. Returns nullopt and writes a

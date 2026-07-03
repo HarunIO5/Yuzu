@@ -306,6 +306,97 @@ Admin via OIDC is granted **only** through explicit membership in the configured
 5. Grant `openid`, `profile`, and `email` API permissions.
 6. Pass the tenant-specific issuer URL, client ID, secret, and admin group ID to the Yuzu server flags (`--oidc-issuer`, `--oidc-client-id`, `--oidc-client-secret`, `--oidc-admin-group`).
 
+## SAML 2.0 SSO
+
+Yuzu supports SAML 2.0 SP-initiated single sign-on against a single, statically-configured IdP. This is an alternative to OIDC for enterprises whose identity infrastructure requires SAML rather than OpenID Connect.
+
+> **Platform note:** SAML is supported on Linux and macOS only. A Windows server logs an error at startup and does not enable SAML regardless of flag values. If you need SSO on Windows, use OIDC.
+
+> **Role note:** All SAML users sign in as `role=user`. There is no group-to-role mapping in this release. **SAML-authenticated users are permanently `role=user` — there is no admin path for them in this release.** JIT elevation is non-functional for SAML users (the elevation check requires a local `users` row in auth.db, which SAML users do not have). For admin access, use OIDC or a local account.
+
+> **HTTPS required:** SAML uses a `Secure` browser-binding cookie (`__Host-yuzu_saml_bind`). Browsers silently drop `Secure` cookies over plain HTTP. SAML fails closed at startup when `--https-cert`/`--https-key` are not configured. Do not run SAML over HTTP.
+
+> **MFA step-up:** MFA step-up is not supported for SAML sessions in this release. A SAML session hitting any of the 11 step-up-gated endpoints (token mint/revoke, session revoke, Guardian rule write, software deploy, user management) receives a `403` regardless of `--mfa-enforcement` mode. Use `--mfa-enforcement=optional` and rely on your IdP to enforce MFA at login time. Do not use `--mfa-enforcement=required` for SAML deployments — it denies SAML users at all step-up gates.
+
+### Registering the SP with Your IdP
+
+Before configuring the server, register Yuzu as a Service Provider with your identity provider:
+
+1. **SP Entity ID** — a URI that identifies this Yuzu installation to the IdP (e.g. `https://yuzu.example.com`). You choose this value; it must be unique within the IdP's SP registry.
+2. **ACS URL** — the Assertion Consumer Service URL where the IdP will POST the SAML response. This is `https://yuzu.example.com/saml/acs` (or the equivalent for your host and port). Set this as the ACS / reply URL in your IdP.
+3. **Bindings** — configure the IdP to use **HTTP-Redirect** for the AuthnRequest and **HTTP-POST** for the response to the ACS.
+4. **IdP signing certificate** — download or copy the IdP's assertion-signing certificate in PEM format and store it on the Yuzu server host (e.g. `/etc/yuzu/idp-signing.pem`, readable by the `yuzu` service account).
+
+### Server Configuration
+
+SAML is enabled via CLI flags (or the matching environment variables). All five flags (`--saml-idp-entity-id`, `--saml-idp-sso-url`, `--saml-idp-cert`, `--saml-sp-entity-id`, `--saml-sp-acs-url`) are validated at startup as one unit — supplying any subset produces a startup warning that names the missing flag, and SAML is disabled (fail-closed). A partial configuration never logs "SAML SP initialized".
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--saml-idp-entity-id` | `YUZU_SAML_IDP_ENTITY_ID` | Entity ID URI of the IdP (must match what the IdP uses in its assertions) |
+| `--saml-idp-sso-url` | `YUZU_SAML_IDP_SSO_URL` | IdP's HTTP-Redirect SSO endpoint URL |
+| `--saml-idp-cert` | `YUZU_SAML_IDP_CERT` | Path to the IdP signing certificate PEM file on the server host |
+| `--saml-sp-entity-id` | `YUZU_SAML_SP_ENTITY_ID` | Entity ID URI this SP advertises to the IdP |
+| `--saml-sp-acs-url` | `YUZU_SAML_SP_ACS_URL` | Full public URL of the ACS endpoint (`https://<host>/saml/acs`) |
+
+Example startup:
+
+```bash
+./yuzu-server \
+  --https --https-port 8443 \
+  --https-cert /etc/yuzu/server.crt \
+  --https-key  /etc/yuzu/server.key \
+  --saml-idp-entity-id "https://idp.example.com/saml" \
+  --saml-idp-sso-url   "https://idp.example.com/saml/sso" \
+  --saml-idp-cert      /etc/yuzu/idp-signing.pem \
+  --saml-sp-entity-id  "https://yuzu.example.com" \
+  --saml-sp-acs-url    "https://yuzu.example.com/saml/acs"
+```
+
+### SAML Login Flow
+
+1. The operator navigates directly to `GET /auth/saml/start`. There is no "Sign in with SAML" button on the login page in this release — the login-page SSO button for SAML is deferred.
+2. The server generates a `<samlp:AuthnRequest>` and redirects the browser to the IdP via **HTTP-Redirect binding** (the request is deflate-compressed and URL-encoded in the `SAMLRequest` query parameter).
+3. The operator authenticates at the IdP.
+4. The IdP POSTs a `<samlp:Response>` containing a signed assertion to the ACS endpoint (`POST /saml/acs`) via **HTTP-POST binding**.
+5. The server validates the assertion (signature, audience, recipient, expiry, and replay protection) and mints a session cookie on success.
+
+```
+Browser           Yuzu Server               IdP
+  |                    |                          |
+  |-- GET /auth/saml/start -->                    |
+  |                    |-- 302 SAMLRequest? ---->|
+  |                    |                          |
+  |                    |      (user authenticates)|
+  |                    |                          |
+  |                    |<--- POST /saml/acs ------|
+  |<-- Set-Cookie -----|                          |
+```
+
+The resulting session behaves identically to an OIDC session — it is subject to the same 8-hour absolute lifetime and the optional `--session-inactivity-secs` idle timeout. See [Session lifetime](#session-lifetime) for details.
+
+### What Is and Is Not Supported
+
+| Capability | Status |
+|---|---|
+| SP-initiated login (HTTP-Redirect AuthnRequest) | Supported |
+| Signed assertion validation (pinned IdP cert) | Supported |
+| Audience / recipient / expiry validation | Supported |
+| Replay protection (`InResponseTo` single-use) | Supported |
+| Group-to-role mapping | Not in this release — all SAML users are permanently `role=user` |
+| Admin access for SAML users | Not supported — JIT elevation is non-functional for SAML users; use OIDC or local accounts for admin |
+| Login-page SSO button | Not in this release — navigate directly to `GET /auth/saml/start` |
+| MFA step-up at high-risk endpoints | Not supported — SAML sessions receive 403 at all step-up-gated endpoints regardless of `--mfa-enforcement`; rely on IdP MFA |
+| `--auth-mode=sso-only` with SAML-only | Not supported — `sso-only` requires OIDC configuration; local-password login cannot be disabled with SAML alone |
+| Multi-replica / HA without sticky sessions | Not supported — pending AuthnRequest state is in-process; configure load-balancer session affinity on `/auth/saml/start` and `/saml/acs` |
+| AuthnRequest signing | Not in this release — the IdP must accept unsigned requests; use OIDC if the IdP requires signed requests |
+| AttributeStatement parsing | Not in this release — only `NameID` is read |
+| IdP-metadata auto-fetch | Not in this release — cert and SSO URL are configured statically |
+| IdP cert hot-reload | Not supported — update `--saml-idp-cert` and restart the server |
+| Runtime reconfigure via dashboard | Not in this release — a server restart is required to change SAML flags |
+| SP metadata endpoint | Not in this release — register the SP manually using the flag values |
+| Windows | Not supported — SAML is Linux/macOS only |
+
 ## API Tokens
 
 API tokens provide non-interactive authentication for scripts, CI/CD pipelines, and integrations. Tokens are passed as Bearer tokens and bypass the session/cookie mechanism.
@@ -461,17 +552,22 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 Eligibility is the per-user `users.elevation_eligible` flag — distinct from holding standing admin, and enumerable for access reviews. An admin **cannot** grant their own eligibility (another admin must). Revoking it (`{"eligible":false}`) immediately ends any elevation the user currently holds.
 
-**2. The eligible operator elevates** when they need admin. The operator must have **MFA enrolled** (a second factor is mandatory to elevate, regardless of `--mfa-enforcement`) and will be challenged for a fresh TOTP code:
+**Prerequisite for a federated (OIDC/SSO) operator:** eligibility is keyed on a Yuzu `users` table row, and signing in via OIDC does **not** create one. A federated-only identity must already have a `users` row — provision it first (e.g. `POST /api/v1/users`) — or the eligibility call above 404s. This is a known limitation; auto-provisioning eligibility by OIDC identity is tracked as a follow-up, not yet implemented.
+
+**2. The eligible operator elevates** when they need admin. A second factor is mandatory to elevate, regardless of `--mfa-enforcement`, and satisfied one of two ways depending on how the operator is currently authenticated (their identity SOURCE, not their username — an OIDC session never consults a local namesake account's TOTP enrollment):
+
+- **Local account:** the operator must have **MFA enrolled** and will be challenged for a fresh TOTP code.
+- **OIDC/SSO account:** if the operator's *current* SSO login was authenticated with IdP MFA (asserted via the OIDC `amr` claim), that assertion satisfies the second-factor requirement — **no local TOTP enrollment needed**. A single-factor SSO login (no IdP MFA) is still denied. This is controlled by `--jit-oidc-amr-elevation` (default enabled). Disabling it (`--no-jit-oidc-amr-elevation`) means **OIDC sessions cannot use JIT elevation at all** — an OIDC session cannot present a local TOTP step-up (its step-up challenge is re-authenticating via SSO, not a TOTP code), so the operator must elevate from a local-authenticated session with local TOTP instead.
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"justification":"prod incident #42","duration_secs":600}' \
   https://yuzu.example.com/api/v1/elevate
-# -> {"status":"ok","expires_in":600}
+# -> {"status":"ok","expires_in":598,"expires_at":"2026-07-02T13:10:00Z"}
 ```
 
-The session is now admin for the window (capped by `--jit-max-elevation-secs`, default 1h). It **auto-reverts** when the window lapses, on logout, or on a server restart — the elevation is never persisted. Step down early with `POST /api/v1/elevate/revoke`. Every step (`role.elevation.granted`/`denied`/`revoked`, `user.elevation_eligibility.set`) is audited. Technical invariants: `docs/auth-architecture.md` "JIT admin elevation".
+`expires_in` is the TRUE remaining seconds computed after the grant (always `<=` the requested `duration_secs` — it is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute lifetime, so it is never an exact echo of the request), and `expires_at` is the same window as a wall-clock RFC3339 UTC timestamp. The session is now admin for the window (capped by `--jit-max-elevation-secs`, default 1h). It **auto-reverts** when the window lapses, on logout, or on a server restart — the elevation is never persisted. Step down early with `POST /api/v1/elevate/revoke`. Every step (`role.elevation.granted`/`denied`/`revoked`/`expired`, `user.elevation_eligibility.set`) is audited — the `granted` row's detail records which factor was used (`mfa=local_totp` or `mfa=oidc_amr`). Technical invariants: `docs/auth-architecture.md` "JIT admin elevation".
 
 ## MCP Tokens
 
@@ -572,6 +668,8 @@ The following audit actions are emitted for authentication and authorization eve
 | `auth.logout` | `success` | User-initiated logout |
 | `auth.oidc_login` | `success` | Successful OIDC SSO login |
 | `auth.oidc_login_failed` | `failure` | Failed OIDC login attempt |
+| `auth.saml_login` | `ok` | Successful SAML 2.0 SSO login |
+| `auth.saml_login_failed` | `error` | Failed SAML login attempt (missing binding cookie, oversize body, missing SAMLResponse, or signature/audience/expiry/replay validation failure) |
 
 All `denied` results include a `detail` field explaining the reason. Examples per action:
 - `auth.admin_required` → `"MCP token blocked from admin route"`, `"service-scoped token blocked from admin route"`, `"non-admin user blocked from admin route"`
@@ -608,6 +706,8 @@ HTTP status codes:
 | `POST` | `/logout` | Session | Invalidate current session; returns JSON `{"status":"ok"}` |
 | `GET` | `/auth/oidc/start` | No | Begin OIDC PKCE login flow (302 redirect to IdP) |
 | `GET` | `/auth/callback` | No | OIDC callback (IdP redirects here; creates session, 302 to `/`) |
+| `GET` | `/auth/saml/start` | No | Begin SAML 2.0 SP-initiated login flow (302 redirect to IdP via HTTP-Redirect binding); Linux/macOS only |
+| `POST` | `/saml/acs` | No | SAML Assertion Consumer Service — IdP POSTs the response here; validates and creates session; Linux/macOS only |
 | `GET` | `/api/v1/me` | Any (session, Bearer, or X-Yuzu-Token) | Current user info and role |
 | `POST` | `/api/v1/tokens` | RBAC `ApiToken:Write` | Create a new API token |
 | `GET` | `/api/v1/tokens` | RBAC `ApiToken:Read` | List tokens owned by the authenticated user |
