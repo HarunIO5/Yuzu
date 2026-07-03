@@ -71,8 +71,12 @@ void report_status(DWORD current_state, DWORD win32_exit_code = NO_ERROR,
         SetServiceStatus(handle, &status);
 }
 
+// noexcept for the same reason as service_main: a raw WINAPI callback the SCM
+// invokes directly must not let an exception (however unlikely -- only source
+// here is std::mutex::lock inside report_status()/this function) cross that C
+// ABI boundary as UB; noexcept converts it into a defined std::terminate instead.
 DWORD WINAPI handler_ex(DWORD control, DWORD /*event_type*/, LPVOID /*event_data*/,
-                         LPVOID /*context*/) {
+                         LPVOID /*context*/) noexcept {
     switch (control) {
     case SERVICE_CONTROL_STOP:
     case SERVICE_CONTROL_SHUTDOWN:

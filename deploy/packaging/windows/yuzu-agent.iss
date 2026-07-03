@@ -286,6 +286,7 @@ end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): string;
 var
+  StopResultCode: Integer;
   ResultCode: Integer;
   i: Integer;
 begin
@@ -294,15 +295,24 @@ begin
     (the agent reports SERVICE_STOP_PENDING then SERVICE_STOPPED instead of
     never responding), so poll for STOPPED instead of a blind delay -- bounded
     so a slow/loaded machine still gets there without holding up install
-    indefinitely if something else goes wrong. }
-  Exec('sc.exe', 'stop YuzuAgent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  for i := 1 to 15 do
+    indefinitely if something else goes wrong.
+    sc.exe's exit code IS the underlying Win32 error (confirmed empirically:
+    1060 = ERROR_SERVICE_DOES_NOT_EXIST on a fresh install, no prior service).
+    Only poll when the stop was actually ACCEPTED (0) -- gating on that, not
+    unconditionally, is load-bearing: a fresh install (the dominant case, no
+    YuzuAgent service yet) would otherwise burn the full 15s poll for nothing
+    every single time, a real regression against the old flat 2s wait. }
+  Exec('sc.exe', 'stop YuzuAgent', '', SW_HIDE, ewWaitUntilTerminated, StopResultCode);
+  if StopResultCode = 0 then
   begin
-    Exec('cmd.exe', '/c sc query YuzuAgent | find "STOPPED" >nul', '', SW_HIDE,
-         ewWaitUntilTerminated, ResultCode);
-    if ResultCode = 0 then
-      Break;
-    Sleep(1000);
+    for i := 1 to 15 do
+    begin
+      Exec('cmd.exe', '/c sc query YuzuAgent | find "STOPPED" >nul', '', SW_HIDE,
+           ewWaitUntilTerminated, ResultCode);
+      if ResultCode = 0 then
+        Break;
+      Sleep(1000);
+    end;
   end;
 end;
 
