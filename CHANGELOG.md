@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TAR `perf` + `procperf` collectors on Linux (procfs).** The device
+  performance sampler and the per-application top-N sampler — Windows-only
+  until now — are implemented on Linux: `perf` reads `/proc/stat`,
+  `/proc/meminfo` (`MemAvailable`; `commit_pct` reads 0 under
+  `vm.overcommit_memory=1`), `/proc/diskstats` (whole disks only, 512-byte ABI
+  sectors), and `/proc/net/dev` (loopback excluded); `procperf` does one
+  `/proc/<pid>/stat` read per process per tick (kernel 15-char comm — joins
+  `$Process_Live` by name; `version` is always `""` until on-disk version
+  capture lands). Because `perf` is default-ON, **Linux agents begin device
+  performance sampling automatically on upgrade** (device-level, no user
+  identity; opt out with `perf_enabled=false`); `procperf` remains opt-in on
+  every OS, and enabling it now also feeds the `app_perf` daily sync (B1/B2)
+  from Linux devices — no server change, the plumbing was already
+  platform-agnostic. macOS remains planned for both sources.
 - **`/inventory` Devices tab shows real device-CI data.** The Serial/Model/CPU-RAM
   columns (previously greyed placeholders) now read from `DeviceInventoryStore`, and
   the per-device drill grows a full CI-record panel (manufacturer, model, serial,

@@ -251,6 +251,14 @@ Before upgrading any component:
   enable it for an EU workforce, treat it as a works-council co-determination
   trigger. See the *DEX per-application sampling* upgrade note in
   [Server Administration](server-admin.md#upgrade-notes).
+- [ ] **New device performance sampling on Linux:** this release wires the TAR
+  `perf` collector on **Linux**, and because it is default-ON, Linux agents
+  **begin recording on-device performance samples automatically on agent
+  upgrade** (device-level, no user identity; opt out per host with
+  `tar.configure perf_enabled=false`). Per-application sampling (`procperf`)
+  is now also implemented on Linux but remains **opt-in on every OS** — the
+  works-council posture above applies unchanged. Details and caveats: the
+  upgrade note in [the TAR user manual](tar.md#performance-impact).
 - [ ] **New network telemetry on Windows:** this release makes **Windows** agents
   emit device-aggregate network facts (throughput + interval retransmit rate) on
   the heartbeat, automatically on agent upgrade — gated by the existing

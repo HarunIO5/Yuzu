@@ -297,8 +297,12 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "GetPerformanceInfo, IOCTL_DISK_PERFORMANCE, GetIfTable2. "
                  "No PDH, no WMI, no shell-out. Some virtual disks do not "
                  "answer IOCTL_DISK_PERFORMANCE — disk columns read 0 there."},
-                {"linux",   OsSupportStatus::kPlanned,    "procfs",
-                 "/proc/stat, /proc/meminfo, /proc/diskstats, /proc/net/dev."},
+                {"linux",   OsSupportStatus::kSupported,  "procfs",
+                 "/proc/stat (aggregate jiffies, DEX busy conventions), "
+                 "/proc/meminfo (MemAvailable; commit_pct reads 0 under "
+                 "vm.overcommit_memory=1 — CommitLimit is advisory there), "
+                 "/proc/diskstats (whole disks only, 512-byte ABI sectors), "
+                 "/proc/net/dev (non-loopback). No shell-out."},
                 {"macos",   OsSupportStatus::kPlanned,    "host_statistics",
                  "host_processor_info / host_statistics64 + IOKit counters."},
             },
@@ -367,8 +371,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "every process; no PDH, no WMI. The per-app file version is "
                  "the bounded exception: a least-privilege OpenProcess on each "
                  "top-N representative only (<= 2N/tick), failures → empty."},
-                {"linux",   OsSupportStatus::kPlanned,    "procfs",
-                 "/proc/[pid]/stat utime+stime + VmRSS."},
+                {"linux",   OsSupportStatus::kSupported,  "procfs",
+                 "One /proc/[pid]/stat pass per tick — comm, utime+stime, rss, "
+                 "starttime; no ptrace, no per-process handles. Names are the "
+                 "kernel's 15-char comm (joins process_live). version is "
+                 "always '' (on-disk version capture is a follow-up)."},
                 {"macos",   OsSupportStatus::kPlanned,    "libproc",
                  "proc_pid_rusage / proc_taskinfo per sysctl PID list."},
             },

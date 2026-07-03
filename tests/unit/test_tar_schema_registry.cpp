@@ -281,6 +281,26 @@ TEST_CASE("TAR schema: software source is registered with three tiers + Windows 
     }
 }
 
+TEST_CASE("TAR schema: perf + procperf are supported on Windows AND Linux (procfs)",
+          "[tar][schema][perf]") {
+    const auto& sources = capture_sources();
+    for (const auto* name : {"perf", "procperf"}) {
+        auto it = std::find_if(sources.begin(), sources.end(),
+                               [&](const CaptureSourceDef& s) { return s.name == name; });
+        REQUIRE(it != sources.end());
+        for (const auto& os : it->os_support) {
+            INFO("source=" << name << " os=" << os.os);
+            if (os.os == "windows" || os.os == "linux") {
+                CHECK(os.status == OsSupportStatus::kSupported);
+                if (os.os == "linux")
+                    CHECK(os.capture_method == "procfs");
+            } else {
+                CHECK(os.status == OsSupportStatus::kPlanned); // macOS still planned
+            }
+        }
+    }
+}
+
 TEST_CASE("TAR schema: $Software dollar-names translate and DDL has the columns",
           "[tar][schema][software]") {
     CHECK(translate_dollar_name("$Software_Live") == "software_live");

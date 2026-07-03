@@ -25,7 +25,7 @@ The **Software** source diffs the installed-software inventory to record install
 
 The **first run on a host seeds the baseline silently** (it records no events) so an `installed` event always means "installed now", not "was already present when the agent started watching". Linux (dpkg/rpm) and macOS (pkgutil) collectors are planned; the `$Software_*` tables are queryable but stay empty on those platforms until then.
 
-The **Performance** source is different: it is a fixed-cadence *scalar sample*, not an event diff. Each 30-second tick records one row of derived device metrics — CPU busy %, memory used % and commit-charge %, per-IO disk service time (µs) and read/write throughput, and non-loopback network rx/tx throughput. It is collected from raw kernel counters (no PDH, no WMI, no shell-out) and, like all TAR data, **stays on the device** — only aggregates leave the edge. On Windows it is fully supported; Linux and macOS collectors are planned. The first sample after the agent starts is a baseline (it establishes the counter reference and records no row); every subsequent tick records one sample.
+The **Performance** source is different: it is a fixed-cadence *scalar sample*, not an event diff. Each 30-second tick records one row of derived device metrics — CPU busy %, memory used % and commit-charge %, per-IO disk service time (µs) and read/write throughput, and non-loopback network rx/tx throughput. It is collected from raw kernel counters (no PDH, no WMI, no shell-out) and, like all TAR data, **stays on the device** — only aggregates leave the edge. On Windows and Linux it is fully supported (Windows: kernel counters; Linux: procfs); the macOS collector is planned. The first sample after the agent starts is a baseline (it establishes the counter reference and records no row); every subsequent tick records one sample.
 
 ## Querying TAR data
 
@@ -151,8 +151,8 @@ TAR runs on Windows, Linux, and macOS, but each capture source has platform-spec
 | **tcp** | supported (`iphlpapi`) — `GetExtendedTcpTable` polled at `fast_interval`. ETW (`Microsoft-Windows-Kernel-Network`) is **planned** for sub-second fidelity; not yet wired. | supported (`procfs`) — `/proc/net/{tcp,tcp6,udp,udp6}`. Connection lifetime below `fast_interval` may be missed. | constrained (`proc_pidfdinfo`) — `proc_listallpids` + `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` via `libproc`. Inherent TOCTOU between pid enumeration and per-fd query — short-lived sockets that close before the per-fd query may produce empty rows. Endpoint Security framework is the planned replacement. |
 | **service** | supported (`scm`) — `EnumServicesStatusEx` / `QueryServiceConfig`; full status + startup_type. | constrained (`systemctl`) — `systemctl list-units`; `startup_type` reported as `unknown`. Hosts without systemd (Alpine sysvinit, OpenRC) are unsupported. | constrained (`launchctl`) — `launchctl list`; no startup_type, status binary running/stopped only. |
 | **user** | supported (`wts`) — `WTSEnumerateSessionsW` + `WTSQuerySessionInformationW`; interactive, RDP, console. Server Core 2008 R2 minimal installs lack Terminal Services. | constrained (`utmp`) — `getutent`. Containers without `/var/run/utmp` produce no events. `logon_type` inferred from tty (`pts/*` → remote). | constrained (`utmpx`) — `getutxent`. GUI logins are not always reflected. |
-| **perf** | supported (`ntcounters`) — `GetSystemTimes`, `GlobalMemoryStatusEx`/`GetPerformanceInfo`, `IOCTL_DISK_PERFORMANCE`, `GetIfTable2`. No PDH, no WMI, no shell-out. Some virtual disks do not answer `IOCTL_DISK_PERFORMANCE` — disk columns read 0 there. | planned (`procfs`) — `/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/dev`. Records nothing until wired. | planned (`host_statistics`) — `host_processor_info` / `host_statistics64` + IOKit. Records nothing until wired. |
-| **procperf** | supported (`ntsysinfo`), **opt-in (off by default)** — one `NtQuerySystemInformation(SystemProcessInformation)` snapshot per tick: image name, CPU times, working set for every process. No PDH, no WMI, no per-process handles. Records image **names only — never command lines**; redaction patterns apply to the name (as bare case-insensitive substrings — a pattern meant for a command-line argument can match an image name, so over-matching drops a process from the warehouse entirely). | planned (`procfs`) — `/proc/<pid>/stat` utime+stime + VmRSS. Records nothing until wired. | planned (`libproc`) — `proc_pid_rusage`/`proc_taskinfo`. Records nothing until wired. |
+| **perf** | supported (`ntcounters`) — `GetSystemTimes`, `GlobalMemoryStatusEx`/`GetPerformanceInfo`, `IOCTL_DISK_PERFORMANCE`, `GetIfTable2`. No PDH, no WMI, no shell-out. Some virtual disks do not answer `IOCTL_DISK_PERFORMANCE` — disk columns read 0 there. | supported (`procfs`) — `/proc/stat`, `/proc/meminfo` (`MemAvailable`), `/proc/diskstats` (whole disks only, fixed 512-byte ABI sectors), `/proc/net/dev` (loopback excluded). No shell-out. `commit_pct` reads 0 under `vm.overcommit_memory=1` (CommitLimit is advisory there); a host with no recognised whole-disk device (some containers) reads 0 in the disk columns — same per-domain degrade as a Windows virtual disk. | planned (`host_statistics`) — `host_processor_info` / `host_statistics64` + IOKit. Records nothing until wired. |
+| **procperf** | supported (`ntsysinfo`), **opt-in (off by default)** — one `NtQuerySystemInformation(SystemProcessInformation)` snapshot per tick: image name, CPU times, working set for every process. No PDH, no WMI, no per-process handles. Records image **names only — never command lines**; redaction patterns apply to the name (as bare case-insensitive substrings — a pattern meant for a command-line argument can match an image name, so over-matching drops a process from the warehouse entirely). | supported (`procfs`), **opt-in (off by default)** — one `/proc/<pid>/stat` read per process per tick: comm, utime+stime, rss, starttime; no ptrace, no per-process handles. Names are the kernel's **15-character comm** — the same value the process source records, so procperf rows join `$Process_Live` by name. Redaction: a pattern core (after `*` stripping) longer than 15 characters is additionally matched by its **15-character prefix**, so a full-app-name pattern still redacts the app it names (over-matching errs toward redaction); a Windows-specific core like `outlook.exe` does **not** match the extension-less comm `outlook` — Linux fleets need Linux-appropriate patterns. `version` is always `""` (on-disk version capture is a follow-up). | planned (`libproc`) — `proc_pid_rusage`/`proc_taskinfo`. Records nothing until wired. |
 | **module** | planned (`etw`), **opt-in (off by default)** — `Microsoft-Windows-Kernel-Process` image-load events with the code-signing verdict resolved at drain. **Schema registered + queryable now (M1); records nothing until the collector ships (M2).** | planned (`auditd`) — kernel-module loads via `init_module`/`finit_module` (M6). Records nothing until wired. | planned (`endpoint_security`) — `NOTIFY_KEXTLOAD`/`KEXTUNLOAD` + dylibs (M4/M5). Records nothing until wired. |
 | **software** | supported (`registry`), **opt-in (off by default)** — diffs the registry Uninstall keys on the `tar.software` tick: HKLM 64-bit + WOW6432Node 32-bit (**machine scope only, no user identity / no PII**). `SystemComponent` entries (canonically a `REG_DWORD` set to a non-zero value) are excluded — system components and OS patches are not reported as installed software; names, versions, and publisher only. First run seeds the baseline silently. | planned (`dpkg_rpm`) — dpkg/rpm/pacman diff. Records nothing until wired. | planned (`pkgutil`) — `system_profiler` + pkgutil diff. Records nothing until wired. |
 | **arp** | supported (`iphlpapi`), **opt-in (off by default)** — `GetIpNetTable2(AF_UNSPEC)`: ARP + IPv6 neighbour cache; full interface/IP/MAC/entry_type (ADR-0015). | planned (`procfs`) — `/proc/net/arp`. Records nothing until wired. | planned (`route_sysctl`) — `sysctl NET_RT_FLAGS`; `entry_type` will be `unknown` (constrained). Records nothing until wired. |
@@ -376,7 +376,14 @@ TAR is designed for minimal performance overhead:
 > **Upgrade note (device perf sampling; per-app sampling is opt-in).** On
 > upgrade to this release, every Windows agent continues **device** performance
 > sampling (`perf_enabled` defaults to `true`, 30-second cadence — unchanged
-> from the prior release). **Per-application** sampling (`procperf_enabled`) is
+> from the prior release). **Linux agents BEGIN device performance sampling on
+> upgrade to this release**: the Linux `perf` collector (procfs) is new, and
+> because `perf_enabled` is default-ON, `$Perf_Live` rows start accruing on
+> Linux hosts at the same 30-second cadence with no operator action — a real,
+> operator-visible data-collection change on Linux fleets (set
+> `perf_enabled=false` per host to opt out; the data is device-level with no
+> user identity, the same class as the Windows rows). **Per-application**
+> sampling (`procperf_enabled`, now implemented on Windows and Linux) is
 > a new, distinct telemetry category — per-app CPU/working-set by image name —
 > and ships **off by default**: it is not collected until an operator opts in,
 > because it is usage-class data subject to works-council/DPA review (see
@@ -389,7 +396,9 @@ TAR is designed for minimal performance overhead:
 > previous release misreported them as `true` even though nothing was being
 > collected); if you parse `tar.status` to inventory active sources, expect
 > `module_enabled`, `procperf_enabled`, and `netqual_enabled` to read `false`
-> unless you have explicitly opted in. No data collection changes on upgrade.
+> unless you have explicitly opted in. No data collection changes on upgrade
+> from these opt-in sources (the one collection change this release does make
+> is Linux device perf starting automatically — see the start of this note).
 > Warehouse tables added by a new release are now created on every database open
 > (previously a pre-existing `tar.db` missed tables introduced after it was
 > first created), so no manual table-creation step is needed on upgrade.
@@ -398,7 +407,7 @@ TAR is designed for minimal performance overhead:
 > off by default.** Expect both to read `false` in `tar.status` on upgrade; the
 > new `$ARP_*` / `$DNS_*` warehouse tables are created automatically and stay
 > empty until you opt in (Windows-only collectors today; Linux/macOS planned).
-> No data collection changes on upgrade. **GUI note:** after enabling a source
+> No data collection changes on upgrade from ARP/DNS. **GUI note:** after enabling a source
 > (Capture-sources frame or `configure`), the first rows appear at the next
 > `fast_interval` tick (default 60 s) — an empty panel immediately after enabling
 > is expected, not a fault.
