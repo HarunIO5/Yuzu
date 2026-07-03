@@ -203,12 +203,16 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   rather than leaving it standing for the window.
 - **Activation** — `POST /api/v1/elevate`
   `{"justification": <required>, "duration_secs": <int>}`. Requires the caller to
-  be eligible **and** have **MFA enrolled** **and** pass a fresh MFA step-up.
-  MFA enrollment is mandatory **unconditionally** here, NOT gated on
+  be eligible **and** present a mandatory second factor **and** pass a fresh MFA
+  step-up. The mandatory second factor is **local TOTP enrollment** for a local
+  session, or a **fresh IdP-attested MFA `amr` proof** for an OIDC session when
+  `--jit-oidc-amr-elevation` is enabled (see "OIDC-amr elevation" below). This
+  requirement is mandatory **unconditionally** here, NOT gated on
   `--mfa-enforcement`: elevation is the privilege-crossing boundary (non-admin →
   full admin), so — unlike the other step-up sites where the actor is already
-  admin — an eligible operator with no enrolled second factor is refused (403,
-  `role.elevation.denied`). Sets
+  admin — an eligible operator who presents no second factor (a local session
+  with no enrolled TOTP, or an OIDC session with no `amr` proof / the toggle
+  off) is refused (403, `role.elevation.denied`). Sets
   `Session::elevated_until = min(now + min(duration, --jit-max-elevation-secs), session.expires_at)`
   (default cap 1h, max 24h; an absent/0 `duration_secs` defaults to the cap, a
   negative one is a 400, a present-but-wrong-typed field is a 400). **The window
@@ -251,12 +255,66 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   tokens resolve through `synthesize_token_session` (no cookie, no
   `elevated_until`), so a long-lived automation credential can **never** be
   elevated.
-- **v1 limitation — local TOTP required.** The mandatory-MFA check is the local
-  `mfa_status` (`auth.db`), so an **OIDC-only operator with no local TOTP
-  enrolled cannot elevate** (fail-closed: `role.elevation.denied` / no MFA
-  enrolled). This is safe but restrictive for SSO-first deployments; elevation
-  gated on the OIDC `amr` MFA assertion (so an IdP-MFA'd SSO operator can elevate
-  without a local TOTP) is a tracked follow-up.
+- **OIDC-amr elevation (shipped follow-up).** An OIDC operator whose SSO
+  session was authenticated with IdP MFA — asserted via the OIDC `amr` claim
+  at `/auth/callback`, which seeds `Session::mfa_verified_at` when
+  `amr_asserts_mfa(claims.amr)` is true (see `docs/auth-mfa-design.md` "OIDC
+  interop") — CAN elevate without local TOTP enrollment. **Prerequisite:**
+  eligibility and MFA status are both keyed on the `users` table row, and the
+  OIDC login path does **not** create one; a federated-only identity must
+  already have a Yuzu `users` row (e.g. provisioned via `POST /api/v1/users`)
+  before an admin can grant it `elevation_eligible` at all — see the "AuthDB
+  — persistent authentication store" section below and `.claude/agents/authdb.md`.
+  The mandatory-second-factor check at
+  `POST /api/v1/elevate` (`auth_routes.cpp`) branches EXPLICITLY on identity
+  source, not a single "skip the local check" flag:
+  ```cpp
+  const bool oidc_amr_proof = session->auth_source == "oidc" &&
+                              session->mfa_verified_at.time_since_epoch().count() != 0;
+  const bool oidc_amr_elevation = cfg_.jit_oidc_amr_elevation && oidc_amr_proof;
+  if (session->auth_source == "oidc") {
+      if (!oidc_amr_elevation) { /* 403 — distinct reason for no-amr vs toggle-off */ }
+      // else fall through to elevation_step_up (freshness on the amr seed)
+  } else {
+      if (auto st = db->mfa_status(session->username); !st || !st->enrolled) { /* 403 */ }
+  }
+  ```
+  **LOAD-BEARING (security-F1, hardening-round consistency S-2):** an OIDC
+  session must **never** fall through to the local `mfa_status` lookup. A
+  local *namesake* account (same username, unrelated identity) might be
+  TOTP-enrolled, and an earlier draft that used a single `if (!oidc_amr_elevation)
+  { <local enrollment check> }` guard let an OIDC caller with no amr proof
+  inherit that namesake's enrollment — passing the enrollment gate on a factor
+  the OIDC caller never actually presented, then possibly clearing
+  `elevation_step_up` too (its no-proof-OIDC branch PASSes under
+  `--mfa-enforcement=optional`), granting elevation with a **mislabeled**
+  `mfa=local_totp` audit row. The disjoint `auth_source` branch above closes
+  that: OIDC sessions have exactly one path to "second factor satisfied" (a
+  seeded amr proof with the toggle on) and never consult the `users` MFA
+  column at all. This seam remains the ONLY place that unconditionally blocks
+  a single-factor (no-amr) OIDC session from elevating — `require_mfa_step_up`
+  alone cannot, per the note above.
+  A seeded-but-stale proof still falls through to the **same**
+  `elevation_step_up` freshness gate every other session goes through — never
+  a silent grant. The granted audit row records which factor source was used:
+  `role.elevation.granted` detail is `duration_secs=<n> mfa=<oidc_amr|local_totp>
+  expires_at=<rfc3339> justification=<text>` — `duration_secs` is the TRUE
+  post-clamp window (follow-up B), and BOTH machine-parsed tokens (`mfa=` and
+  `expires_at=`) are placed **before** the free-text `justification=` field
+  (hardening-round consistency S-3) so a crafted justification containing a
+  forged `mfa=...`/`expires_at=...` token can never be mistaken for the
+  genuine, code-emitted values by a first-match grep.
+  Toggle: **`--jit-oidc-amr-elevation`** (`YUZU_JIT_OIDC_AMR_ELEVATION`,
+  default **true**; `--no-jit-oidc-amr-elevation` to disable). Disabling it
+  means **OIDC sessions cannot use JIT elevation at all** — an operator must
+  elevate from a local-authenticated session with local TOTP instead. This is
+  NOT "OIDC sessions fall back to requiring local TOTP": an OIDC session has
+  no way to present a local TOTP step-up (its step-up challenge is re-SSO, not
+  a TOTP code), so the toggle-off denial is unconditional for that identity
+  source, with its own distinct audited reason from the no-amr-assertion case.
+  A one-time INFO log line is emitted at boot when OIDC is configured and the
+  toggle is on, so an incident responder can discover the posture without
+  reading source or an individual audit row.
 - **Step-down** — `POST /api/v1/elevate/revoke` clears the window
   (`role.elevation.revoked`). **Passive expiry on lapse is now audited too
   (follow-up A, shipped)** — `role.elevation.expired` — but LAZILY, not via a

@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Installed-software inventory gains package-manager fields (blob contract v2, ADR-0016).**
+  Every row in `GET /api/v1/inventory/software` and the `query_installed_software` MCP tool
+  now carries `kind` (package|app), `ecosystem` (rpm|deb|apk|pacman|windows|macos|homebrew),
+  `epoch`, `release`, `arch`, `signature_status` (rpm only, from stored rpm header tags —
+  never a live `rpm -K` verification), `distro_id`, and `distro_version`, alongside the
+  original name/version/publisher/install_date. A field the ecosystem does not store is
+  `""`, never synthesised — see `docs/user-manual/inventory.md` for the full per-ecosystem
+  matrix. Collection is a new `installed_apps` plugin action, `list_inventory`; the
+  operator-facing `list`/`query`/`list_per_user` actions are unchanged. New `apk`
+  (Alpine) package enumeration on the sync path. **Breaking — data shift on Linux
+  rpm fleets:** `publisher` now reflects the rpm PACKAGER tag (was VENDOR), and `version`
+  is upstream-only with the release moved to its own column (was fused
+  `VERSION-RELEASE`). A saved query/dashboard filter against the old `publisher` or
+  fused `version` shape on rpm hosts will silently stop matching post-upgrade — see
+  `docs/user-manual/inventory.md` before relying on either field in existing
+  automation. No wire-protocol or gateway change (the fields ride inside the
+  existing opaque sync blob). **Upgrade note:** deploy the server before agents; each
+  agent's first post-upgrade sync triggers one expected full resend (`need_full`),
+  phase-spread across the daily sync window, self-healing.
+- **JIT elevation: OIDC amr-asserted MFA satisfies the second-factor
+  requirement.** An OIDC operator can now activate `POST /api/v1/elevate`
+  when their SSO session was authenticated with IdP MFA — asserted via the
+  OIDC `amr` claim and seeded into `Session::mfa_verified_at` at
+  `/auth/callback` (the same mechanism OIDC login step-up already used).
+  Closes the v1 limitation tracked in
+  `docs/security-reviews/jit-elevation-2026-06-30.md`. Eligibility and MFA
+  status are both keyed on a `users` table row, which OIDC login does not
+  create — a federated-only identity needs one provisioned first (e.g.
+  `POST /api/v1/users`). The mandatory-MFA gate branches EXPLICITLY on
+  identity source: an OIDC session's only acceptable factor is a **seeded**
+  proof (`mfa_verified_at != epoch`, never merely `auth_source == "oidc"`,
+  security-F1) with the toggle on, and it can **never** fall through to a
+  local namesake account's TOTP enrollment (a hardening-round fix — the first
+  cut's single-flag guard allowed exactly that fallthrough, mislabeling the
+  audit trail). A single-factor (no-`amr`) SSO session is hard-denied with
+  its own distinct reason; a stale seeded proof still falls through to the
+  existing step-up freshness challenge rather than a silent grant. New toggle
+  `--jit-oidc-amr-elevation` / `YUZU_JIT_OIDC_AMR_ELEVATION` (default true;
+  `--no-jit-oidc-amr-elevation` disables JIT elevation for OIDC sessions
+  entirely — they cannot fall back to a local TOTP step-up, since their
+  step-up challenge is re-SSO, not a TOTP code). A one-time INFO log line
+  announces the posture at boot when OIDC is configured. The
+  `role.elevation.granted` audit detail records the factor source
+  (`duration_secs=<n> mfa=<oidc_amr|local_totp> expires_at=<rfc3339> justification=<text>`
+  — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the
+  free-text `justification=` field so a crafted justification can't forge either).
 - **JIT admin elevation follow-ups: passive-lapse audit + absolute `expires_at` (SOC 2
   CC6.3/CC6.6).** Closes the two residual risks tracked in
   `docs/security-reviews/jit-elevation-2026-06-30.md`. (A) A JIT elevation window that
