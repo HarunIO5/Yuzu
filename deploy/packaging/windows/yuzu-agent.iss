@@ -153,6 +153,14 @@ Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Com
 ; governance re-run). Falls through regardless of outcome: --remove-service and
 ; file deletion below are safe even if the process is still exiting (marks for
 ; delete / falls back to delete-on-reboot for a locked exe), same as before.
+; Deliberately NOT gated on StopResultCode the way PrepareToInstall's poll is
+; (that skip matters there because installs may be scripted/repeated across a
+; fleet -- worth optimizing the dominant case); this always polls, so a
+; service-already-absent uninstall burns the full bounded 15s instead of
+; short-circuiting. Accepted: uninstall is rarer, typically human-driven, and
+; replicating an exact-match (not >=) errorlevel skip safely inside a single
+; cmd.exe /c one-liner isn't worth the added scripting risk for that saving
+; (Gate 4 unhappy-path + consistency-auditor finding, governance re-run).
 Filename: "cmd.exe"; Parameters: "/c sc stop YuzuAgent >nul 2>&1 & for /l %i in (1,1,15) do (sc query YuzuAgent | find ""STOPPED"" >nul && exit /b 0 || timeout /t 1 /nobreak >nul)"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
 Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--remove-service"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
 ; Tear down the boot AutoLogger + its .etl on uninstall. Remove-AutologgerConfig
