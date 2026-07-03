@@ -416,14 +416,15 @@ std::vector<inv::InvRecord> get_inventory_linux() {
                 "${Architecture}\\t${Maintainer}\\n' 2>/dev/null",
                 inv::parse_dpkg_inv_line);
     } else if (command_exists("rpm")) {
-        // Signature comes from the STORED header tags (DSAHEADER/RSAHEADER/
-        // SIGGPG/SIGPGP presence) via queryformat conditionals — pure rpmdb
-        // formatting, never a live `rpm -K` verification. PACKAGER per the v2
-        // spec (`list` keeps VENDOR for its stable operator contract).
+        // Raw SIGPGP (payload) + RSAHEADER (header) signature tags; signed vs
+        // unsigned is computed in C++ by parse_rpm_inv_line/rpm_sig_present —
+        // matches vuln_scan's vuln_identity.hpp (PR #1804) exactly, so the two
+        // collectors agree on this field for the same rpm. Never a live
+        // `rpm -K` verification. PACKAGER per the v2 spec (`list` keeps VENDOR
+        // for its stable operator contract).
         collect("rpm -qa --queryformat '%{NAME}\\t%{EPOCH}\\t%{VERSION}\\t%{RELEASE}\\t"
-                "%{ARCH}\\t%{PACKAGER}\\t%{INSTALLTIME:date}\\t"
-                "%|DSAHEADER?{signed}:{%|RSAHEADER?{signed}:{%|SIGGPG?{signed}:{"
-                "%|SIGPGP?{signed}:{unsigned}|}|}|}|\\n' 2>/dev/null",
+                "%{ARCH}\\t%{PACKAGER}\\t%{INSTALLTIME:date}\\t%{SIGPGP}\\t%{RSAHEADER}\\n' "
+                "2>/dev/null",
                 inv::parse_rpm_inv_line);
     } else if (command_exists("pacman")) {
         collect("pacman -Q 2>/dev/null", inv::parse_pacman_inv_line);

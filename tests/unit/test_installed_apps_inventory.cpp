@@ -206,10 +206,21 @@ TEST_CASE("parse_dpkg_inv_line keeps installed+held, drops the rest", "[installe
     }
 }
 
-TEST_CASE("parse_rpm_inv_line maps (none) and pins signature values", "[installed_apps][inventory]") {
-    SECTION("fully populated signed package") {
+TEST_CASE("rpm_sig_present treats only a real stored-tag value as present",
+          "[installed_apps][inventory]") {
+    CHECK(rpm_sig_present("abcdef0123456789")); // a real (fake-shaped) sig blob
+    CHECK_FALSE(rpm_sig_present("(none)"));      // unset tag
+    CHECK_FALSE(rpm_sig_present(""));            // empty
+    CHECK_FALSE(rpm_sig_present("%{SIGPGP}"));   // rpm too old to know the tag: unexpanded literal
+    CHECK_FALSE(rpm_sig_present("%{RSAHEADER}"));
+}
+
+TEST_CASE("parse_rpm_inv_line maps (none) and pins signature values (matches PR #1804's "
+          "rpm_sig_present exactly)",
+          "[installed_apps][inventory]") {
+    SECTION("fully populated, payload+header both signed") {
         const auto r = parse_rpm_inv_line(
-            "bash\t0\t5.2.21\t3.fc40\tx86_64\tFedora Project\tMon 01 Jan 2026\tsigned");
+            "bash\t0\t5.2.21\t3.fc40\tx86_64\tFedora Project\tMon 01 Jan 2026\tsigpgpblob\trsahdrblob");
         REQUIRE(r.has_value());
         CHECK(r->name == "bash");
         CHECK(r->epoch == "0");
@@ -222,22 +233,42 @@ TEST_CASE("parse_rpm_inv_line maps (none) and pins signature values", "[installe
         CHECK(r->kind == "package");
         CHECK(r->ecosystem == "rpm");
     }
+    SECTION("header-signed only (SIGPGP (none)) still reads signed -- the modern RHEL/Fedora case") {
+        const auto r = parse_rpm_inv_line(
+            "openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\t(none)\trsahdrblob");
+        REQUIRE(r.has_value());
+        CHECK(r->signature_status == "signed");
+    }
+    SECTION("payload-signed only (RSAHEADER (none)) still reads signed") {
+        const auto r =
+            parse_rpm_inv_line("openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\tsigpgpblob\t(none)");
+        REQUIRE(r.has_value());
+        CHECK(r->signature_status == "signed");
+    }
+    SECTION("both tags absent reads unsigned") {
+        const auto r =
+            parse_rpm_inv_line("openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\t(none)\t(none)");
+        REQUIRE(r.has_value());
+        CHECK(r->signature_status == "unsigned");
+    }
+    SECTION("old-rpm literal %{...} echo on both tags reads unsigned, never a false positive") {
+        const auto r = parse_rpm_inv_line(
+            "openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\t%{SIGPGP}\t%{RSAHEADER}");
+        REQUIRE(r.has_value());
+        CHECK(r->signature_status == "unsigned");
+    }
     SECTION("(none) epoch/arch/packager map to honest-empty") {
         const auto r = parse_rpm_inv_line(
-            "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\t(none)\tTue 02 Jan 2026\tunsigned");
+            "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\t(none)\tTue 02 Jan 2026\t(none)\t(none)");
         REQUIRE(r.has_value());
         CHECK(r->epoch.empty());
         CHECK(r->arch.empty());
         CHECK(r->publisher.empty());
         CHECK(r->signature_status == "unsigned");
     }
-    SECTION("unexpected signature token maps to empty, never a guess") {
-        const auto r = parse_rpm_inv_line("p\t0\t1\t1\tnoarch\tX\td\tgarbage");
-        REQUIRE(r.has_value());
-        CHECK(r->signature_status.empty());
-    }
     SECTION("wrong token count is dropped") {
         CHECK_FALSE(parse_rpm_inv_line("bash\t0\t5.2.21").has_value());
+        CHECK_FALSE(parse_rpm_inv_line("p\t0\t1\t1\tnoarch\tX\td\tonly-eight-tokens").has_value());
     }
 }
 

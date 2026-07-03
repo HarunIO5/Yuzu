@@ -111,6 +111,19 @@ inline std::string map_rpm_none(std::string_view v) {
     return v == "(none)" ? std::string{} : std::string{v};
 }
 
+// A signature tag counts as present only if it holds a real value -- not
+// empty, not "(none)", and not an unexpanded literal "%{...}" (an rpm too
+// old to know the tag echoes the format string back, which must NOT read as
+// "signed"). Mirrors vuln_identity.hpp::rpm_sig_present (PR #1804) exactly --
+// the two agent-side collectors emit the same PackageRecord shape for the
+// same rpm and must agree on this security-posture-relevant field, or an
+// operator/matcher sees a different signed/unsigned answer depending on
+// which collector happened to report the device.
+inline bool rpm_sig_present(std::string_view raw) {
+    const std::string v = map_rpm_none(raw);
+    return !v.empty() && v.rfind("%{", 0) != 0;
+}
+
 // deb `${Version}` = [epoch:]upstream[-revision].
 inline EvrParts split_deb_version(std::string_view v) {
     return detail::split_evr(v);
@@ -207,15 +220,16 @@ inline std::optional<InvRecord> parse_dpkg_inv_line(std::string_view line) {
     return r;
 }
 
-// One rpm line (8 tab-separated tokens):
-//   NAME EPOCH VERSION RELEASE ARCH PACKAGER INSTALLTIME:date SIGSTATUS
-// where SIGSTATUS is "signed"/"unsigned" computed by the queryformat's stored-
-// header-tag conditionals (DSAHEADER/RSAHEADER/SIGGPG/SIGPGP presence -- pure
-// rpmdb header formatting, never a live `rpm -K` verification). Any other
-// value (unexpected rpm output) maps to honest-empty rather than a guess.
+// One rpm line (9 tab-separated tokens):
+//   NAME EPOCH VERSION RELEASE ARCH PACKAGER INSTALLTIME:date SIGPGP RSAHEADER
+// SIGPGP is the payload (v3 OpenPGP) signature tag; RSAHEADER is the header
+// signature tag. Both are checked (via rpm_sig_present) because modern
+// RHEL/Fedora packages are frequently header-signed only -- SIGPGP alone
+// would mislabel a validly-signed package as unsigned. Signature is read
+// from these STORED rpmdb tags only, never a live `rpm -K` verification.
 inline std::optional<InvRecord> parse_rpm_inv_line(std::string_view line) {
     const auto tok = detail::split_tabs(line);
-    if (tok.size() != 8)
+    if (tok.size() != 9)
         return std::nullopt;
     InvRecord r;
     r.name = std::string(tok[0]);
@@ -225,8 +239,7 @@ inline std::optional<InvRecord> parse_rpm_inv_line(std::string_view line) {
     r.arch = map_rpm_none(tok[4]); // gpg-pubkey pseudo-packages have (none) arch
     r.publisher = map_rpm_none(tok[5]); // PACKAGER (the v2 spec; `list` keeps VENDOR)
     r.install_date = map_rpm_none(tok[6]);
-    if (tok[7] == "signed" || tok[7] == "unsigned")
-        r.signature_status = std::string(tok[7]);
+    r.signature_status = (rpm_sig_present(tok[7]) || rpm_sig_present(tok[8])) ? "signed" : "unsigned";
     r.kind = "package";
     r.ecosystem = "rpm";
     return r;
