@@ -2094,6 +2094,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub, claims.iss,
                                                            claims.groups, admin_gid, mfa_at);
 
+        // #1852 — auto-provision a durable auth.db row for this stable
+        // principal so JIT admin elevation has something to key on
+        // (elevation_eligible / role survive across logins). Deliberately
+        // called HERE, outside `create_oidc_session` — that method holds
+        // `mu_` for the in-memory session map, and this performs
+        // independent auth.db I/O that must not serialize behind it.
+        // Fail-soft: a provisioning error is logged and swallowed by
+        // `provision_sso_identity` itself; the session minted above is
+        // never un-minted because of it (a login must not fail here).
+        auth_mgr_.provision_sso_identity(username, claims.iss, claims.sub, display);
+
         res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
 
         // Explicit-principal audit row — request lands at /auth/callback
@@ -2517,7 +2528,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                       return;
                   }
                   const auto target = req.matches[1].str();
-                  if (target.empty() || !is_valid_username(target)) {
+                  // #1852 — `target` may be a durable SSO principal
+                  // (`oidc:<iss>#<sub>`); an admin must be able to grant
+                  // elevation eligibility to an SSO operator, not just a
+                  // local account. `is_valid_principal` is a strict
+                  // superset of `is_valid_username`, so local-target
+                  // behaviour is unchanged.
+                  if (target.empty() || !is_valid_principal(target)) {
                       res.status = 400;
                       res.set_content(detail::error_json_a4(400, "invalid username format", cid,
                                                             "username must match the allowed format"),

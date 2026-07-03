@@ -440,8 +440,24 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
             auto role_str = auth::role_to_string(u.role);
             auto cls = (u.role == auth::Role::admin) ? "role-admin" : "role-user";
             const bool is_self = !current_username.empty() && u.username == current_username;
-            html += "<tr><td>" + html_escape(u.username) +
-                    "</td>"
+            // #1852 — a durable SSO row (`identity_source != "local"`, e.g.
+            // an auto-provisioned `oidc:<iss>#<sub>` principal) now appears
+            // in this list. Its `username` fails the STRICT
+            // `is_valid_username` gate that guards local-account mutation
+            // routes (delete, password-reset, role-change — see
+            // auth_db.hpp's `is_valid_principal` doc), so those buttons are
+            // suppressed for it below rather than rendering a button that
+            // always 400s. Session-revoke and elevation-eligibility are
+            // principal-keyed (`is_valid_principal`) and stay available.
+            const bool is_sso = u.identity_source != "local";
+            html += "<tr><td>" + html_escape(u.username);
+            if (is_sso) {
+                html += " <span class=\"role-badge\" style=\"background:#1f6feb22;"
+                        "color:#58a6ff;font-size:0.6rem;margin-left:0.3rem\" "
+                        "title=\"Auto-provisioned via SSO (identity_source=" +
+                        html_escape(u.identity_source) + ")\">SSO</span>";
+            }
+            html += "</td>"
                     "<td><span class=\"role-badge " +
                     std::string(cls) + "\">" + html_escape(role_str) +
                     "</span></td>"
@@ -485,17 +501,27 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                         html_escape(u.username) +
                         "&quot; to log in again? Active dashboard sessions "
                         "will end immediately. Their API tokens are NOT revoked.\""
-                        ">Revoke sessions</button>"
-                        "<button class=\"btn btn-danger\" "
-                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
-                        "hx-delete=\"/api/settings/users/" +
-                        html_escape(u.username) +
-                        "\" "
-                        "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
-                        "hx-confirm=\"Remove user &quot;" +
-                        html_escape(u.username) +
-                        "&quot;?\""
-                        ">Remove</button>";
+                        ">Revoke sessions</button>";
+                // #1852 — the Remove button is suppressed for an SSO row:
+                // DELETE /api/settings/users/:username stays gated by the
+                // STRICT `is_valid_username` (local-account charset only —
+                // see the file header comment on that route), so it would
+                // always 400 against an `oidc:<iss>#<sub>` principal. There
+                // is no local-delete equivalent for a durable SSO identity
+                // yet — its lifecycle is IdP-driven (see `last_seen_at` /
+                // docs/auth-architecture.md).
+                if (!is_sso) {
+                    html += "<button class=\"btn btn-danger\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                            "hx-delete=\"/api/settings/users/" +
+                            html_escape(u.username) +
+                            "\" "
+                            "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
+                            "hx-confirm=\"Remove user &quot;" +
+                            html_escape(u.username) +
+                            "&quot;?\""
+                            ">Remove</button>";
+                }
             }
             html += "</td></tr>";
         }

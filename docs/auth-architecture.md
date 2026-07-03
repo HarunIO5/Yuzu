@@ -257,29 +257,33 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   tokens resolve through `synthesize_token_session` (no cookie, no
   `elevated_until`), so a long-lived automation credential can **never** be
   elevated.
-- **OIDC-amr elevation — TEMPORARILY SEVERED by the #1837/#1857 principal
-  re-key (restoration tracked in #1852).** As of the `oidc:<iss>#<sub>` principal
-  re-key, an OIDC session's principal is **not** a valid local-`users` username
-  (it contains `:`/`#`), so `is_elevation_eligible` fails closed and the elevate
-  route denies an OIDC session at the **eligibility gate** — before the OIDC-amr
-  branch below is ever reached. OIDC operators therefore **cannot JIT-elevate**
-  on this branch. This is deliberate: it severs the pre-#1837 accident where an
-  SSO display name that coincidentally equalled a provisioned *local* username
-  borrowed that local user's eligibility + TOTP. The `amr`/`--jit-oidc-amr-elevation`
-  mechanism described below is retained (currently unreachable-for-success) and
-  documents the **intended** path that #1852 restores against the stable
-  principal; treat the rest of this subsection as the restored-state design.
-- **OIDC-amr elevation (design — restored by #1852).** An OIDC operator whose SSO
+- **OIDC-amr elevation — RESTORED by durable SSO identity (#1852).** As of the
+  `oidc:<iss>#<sub>` principal re-key (#1837/#1857), an OIDC session's principal
+  is not a local-charset `users` username (it contains `:`/`#`), and before #1852
+  the OIDC login path wrote **no `users` row at all** — so `is_elevation_eligible`
+  fail-closed and OIDC operators could not JIT-elevate. #1852 auto-provisions a
+  durable `users` row for the stable principal (`AuthDB::upsert_sso_identity`,
+  migration v6 — see "Durable SSO identity" below), and the elevate route's
+  target-lookup chokepoints now validate through `is_valid_principal` (a strict
+  superset of `is_valid_username` that additionally accepts a reserved-prefixed
+  `oidc:`/`saml:`/`ad:` principal), so an admin can grant `elevation_eligible`
+  against the SSO principal and the eligibility gate passes. This does **not**
+  resurrect the pre-#1837 accident where an SSO display name that coincidentally
+  equalled a *local* username borrowed that local user's eligibility + TOTP — the
+  principal is now the immutable `oidc:<iss>#<sub>`, bound to its own provisioned
+  row.
+- **OIDC-amr elevation (design).** An OIDC operator whose SSO
   session was authenticated with IdP MFA — asserted via the OIDC `amr` claim
   at `/auth/callback`, which seeds `Session::mfa_verified_at` when
   `amr_asserts_mfa(claims.amr)` is true (see `docs/auth-mfa-design.md` "OIDC
   interop") — CAN elevate without local TOTP enrollment. **Prerequisite:**
-  eligibility and MFA status are both keyed on the `users` table row, and the
-  OIDC login path does **not** create one; a federated-only identity must
-  already have a Yuzu `users` row (e.g. provisioned via `POST /api/v1/users`)
-  before an admin can grant it `elevation_eligible` at all — see the "AuthDB
-  — persistent authentication store" section below and `.claude/agents/authdb.md`.
-  The mandatory-second-factor check at
+  eligibility is keyed on the `users` table row, which the OIDC login path now
+  **auto-provisions** for the stable principal (`upsert_sso_identity`, #1852 —
+  see "Durable SSO identity" below); an admin grants `elevation_eligible` against
+  that SSO principal directly, no manual `POST /api/v1/users` step. MFA status is
+  **not** consulted for an OIDC session — its second factor is the IdP `amr`
+  proof, checked below, never a local TOTP secret. The mandatory-second-factor
+  check at
   `POST /api/v1/elevate` (`auth_routes.cpp`) branches EXPLICITLY on identity
   source, not a single "skip the local check" flag:
   ```cpp
@@ -307,7 +311,9 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   seeded amr proof with the toggle on) and never consult the `users` MFA
   column at all. This seam remains the ONLY place that unconditionally blocks
   a single-factor (no-amr) OIDC session from elevating — `require_mfa_step_up`
-  alone cannot, per the note above.
+  alone cannot, per the note above. **SAML** sessions carry no `amr` equivalent
+  yet: they are provisioned but cannot elevate (no local TOTP to check either;
+  SAML-MFA is a future workstream).
   A seeded-but-stale proof still falls through to the **same**
   `elevation_step_up` freshness gate every other session goes through — never
   a silent grant. The granted audit row records which factor source was used:
@@ -637,23 +643,89 @@ removed; `groups`/`roles`/`role_permissions`/local memberships are
 untouched, and IdP membership re-populates under the new stable key on
 each affected user's next SSO login via `reconcile_idp_memberships`.
 
-**Known gap — OIDC JIT admin elevation is temporarily unavailable for SSO
-operators, pending durable SSO identity provisioning (issue #1852).**
-`AuthDB::set_elevation_eligible`/`is_elevation_eligible` key on
-`users.username` and are gated through `is_valid_username`, which allows
+**Resolved — durable SSO identity restores OIDC JIT admin elevation
+(#1852).** `AuthDB::set_elevation_eligible`/`is_elevation_eligible` key on
+`users.username` and were gated through `is_valid_username`, which allows
 only alphanumerics plus `. _ -` and explicitly rejects `:` (comment:
 "prevent config file format injection"). The stable OIDC principal shape
-(`oidc:<iss>#<sub>`) contains both `:` and `#`, so it fails that check
-unconditionally — `POST /api/v1/users/{name}/elevation-eligibility` 400s
+(`oidc:<iss>#<sub>`) contains both `:` and `#`, so it failed that check
+unconditionally — `POST /api/v1/users/{name}/elevation-eligibility` 400'd
 before reaching the store, and `is_elevation_eligible(session->username)`
-for a live OIDC session returns `InvalidUsername`, which the caller treats
-as fail-closed/denied. But widening `is_valid_username`'s charset would not
-be sufficient to fix this: an OIDC login provisions **no `users` row at
-all** — `elevation_eligible`/`mfa_totp_secret` are columns on `users`, and
-there is no row for an SSO principal to set them on. **An admin cannot
-restore this today by "re-providing eligibility against the stable id" —
-that operation does not exist until #1852 (a durable, first-class identity
-record for SSO principals) lands.**
+for a live OIDC session returned `InvalidUsername`, treated as
+fail-closed/denied by the caller. Widening `is_valid_username`'s charset
+alone would not have been sufficient: an OIDC login provisioned **no
+`users` row at all** — `elevation_eligible` is a column on `users`, and
+there was no row for an SSO principal to set it on. Both halves are now
+fixed:
+
+- **Durable identity row.** `/auth/callback` calls
+  `AuthManager::provision_sso_identity` immediately after
+  `create_oidc_session` mints the session — a new, independent call, not
+  folded into `create_oidc_session` itself (that method holds `mu_` for the
+  in-memory session map; provisioning does unrelated `auth.db` I/O that must
+  not serialize behind it). It forwards to `AuthDB::upsert_sso_identity`
+  (auth.db migration v6: `users` gains `identity_source`, `external_iss`,
+  `external_sub`, `display_name`, `last_seen_at`, all nullable/defaulted so
+  every existing row survives without backfill), which `INSERT ... ON
+  CONFLICT(username) DO UPDATE`s a row for the stable principal —
+  `password_hash`/`salt_hex` are `''` (never resolvable on the local login
+  path — see the constant-time-compare note at the top of this document),
+  `role` defaults `'user'` on first insert only. The `ON CONFLICT` refresh
+  arm updates **only** `display_name`/`last_seen_at`/`is_active` — it
+  deliberately never touches `role` or `elevation_eligible`, so a standing
+  admin grant and elevation eligibility survive every re-login. **Fail-soft
+  by design:** a provisioning error is logged and the login still succeeds
+  (a login must never fail because a secondary bookkeeping write failed);
+  the principal simply cannot elevate until a later successful login
+  provisions it. IdP-side deprovisioning has no push signal into Yuzu today
+  — a removed IdP account's row goes stale, aged by `last_seen_at`; a
+  reaper/SCIM-driven sweep of long-unseen SSO rows is a tracked follow-up,
+  not built in this slice.
+- **`is_valid_principal` at the elevation-cluster target-lookup
+  chokepoints.** A strict SUPERSET of `is_valid_username` (any string the
+  strict validator accepts is accepted unchanged) that additionally accepts
+  a reserved-prefixed (`oidc:`/`saml:`/`ad:`) principal after a narrow
+  control-byte/SQL-metacharacter blocklist (rejects `< 0x20`, `0x7F`, `;`,
+  `=`, `\`, `'`, `"`, `` ` ``, space; caps at 255 bytes; permits `: # / . _
+  - @ ~ % |` — the alphabet a real issuer URL + opaque sub actually need).
+  Replaces `is_valid_username` at exactly four call sites, all
+  target-lookups on an EXISTING row, never a create path:
+  `AuthDB::set_elevation_eligible`, `AuthDB::is_elevation_eligible`, the
+  `POST /api/v1/users/{name}/elevation-eligibility` target parameter, and
+  `DELETE /api/v1/sessions?username=`'s target parameter. Every other
+  `is_valid_username` call site — local user create (`upsert_user`),
+  delete, role-change, `mfa_status`, account-unlock (a lockout-domain
+  action; SSO logins never accumulate lockout state, so there is nothing to
+  unlock), and all password/lockout sites — is deliberately left untouched.
+- **The elevate route's mandatory-MFA gate branches on `auth_source`.**
+  See "JIT admin elevation" above for the local-vs-OIDC split and the
+  dedicated unconditional amr-proof gate that prevents the restoration from
+  accidentally granting elevation to a never-MFA'd SSO login under the
+  default `--mfa-enforcement=optional`.
+- **Settings → Users surfaces SSO rows.** `AuthDB::list_users` now selects
+  `identity_source`; the fragment renders an `SSO` badge and suppresses the
+  Remove button for a non-local row (`DELETE
+  /api/settings/users/:username` stays on the strict validator, so it would
+  always 400 against a `oidc:<iss>#<sub>` target — there is no local-delete
+  equivalent for a durable SSO identity; its lifecycle is IdP-driven).
+  Revoke-sessions stays available (principal-keyed, per the previous
+  bullet).
+- **A side effect, not the goal: `users.display_name` is now a durable
+  record for a provisioned principal.** The "Recovering a human name
+  without a live session" gap described above is *narrowed* by this — a
+  future render site could join `users.display_name` by principal instead
+  of relying only on a live session or an audit-row `detail` field — but no
+  such render site is wired in this slice; that remains a fast-follow.
+
+SAML is unaffected by this restoration: `create_saml_session` still keys
+`username` on the raw NameID (no reserved-prefix stable principal — see
+"SAML is unaffected this slice" above), so `is_valid_principal` does not
+recognise it as an SSO principal and `provision_sso_identity` is not called
+from the SAML ACS handler. A SAML session is therefore provisioned nowhere
+and cannot elevate — not because of a missing MFA proof specifically, but
+because there is no durable identity row to hold `elevation_eligible` on in
+the first place. Keying SAML on `entity_id#NameID` (the tracked fast-follow
+noted above) is a prerequisite for extending this restoration to SAML.
 
 **This is not a regression of a previously-supported flow.** Before #1837,
 `Session::username` for an OIDC session was the mutable display name

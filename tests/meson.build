@@ -257,6 +257,7 @@ if build_server
       'unit/server/test_auth_routes.cpp',
       'unit/server/test_auth_routes_mfa.cpp',
       'unit/server/test_auth_jit_elevation.cpp',
+      'unit/server/test_auth_sso_identity.cpp',
       'unit/server/test_auth_routes_hardened.cpp',
       'unit/server/test_settings_routes_mfa.cpp',
       'unit/server/test_totp.cpp',

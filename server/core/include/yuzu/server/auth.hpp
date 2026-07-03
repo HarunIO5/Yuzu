@@ -33,6 +33,12 @@ struct UserEntry {
     Role role;
     std::string salt_hex;
     std::string hash_hex;
+    /// #1852 — `'local'` for a password-authenticated account (auth.db
+    /// migration v6 default; every pre-v6 row and every row created via
+    /// `upsert_user` is `'local'`), `'oidc'`/`'saml'`/`'ad'` for a durable
+    /// SSO identity auto-provisioned by `AuthDB::upsert_sso_identity`. Not
+    /// populated by every list/read path — see the call site's doc comment.
+    std::string identity_source{"local"};
 };
 
 struct Session {
@@ -441,6 +447,29 @@ public:
     std::string create_saml_session(const std::string& name_id,
                                     const std::vector<std::string>& groups = {},
                                     const std::string& admin_group = {});
+
+    /// #1852 — auto-provision (or refresh) a durable `users` row for an
+    /// OIDC-authenticated principal, so JIT admin elevation (which reads
+    /// `auth.db users.elevation_eligible`) has something to key on. Forwards
+    /// to `AuthDB::upsert_sso_identity(..., "oidc")` when `auth_db_` is set
+    /// (a legacy config-file-only deployment has no durable store — a
+    /// silent no-op). `principal` is the stable `"oidc:" + iss + "#" + sub`
+    /// form (matches `create_oidc_session`'s construction exactly — pass
+    /// the SAME string). Call this AFTER `create_oidc_session` at the route
+    /// layer, NOT from inside `create_oidc_session` itself: that method
+    /// holds `mu_` for the in-memory session map, and this performs
+    /// independent auth.db I/O that must not serialize behind it.
+    /// **Fail-soft**: an AuthDB error is logged and swallowed — the
+    /// caller's session is already minted and must not be un-minted
+    /// because provisioning failed; the principal simply cannot elevate
+    /// until a future successful login provisions it. SAML is NOT wired
+    /// to this method yet — SAML sessions are keyed on the raw NameID
+    /// (no reserved-prefix stable principal; see `create_saml_session`'s
+    /// "#1837 fast-follow" comment), which `is_valid_principal` would
+    /// reject, so a SAML session cannot elevate until that fast-follow
+    /// lands (docs/auth-architecture.md).
+    void provision_sso_identity(const std::string& principal, const std::string& iss,
+                                const std::string& sub, const std::string& display_name);
 
     const std::filesystem::path& config_path() const { return cfg_path_; }
 

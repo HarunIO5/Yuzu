@@ -1020,6 +1020,25 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     return token;
 }
 
+// #1852 — see the header doc for the fail-soft / lock-ordering contract.
+void AuthManager::provision_sso_identity(const std::string& principal, const std::string& iss,
+                                         const std::string& sub,
+                                         const std::string& display_name) {
+    if (!auth_db_) {
+        // Legacy config-file-only deployment — no durable store to
+        // provision into. Not an error: elevation is unreachable for this
+        // deployment mode regardless (POST /api/v1/elevate 503s without
+        // auth_db_ptr()).
+        return;
+    }
+    auto result = auth_db_->upsert_sso_identity(principal, iss, sub, display_name, "oidc");
+    if (!result) {
+        spdlog::warn("provision_sso_identity failed for '{}': error={} (login proceeds; this "
+                     "principal cannot elevate until a future login provisions it)",
+                     principal, static_cast<int>(result.error()));
+    }
+}
+
 // ── SAML session creation ───────────────────────────────────────────────────
 
 std::string AuthManager::create_saml_session(const std::string& name_id,
