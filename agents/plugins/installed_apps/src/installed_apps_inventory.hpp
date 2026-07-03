@@ -198,14 +198,17 @@ inline std::string parse_os_release(std::string_view content, std::string_view k
 }
 
 // One dpkg-query line:
-//   ${Package}\t${db:Status-Status}\t${Version}\t${Architecture}\t${Maintainer}
-// Keeps rows whose Status-Status is exactly "installed" -- deliberately
-// including HELD packages (`hold ok installed`), which the legacy `list`
-// action's "install ok installed" substring filter excludes. nullopt for a
-// structurally wrong or not-installed line.
+//   ${Package}\t${db:Status-Abbrev}\t${Version}\t${Architecture}\t${Maintainer}
+// Status-Abbrev is <want><status> (2 chars); the 2nd char 'i' == installed --
+// matches vuln_identity.hpp::parse_dpkg_line (PR #1804) exactly. Covers "ii"
+// (want=install) AND "hi" (want=hold: apt-mark hold / kernel pin), so a
+// held-but-installed package is present and scannable -- the legacy `list`
+// action's "install ok installed" substring filter excludes held, this does
+// not. "rc" (removed, config-files) and "un" (unknown) are correctly
+// excluded. nullopt for a structurally wrong or not-installed line.
 inline std::optional<InvRecord> parse_dpkg_inv_line(std::string_view line) {
     const auto tok = detail::split_tabs(line);
-    if (tok.size() != 5 || tok[1] != "installed")
+    if (tok.size() != 5 || tok[1].size() < 2 || tok[1][1] != 'i')
         return std::nullopt;
     InvRecord r;
     r.name = std::string(tok[0]);

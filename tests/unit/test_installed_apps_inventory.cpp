@@ -168,9 +168,11 @@ TEST_CASE("parse_os_release extracts ID / VERSION_ID", "[installed_apps][invento
     }
 }
 
-TEST_CASE("parse_dpkg_inv_line keeps installed+held, drops the rest", "[installed_apps][inventory]") {
-    SECTION("installed package, full EVR") {
-        const auto r = parse_dpkg_inv_line("bash\tinstalled\t1:5.2.21-2ubuntu4\tamd64\tUbuntu "
+TEST_CASE("parse_dpkg_inv_line keeps installed+held, drops the rest (matches PR #1804's "
+          "Status-Abbrev 2nd-char check exactly)",
+          "[installed_apps][inventory]") {
+    SECTION("installed package, full EVR (\"ii\": want=install, status=installed)") {
+        const auto r = parse_dpkg_inv_line("bash\tii\t1:5.2.21-2ubuntu4\tamd64\tUbuntu "
                                            "Developers <ubuntu-devel-discuss@lists.ubuntu.com>");
         REQUIRE(r.has_value());
         CHECK(r->name == "bash");
@@ -185,23 +187,30 @@ TEST_CASE("parse_dpkg_inv_line keeps installed+held, drops the rest", "[installe
         CHECK(r->signature_status.empty()); // deb stores no signature -- honest-empty
         CHECK(r->install_date.empty());
     }
-    SECTION("held package is kept (Status-Status is still installed)") {
-        const auto r = parse_dpkg_inv_line("linux-image\tinstalled\t6.8.0-31.31\tamd64\tX");
+    SECTION("held package is kept (\"hi\": want=hold, status=installed)") {
+        const auto r = parse_dpkg_inv_line("linux-image\thi\t6.8.0-31.31\tamd64\tX");
         REQUIRE(r.has_value());
         CHECK(r->version == "6.8.0");
         CHECK(r->release == "31.31");
     }
-    SECTION("config-files residue is dropped") {
-        CHECK_FALSE(parse_dpkg_inv_line("old-pkg\tconfig-files\t1.0-1\tamd64\tX").has_value());
+    SECTION("config-files residue is dropped (\"rc\": status=config-files, not installed)") {
+        CHECK_FALSE(parse_dpkg_inv_line("old-pkg\trc\t1.0-1\tamd64\tX").has_value());
+    }
+    SECTION("unknown want-state is dropped (\"un\")") {
+        CHECK_FALSE(parse_dpkg_inv_line("stray-pkg\tun\t1.0-1\tamd64\tX").has_value());
     }
     SECTION("native package: empty release") {
-        const auto r = parse_dpkg_inv_line("mytool\tinstalled\t5.0\tall\tMe <me@x>");
+        const auto r = parse_dpkg_inv_line("mytool\tii\t5.0\tall\tMe <me@x>");
         REQUIRE(r.has_value());
         CHECK(r->version == "5.0");
         CHECK(r->release.empty());
     }
+    SECTION("malformed (single-char or empty) status token is dropped") {
+        CHECK_FALSE(parse_dpkg_inv_line("bash\ti\t1.0-1\tamd64\tX").has_value());
+        CHECK_FALSE(parse_dpkg_inv_line("bash\t\t1.0-1\tamd64\tX").has_value());
+    }
     SECTION("wrong token count is dropped") {
-        CHECK_FALSE(parse_dpkg_inv_line("bash\tinstalled\t1.0-1").has_value());
+        CHECK_FALSE(parse_dpkg_inv_line("bash\tii\t1.0-1").has_value());
         CHECK_FALSE(parse_dpkg_inv_line("").has_value());
     }
 }

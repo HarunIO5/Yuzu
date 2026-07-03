@@ -410,9 +410,14 @@ std::vector<inv::InvRecord> get_inventory_linux() {
     };
 
     if (command_exists("dpkg-query")) {
-        // ${db:Status-Status} keeps installed AND held packages (the legacy
-        // `list` filter "install ok installed" excludes held) — v2 spec.
-        collect("dpkg-query -W -f='${Package}\\t${db:Status-Status}\\t${Version}\\t"
+        // ${db:Status-Abbrev} (want+status, 2 chars) keeps installed AND held
+        // packages via its 2nd char == 'i' ("ii" want=install, "hi" want=hold)
+        // — matches vuln_scan's vuln_identity.hpp (PR #1804) exactly, so the
+        // two collectors agree on which packages are present. "rc"
+        // (removed, config-files) and "un" (unknown) are correctly excluded;
+        // this also supersedes the legacy `list` filter's narrower
+        // "install ok installed" substring check, which excludes held.
+        collect("dpkg-query -W -f='${Package}\\t${db:Status-Abbrev}\\t${Version}\\t"
                 "${Architecture}\\t${Maintainer}\\n' 2>/dev/null",
                 inv::parse_dpkg_inv_line);
     } else if (command_exists("rpm")) {
