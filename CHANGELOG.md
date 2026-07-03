@@ -24,8 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   days-to-weeks before TAR (or the agent) existed on the box. netconn stores
   closed enum tokens and numeric reason codes only: no SSID, BSSID, profile
   name, interface GUID, or MAC is ever extracted (fixture-pinned allow-list
-  parser). Linux/macOS netconn and the macOS netqual collector remain planned
-  (schema registered, queryable-empty).
+  parser). The retrospective reach is operator-configurable via
+  `netconn_lookback_seconds` (default 7 days; `0` disables the pre-enablement
+  read entirely, for jurisdictions/works-councils where retrospective
+  collection is not permitted — see ADR-0020). Linux/macOS netconn and the
+  macOS netqual collector remain planned (schema registered, queryable-empty).
 - **Installed-software inventory gains package-manager fields (blob contract v2, ADR-0016).**
   Every row in `GET /api/v1/inventory/software` and the `query_installed_software` MCP tool
   now carries `kind` (package|app), `ecosystem` (rpm|deb|apk|pacman|windows|macos|homebrew),

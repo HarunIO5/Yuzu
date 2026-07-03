@@ -23,6 +23,7 @@
 
 #include <charconv>
 #include <cstdint>
+#include <cstdio> // std::snprintf (format_event_systemtime)
 #include <optional>
 #include <string>
 #include <string_view>

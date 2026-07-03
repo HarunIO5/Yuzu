@@ -19,6 +19,10 @@
 
 #include <spdlog/spdlog.h>
 
+#include <atomic>
+#include <cstddef>
+#include <iterator> // std::size (kChannels / g_nc_query_warned bounds)
+
 // clang-format off
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -78,7 +82,16 @@ constexpr ChannelSpec kChannels[] = {
      L"(EventID=8001 or EventID=8002 or EventID=8003)"},
 };
 
-void read_channel(const ChannelSpec& ch, std::int64_t from_ts, std::int64_t before_ts,
+// One-shot warn latch per channel: a missing channel (no WLAN service on a
+// Server SKU) or an ACL-denied read is a permanent topology fact, and the slow
+// leg retries every 300s forever — without this, each failing channel would log
+// a warn per tick indefinitely (the agent has no /metrics; logs are the only
+// surface, so unbounded log growth is the failure mode). Warn once per channel
+// per process, matching the ESTATS ACCESS_DENIED latch philosophy.
+std::atomic<bool> g_nc_query_warned[std::size(kChannels)] = {};
+
+void read_channel(const ChannelSpec& ch, std::size_t ch_index, std::int64_t from_ts,
+                  std::int64_t before_ts,
                   std::size_t cap, std::vector<NetConnRow>& out) {
     // Kernel-side filter: catalogued IDs inside [from, before). The same window
     // is re-checked on the parsed row — the XPath is an optimisation, the code
@@ -102,10 +115,14 @@ void read_channel(const ChannelSpec& ch, std::int64_t from_ts, std::int64_t befo
         const DWORD err = ::GetLastError();
         // Missing channel (no WLAN service / Server SKU) is expected topology,
         // ACL-denial is expected under a hardened baseline: fewer rows, not an
-        // error. One line per backfill call per channel is naturally rate-
-        // limited by the slow cadence.
-        spdlog::warn("TAR netconn: EvtQuery {} failed ({}) — channel skipped",
-                     ch.tag, err);
+        // error. Warn only the FIRST time per channel — the slow leg retries
+        // this failing channel every tick for the process lifetime, so an
+        // un-latched warn would grow the log without bound.
+        if (ch_index < std::size(g_nc_query_warned) &&
+            !g_nc_query_warned[ch_index].exchange(true))
+            spdlog::warn("TAR netconn: EvtQuery {} failed ({}) — channel skipped "
+                         "(silenced for the rest of this session)",
+                         ch.tag, err);
         return;
     }
 
@@ -142,8 +159,8 @@ std::vector<NetConnRow> backfill_netconn_events(std::int64_t from_ts, std::int64
     std::vector<NetConnRow> out;
     if (before_ts <= from_ts || cap == 0)
         return out;
-    for (const auto& ch : kChannels)
-        read_channel(ch, from_ts, before_ts, cap, out);
+    for (std::size_t i = 0; i < std::size(kChannels); ++i)
+        read_channel(kChannels[i], i, from_ts, before_ts, cap, out);
     return out;
 }
 

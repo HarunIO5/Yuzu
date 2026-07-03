@@ -13,6 +13,8 @@
 
 #include "tar_proc_etw.hpp" // boot_time_unix() — shared per-boot dedup anchor
 
+#include <spdlog/spdlog.h>
+
 // clang-format off
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -95,8 +97,14 @@ TcpTotals read_tcp_totals() {
 
 std::optional<NetQualBootRow> collect_netqual_boot(std::int64_t now_ts) {
     const TcpTotals tcp = read_tcp_totals();
-    if (!tcp.valid)
-        return std::nullopt; // no TCP MIB at all — nothing worth a row
+    if (!tcp.valid) {
+        // Both GetTcpStatisticsEx2/Ex failed for both families — unexpected on a
+        // live Windows host. Surface it rather than silently recording no boot
+        // baseline (the caller only sees nullopt, which off-Windows is normal).
+        spdlog::warn("TAR netqual: since-boot TCP statistics unavailable — "
+                     "no boot baseline recorded this boot");
+        return std::nullopt;
+    }
 
     NetQualBootRow row;
     row.ts = now_ts;

@@ -39,6 +39,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility> // std::move (nq_win_build_sample)
 #include <vector>
 
 namespace yuzu::tar {

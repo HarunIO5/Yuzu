@@ -182,7 +182,7 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CryptQueryObject
   tar_test_deps += cxx.find_library('version')  # tar_proc_perf.cpp GetFileVersionInfoW
   tar_test_deps += cxx.find_library('wevtapi')  # tar_netconn_win.cpp EvtQuery/EvtRender
-  tar_test_deps += cxx.find_library('ws2_32')   # tar_netqual_boot.cpp winsock2 deps
+  tar_test_deps += cxx.find_library('ws2_32')   # winsock2 symbols the iphlpapi/netioapi headers in tar_netqual_boot.cpp pull in
 elif host_machine.system() == 'darwin'
   # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
   # audit-token helpers, gated on the framework being present (full Xcode SDK).

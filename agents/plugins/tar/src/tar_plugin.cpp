@@ -72,6 +72,24 @@ int64_t next_snapshot_id() {
     return now_epoch_seconds() * 1000 + counter.fetch_add(1, std::memory_order_relaxed) % 1000;
 }
 
+// Operator-configurable retroactive reach for the netconn backfill, in seconds
+// (ADR-0020 privacy note). Defaults to kNetConnLookbackS (7 days); 0 means "no
+// retrospective read" — the backfill window collapses to empty and the source
+// records only forward connectivity from enablement, for jurisdictions where
+// pre-notice collection is not permitted. Clamped to [0, 90 days] so a bad
+// config value cannot request an unbounded window.
+int64_t netconn_lookback_seconds(yuzu::tar::TarDatabase& db) {
+    int64_t v = yuzu::tar::kNetConnLookbackS;
+    try {
+        v = std::stoll(db.get_config("netconn_lookback_seconds",
+                                     std::to_string(yuzu::tar::kNetConnLookbackS)));
+    } catch (...) {
+        return yuzu::tar::kNetConnLookbackS;
+    }
+    constexpr int64_t kMaxLookback = 90LL * 24 * 3600;
+    return std::clamp<int64_t>(v, 0, kMaxLookback);
+}
+
 // ── State serialization helpers ──────────────────────────────────────────────
 
 json processes_to_json(const std::vector<yuzu::agent::ProcessInfo>& procs) {
@@ -573,8 +591,15 @@ public:
             // is set ONLY on success, so a failed backfill retries on the next
             // slow tick (which sees the still-empty hwm and re-runs the deep
             // read — same window, EvtQuery is cheap at this event rate).
-            auto nc_rows = yuzu::tar::backfill_netconn_events(
-                t_live - yuzu::tar::kNetConnLookbackS, t_live);
+            //
+            // The retroactive REACH is operator-configurable (ADR-0020 privacy
+            // note): netconn_lookback_seconds bounds how far before enablement
+            // the backfill reads. 0 disables the retrospective read entirely
+            // (the window collapses to empty) for jurisdictions/works-councils
+            // where pre-notice collection is not permitted; the source then
+            // records only forward connectivity from enablement onward.
+            const std::int64_t lookback = netconn_lookback_seconds(*db_);
+            auto nc_rows = yuzu::tar::backfill_netconn_events(t_live - lookback, t_live);
             const auto nc_snap = next_snapshot_id();
             for (auto& r : nc_rows)
                 r.snapshot_id = nc_snap;
@@ -1308,7 +1333,10 @@ private:
         // hwm advances ONLY on success, so a failed tick re-reads the same
         // window; rows carry the EVENT's own ts. Non-fatal like every opt-in leg.
         if (db_->get_config("netconn_enabled", "false") == "true") {
-            int64_t from = ts - yuzu::tar::kNetConnLookbackS;
+            // Empty hwm (fresh enable / init backfill failed) -> deep read bounded
+            // by the operator-configurable retroactive reach (0 = forward-only,
+            // see netconn_lookback_seconds and the ADR-0020 privacy note).
+            int64_t from = ts - netconn_lookback_seconds(*db_);
             const auto hwm_str = db_->get_config("netconn_backfill_hwm", "");
             if (!hwm_str.empty()) {
                 try {

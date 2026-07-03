@@ -989,6 +989,115 @@ TEST_CASE("netqual: collect_netqual_boot per-platform contract", "[tar][netqual]
 #endif
 }
 
+TEST_CASE("TarDatabase: insert_netqual_boot_row round-trips every column",
+          "[tar][store][netqual]") {
+    // Cross-platform (qe-S2): construct the row directly rather than via the
+    // Windows-only collector, so all 13 bindings are exercised on every host.
+    auto t = make_test_db();
+    NetQualBootRow r;
+    r.ts = 1710000000;
+    r.snapshot_id = 55;
+    r.boot_ts = 1709990000;
+    r.window_s = 10000;
+    r.retrans_segs = 42;
+    r.segs_out = 987654;
+    r.estab_resets = 3;
+    r.if_in_errors = 5;
+    r.if_in_discards = 7;
+    r.if_out_errors = 11;
+    r.if_out_discards = 13;
+    r.if_in_octets = 111222333;
+    r.if_out_octets = 444555666;
+    REQUIRE(t.db.insert_netqual_boot_row(r));
+
+    auto res = t.db.execute_query(
+        "SELECT ts, snapshot_id, boot_ts, window_s, retrans_segs, segs_out, estab_resets, "
+        "if_in_errors, if_in_discards, if_out_errors, if_out_discards, if_in_octets, "
+        "if_out_octets FROM netqual_boot");
+    REQUIRE(res.has_value());
+    REQUIRE(res->rows.size() == 1);
+    const auto& row = res->rows[0];
+    CHECK(row[0] == "1710000000");
+    CHECK(row[1] == "55");
+    CHECK(row[2] == "1709990000");
+    CHECK(row[3] == "10000");
+    CHECK(row[4] == "42");
+    CHECK(row[5] == "987654");
+    CHECK(row[6] == "3");
+    CHECK(row[7] == "5");
+    CHECK(row[8] == "7");
+    CHECK(row[9] == "11");
+    CHECK(row[10] == "13");
+    CHECK(row[11] == "111222333");
+    CHECK(row[12] == "444555666");
+}
+
+TEST_CASE("TarDatabase: insert_netqual_boot_row returns false (no crash) when the table is gone",
+          "[tar][store][netqual]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_query("DROP TABLE netqual_boot").has_value());
+    NetQualBootRow r;
+    r.ts = 1;
+    CHECK_FALSE(t.db.insert_netqual_boot_row(r));
+    REQUIRE(t.db.execute_query("SELECT 1").has_value()); // connection not wedged
+}
+
+TEST_CASE("TarDatabase: insert_netconn_events round-trips every column + empty no-op",
+          "[tar][store][netconn]") {
+    // qe-S1: the netconn insert had zero coverage. Exercise every binding and
+    // the empty-batch success, cross-platform (the row struct is platform-free).
+    auto t = make_test_db();
+    CHECK(t.db.insert_netconn_events({})); // empty batch is a no-op success
+
+    std::vector<NetConnRow> rows;
+    NetConnRow a;
+    a.ts = 1710000100;
+    a.snapshot_id = 9;
+    a.action = "wifi_disconnected";
+    a.channel = "wlan";
+    a.category = "";
+    a.capability = "";
+    a.iface_kind = "wifi";
+    a.reason_code = 229377;
+    rows.push_back(a);
+    NetConnRow b;
+    b.ts = 1710000200;
+    b.snapshot_id = 9;
+    b.action = "capability_changed";
+    b.channel = "ncsi";
+    b.category = "";
+    b.capability = "internet";
+    b.iface_kind = "";
+    b.reason_code = 4;
+    rows.push_back(b);
+    REQUIRE(t.db.insert_netconn_events(rows));
+
+    auto res = t.db.execute_query(
+        "SELECT ts, snapshot_id, action, channel, category, capability, iface_kind, "
+        "reason_code FROM netconn_live ORDER BY ts");
+    REQUIRE(res.has_value());
+    REQUIRE(res->rows.size() == 2);
+    CHECK(res->rows[0][2] == "wifi_disconnected");
+    CHECK(res->rows[0][3] == "wlan");
+    CHECK(res->rows[0][6] == "wifi");
+    CHECK(res->rows[0][7] == "229377");
+    CHECK(res->rows[1][2] == "capability_changed");
+    CHECK(res->rows[1][5] == "internet");
+    CHECK(res->rows[1][7] == "4");
+}
+
+TEST_CASE("TarDatabase: insert_netconn_events returns false (no crash) when the table is gone",
+          "[tar][store][netconn]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_query("DROP TABLE netconn_live").has_value());
+    NetConnRow r;
+    r.ts = 1;
+    r.action = "connected";
+    r.channel = "networkprofile";
+    CHECK_FALSE(t.db.insert_netconn_events({r}));
+    REQUIRE(t.db.execute_query("SELECT 1").has_value());
+}
+
 TEST_CASE("netqual: nq_win_ca_state severity precedence", "[tar][netqual]") {
     using yuzu::tar::NqPathDeltas;
     using yuzu::tar::nq_win_ca_state;

@@ -251,7 +251,7 @@ struct NetQualBootRow {
 /// time: backfilled rows carry timestamps from before TAR existed on the box.
 ///
 /// PRIVACY — every TEXT field is a closed enum token produced by the
-/// allow-list parser in tar_netqual/netconn; no SSID, BSSID, profile name,
+/// allow-list parser in tar_netconn.hpp; no SSID, BSSID, profile name,
 /// interface GUID, MAC, or any other free-text event field is ever extracted
 /// from the source event (test-pinned in test_tar_netconn.cpp).
 struct NetConnRow {

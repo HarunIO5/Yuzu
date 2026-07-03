@@ -103,6 +103,30 @@ events' RSSI is *not* captured (only failures carry it — a biased sample).
   logging config). Recorded here as a deliberate future decision for
   works-council review if deeper history is wanted.
 
+## Privacy / lawfulness note (retroactive reach)
+
+The retrospective layers read state the OS accumulated **before any monitoring
+was disclosed on the device**: netconn's first read backfills up to
+`netconn_lookback_seconds` (default 7 days) of connectivity/Wi-Fi transitions
+from before TAR — or the agent — existed on the box, and `$NetQual_Boot`
+summarizes the whole pre-TAR-this-boot window. On a person-assigned device the
+*timing* of network/Wi-Fi connect/disconnect events is a proxy for presence and
+working hours — behavioral/personal data under GDPR even with SSID/BSSID
+stripped — so collecting a window that predates the monitoring notice is a
+distinct lawfulness/transparency (GDPR Art. 13-14) and co-determination question
+from forward-looking collection.
+
+Mitigations shipped: (a) all three surfaces are **opt-in** (`default_enabled =
+false`); (b) the retroactive reach is operator-configurable —
+`netconn_lookback_seconds = 0` disables the pre-enablement read entirely, so a
+works-council/DPO can permit `netconn` forward-only where retrospective
+collection is not lawful; (c) only closed enum tokens + numeric reason codes are
+stored, never SSID/BSSID/profile/GUID/MAC/addresses. **For EU/co-determination
+workforces the retroactive reach should be raised with the works-council/DPO
+before enablement** (mirroring the procperf co-determination trigger); the
+data-classification and works-council register in
+`docs/enterprise-readiness-soc2-first-customer.md` carries the per-source rows.
+
 ## Consequences
 
 - Non-elevated Windows agents record **zero** netqual live rows (status shows

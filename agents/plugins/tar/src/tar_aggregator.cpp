@@ -221,8 +221,12 @@ std::string_view diff_state_key(std::string_view source) {
         return "arp";
     if (source == "dns")
         return "dns";
-    // perf/procperf keep an in-memory previous reading; netqual is stateless;
-    // module is a stream-drained source (no snapshot-diff baseline).
+    // perf/procperf keep an in-memory previous reading; netqual holds only a
+    // wall-clock-guarded in-memory baseline (re-anchored on a long gap, never a
+    // stored diff); netconn is high-water-mark based (its only state is the
+    // netconn_backfill_hwm config key, deliberately kept across a disable so the
+    // OS event log recovers the paused window); module is stream-drained. None
+    // has a snapshot-diff baseline to clear here.
     return {};
 }
 
