@@ -18,7 +18,12 @@ using yuzu::agent::Agent;
 // ever one ServiceMain/handler pair alive.
 std::move_only_function<std::unique_ptr<Agent>()> g_factory;
 
-SERVICE_STATUS_HANDLE g_status_handle = nullptr;
+// atomic, not a plain pointer guarded by g_status_mu below: it's published once
+// by RegisterServiceCtrlHandlerExW's return and then only ever READ by
+// report_status() -- an unlocked write racing report_status()'s locked read
+// under the C++ memory model is a data race even though it's single-writer and
+// practically benign (Gate-2 finding, #1822).
+std::atomic<SERVICE_STATUS_HANDLE> g_status_handle{nullptr};
 // Guards both the SetServiceStatus call and the checkpoint counter: the control
 // handler (SCM-invoked, its own thread) and ServiceMain can both report status
 // concurrently -- e.g. a STOP arriving while ServiceMain is still transitioning
@@ -62,8 +67,8 @@ void report_status(DWORD current_state, DWORD win32_exit_code = NO_ERROR,
         break;
     }
 
-    if (g_status_handle)
-        SetServiceStatus(g_status_handle, &status);
+    if (auto handle = g_status_handle.load(std::memory_order_acquire))
+        SetServiceStatus(handle, &status);
 }
 
 DWORD WINAPI handler_ex(DWORD control, DWORD /*event_type*/, LPVOID /*event_data*/,
@@ -92,49 +97,78 @@ DWORD WINAPI handler_ex(DWORD control, DWORD /*event_type*/, LPVOID /*event_data
     }
 }
 
-void WINAPI service_main(DWORD, LPWSTR*) {
-    g_status_handle =
-        RegisterServiceCtrlHandlerExW(yuzu::agent::win::kServiceName, handler_ex, nullptr);
-    if (!g_status_handle) {
-        spdlog::error("RegisterServiceCtrlHandlerExW failed: {}", GetLastError());
-        return;
-    }
-
-    report_status(SERVICE_START_PENDING, NO_ERROR, 0, 30000);
-
-    auto agent = g_factory ? g_factory() : nullptr;
-    if (!agent) {
-        spdlog::critical("Agent factory failed under SCM startup -- reporting service failure");
-        report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, /*specific=*/1);
-        return;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_agent_mu);
-        g_agent = agent.get();
-    }
-
-    // Report RUNNING now, before run() -- run()'s reconnect loop is unbounded while
-    // the server is unreachable (agent.cpp), so waiting for it to return would
-    // itself time out the SCM start (parity with the systemd Type=simple unit,
-    // which has no readiness protocol either).
-    report_status(SERVICE_RUNNING);
-
-    agent->run(); // blocks until stop() (via handler_ex) or a fatal startup error
-
-    {
+// Clears the published g_agent pointer on destruction, under g_agent_mu.
+// service_main declares its unique_ptr<Agent>, THEN this guard: C++ destroys
+// locals in reverse declaration order, so the guard fires -- unpublishing
+// g_agent -- before the unique_ptr's own destructor runs, on EVERY exit path
+// (normal return, exception unwind, everything). Without this, a manual
+// "clear g_agent" statement placed only after a (fallible) agent->run() call
+// only runs on the happy path; a SERVICE_CONTROL_STOP delivered on the SCM
+// control-handler thread during exception unwind would see a stale non-null
+// g_agent and call stop() on an already-destructing/destructed Agent (Gate-2
+// finding, #1822).
+struct AgentUnpublisher {
+    ~AgentUnpublisher() {
         std::lock_guard<std::mutex> lock(g_agent_mu);
         g_agent = nullptr;
     }
-    spdlog::default_logger()->flush();
+};
 
-    if (agent->startup_failed())
-        report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, /*specific=*/1);
-    else if (!g_stop_requested.load(std::memory_order_relaxed))
-        // run() returned on its own, without a STOP/SHUTDOWN control -- unexpected.
-        report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, /*specific=*/2);
-    else
-        report_status(SERVICE_STOPPED);
+void WINAPI service_main(DWORD, LPWSTR*) noexcept {
+    auto handle =
+        RegisterServiceCtrlHandlerExW(yuzu::agent::win::kServiceName, handler_ex, nullptr);
+    if (!handle) {
+        spdlog::error("RegisterServiceCtrlHandlerExW failed: {}", GetLastError());
+        return;
+    }
+    g_status_handle.store(handle, std::memory_order_release);
+
+    report_status(SERVICE_START_PENDING, NO_ERROR, 0, 30000);
+
+    try {
+        auto agent = g_factory ? g_factory() : nullptr;
+        if (!agent) {
+            spdlog::critical(
+                "Agent factory failed under SCM startup -- reporting service failure");
+            report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, /*specific=*/1);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_agent_mu);
+            g_agent = agent.get();
+        }
+        AgentUnpublisher unpublisher; // destructs before `agent` on every exit below
+
+        // Report RUNNING now, before run() -- run()'s reconnect loop is unbounded
+        // while the server is unreachable (agent.cpp), so waiting for it to return
+        // would itself time out the SCM start (parity with the systemd
+        // Type=simple unit, which has no readiness protocol either).
+        report_status(SERVICE_RUNNING);
+
+        agent->run(); // blocks until stop() (via handler_ex) or a fatal startup error
+
+        spdlog::default_logger()->flush();
+
+        if (agent->startup_failed())
+            report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, /*specific=*/1);
+        else if (!g_stop_requested.load(std::memory_order_relaxed))
+            // run() returned on its own, without a STOP/SHUTDOWN control -- unexpected.
+            report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, /*specific=*/2);
+        else
+            report_status(SERVICE_STOPPED);
+    } catch (const std::exception& e) {
+        // service_main is a raw WINAPI callback invoked directly by the SCM
+        // dispatcher thread -- an exception must never cross that C ABI boundary
+        // (UB / std::terminate). AgentUnpublisher has already run by this point
+        // (stack unwind destructs it before this catch runs), so g_agent is safely
+        // cleared regardless of where inside the try the throw originated.
+        spdlog::critical("Unhandled exception in ServiceMain: {}", e.what());
+        report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, /*specific=*/3);
+    } catch (...) {
+        spdlog::critical("Unhandled non-standard exception in ServiceMain");
+        report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, /*specific=*/3);
+    }
 }
 
 } // namespace

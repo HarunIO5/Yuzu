@@ -1181,7 +1181,7 @@ bash scripts/start-stack.sh status   # show running processes and ports
 
 ## Windows Service Installation
 
-On Windows, the Yuzu **agent** has a native Windows service wrapper (`yuzu-agent.exe --install-service`); this is what the shipped installer uses, and is the recommended path — see [Agent: --install-service](#agent-install-service) below. A native wrapper for the Yuzu **server** is still planned for a future release; until then, use `sc.exe` or NSSM (Non-Sucking Service Manager) for the server, as described below.
+On Windows, the Yuzu **agent** has a native Windows service wrapper (`yuzu-agent.exe --install-service`); this is what the shipped installer uses, and is the recommended path — see the **Agent: `--install-service`** subsection below. A native wrapper for the Yuzu **server** is still planned for a future release; until then, use `sc.exe` or NSSM (Non-Sucking Service Manager) for the server, as described below.
 
 ### Agent: `--install-service` (native, recommended)
 
@@ -1199,6 +1199,8 @@ sc.exe stop YuzuAgent
 REM Remove it
 yuzu-agent.exe --remove-service
 ```
+
+The service currently registers to run as **LocalSystem** (unchanged by the #1822 SCM-protocol fix). Moving it to a least-privilege account requires a manual post-install `sc.exe config obj= "NT SERVICE\YuzuAgent"` plus directory ACLs the installer doesn't set today — see `docs/agent-privilege-model.md` for the tracked follow-up and the [Service Account](#service-account) guidance below (written for the server, but the same `obj=` mechanism applies).
 
 Re-running `--install-service` is idempotent — it updates an existing registration's binPath in place rather than failing with "service already exists", so it's safe to re-run after an upgrade. Recovery actions (3 restarts, 60s apart, resetting after 24h) are configured automatically and fire on both crashes and clean-exit-with-error.
 
