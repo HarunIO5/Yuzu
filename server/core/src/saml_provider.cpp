@@ -397,7 +397,12 @@ static std::vector<std::string> extract_group_values(xmlNodePtr assertion,
                     !val->ns->href || !xmlStrEqual(val->ns->href, BAD_CAST kSamlAssertionNs)) {
                     continue;
                 }
-                groups.push_back(get_text(val));
+                // UP-8: skip empty/whitespace-only values — they can never
+                // match a non-empty admin_group and would otherwise waste a
+                // slot against the kMax DoS cap.
+                std::string text = get_text(val);
+                if (text.empty()) continue;
+                groups.push_back(std::move(text));
             }
         }
     }

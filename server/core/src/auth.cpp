@@ -895,6 +895,27 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
     return true;
 }
 
+// ── Shared group→role resolution ────────────────────────────────────────────
+
+Role resolve_role_from_groups(const std::vector<std::string>& groups,
+                              const std::string& admin_group) {
+    // Determine role: admin if the caller's IdP-attested groups contain the
+    // configured admin group. Security (C3 fix, later mirrored for SAML):
+    // admin role ONLY through explicit group membership. Do NOT match on
+    // email/display_name/NameID — these are attacker-controlled values that
+    // ride in the same claims/assertion.
+    Role role = Role::user;
+    if (!admin_group.empty()) {
+        for (const auto& gid : groups) {
+            if (gid == admin_group) {
+                role = Role::admin;
+                break;
+            }
+        }
+    }
+    return role;
+}
+
 // ── OIDC session creation ───────────────────────────────────────────────────
 
 std::string AuthManager::create_oidc_session(const std::string& display_name,
@@ -904,18 +925,7 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
                                              std::chrono::steady_clock::time_point mfa_verified_at) {
     std::unique_lock lock(mu_);
 
-    // Determine role: admin if user is in the configured admin group.
-    // Security (C3 fix): Admin role via OIDC ONLY through explicit group membership.
-    // Do NOT match on email/display_name — these are attacker-controlled values.
-    Role role = Role::user;
-    if (!admin_group_id.empty()) {
-        for (const auto& gid : groups) {
-            if (gid == admin_group_id) {
-                role = Role::admin;
-                break;
-            }
-        }
-    }
+    Role role = resolve_role_from_groups(groups, admin_group_id);
 
     auto token = generate_session_token();
     Session s;
@@ -942,20 +952,7 @@ std::string AuthManager::create_saml_session(const std::string& name_id,
                                              const std::string& admin_group) {
     std::unique_lock lock(mu_);
 
-    // Determine role: admin if the assertion's IdP-attested groups contain the
-    // configured admin group. Security (mirrors the OIDC C3 fix in
-    // create_oidc_session): admin via SAML ONLY through explicit group
-    // membership. Do NOT match on NameID/email/display_name — these are
-    // attacker-controlled values that ride in the same assertion.
-    Role role = Role::user;
-    if (!admin_group.empty()) {
-        for (const auto& gid : groups) {
-            if (gid == admin_group) {
-                role = Role::admin;
-                break;
-            }
-        }
-    }
+    Role role = resolve_role_from_groups(groups, admin_group);
 
     auto token = generate_session_token();
     Session s;

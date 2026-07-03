@@ -2045,6 +2045,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // an uncaught exception surfacing as a non-A4 500.
         std::string saml_name_id;
         std::string session_token;
+        // cons-NICE: mirror the OIDC call site's provider-presence ternary
+        // (defense-in-depth — saml_provider_ is always non-null on this
+        // handler's path since routes 404 without it, but this keeps the two
+        // call sites structurally identical for future refactors). Hoisted
+        // outside the try block so the post-login audit row (comp-S1 / UP-5,
+        // below) can also reference it.
+        auto saml_admin_gid = saml_provider_ ? cfg_.saml_admin_group : std::string{};
         try {
             auto result = saml_provider_->validate_response(saml_response_b64, binding_cookie);
             if (!result) {
@@ -2062,7 +2069,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
             saml_name_id  = result.value().name_id;
             session_token = auth_mgr_.create_saml_session(saml_name_id, result.value().groups,
-                                                           cfg_.saml_admin_group);
+                                                           saml_admin_gid);
         } catch (const std::exception& e) {
             spdlog::error("SAML ACS: internal error during validation/session: {}", e.what());
             audit_log(req, "auth.saml_login_failed", "error", {}, {}, "internal error");
@@ -2093,8 +2100,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                            return auth::role_to_string(s.role);
                                        })
                                        .value_or(std::string{"user"});
+        // comp-S1 / UP-5: when the login resolved to admin, name the granting
+        // group in the audit detail so a reviewer can see WHY this SAML login
+        // is admin without cross-referencing boot flags. Matching is exact
+        // against the single configured saml_admin_gid, so there is exactly
+        // one candidate group to log — no ambiguity about which of possibly
+        // several assertion groups triggered the promotion.
+        auto saml_audit_detail = (saml_effective_role == auth::role_to_string(auth::Role::admin))
+                                     ? "auth_source=saml;admin_group=" + saml_admin_gid
+                                     : std::string{"auth_source=saml"};
         audit_log_for_principal(req, "auth.saml_login", "ok", saml_name_id, saml_effective_role,
-                                "User", saml_name_id, "auth_source=saml");
+                                "User", saml_name_id, saml_audit_detail);
         emit_event("auth.saml_login", req,
                    {{"source_ip", req.remote_addr},
                     {"username", saml_name_id},

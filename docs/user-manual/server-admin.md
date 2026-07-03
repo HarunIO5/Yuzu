@@ -852,7 +852,20 @@ group list contains an **exact match** for `--saml-admin-group`; otherwise
 group-membership evidence. Changing either flag requires a server restart
 (no hot-reload). JIT elevation remains non-functional for SAML users (no
 local `users` row in auth.db) regardless of role — a group-mapped admin gets
-`role=admin` directly at login, not via the elevation endpoint.
+`role=admin` directly at login, not via the elevation endpoint. Unlike OIDC,
+SAML group values are **not** synced into `rbac_store` — group-scoped RBAC
+role assignments do not apply to SAML principals (they only feed the
+admin-or-user decision above).
+
+> **Configuring `--saml-admin-group` against a real IdP:** the value must be
+> the exact identifier the IdP puts in the assertion, not a display name —
+> Entra ID sends group **object ID GUIDs**, not group names, so configure the
+> GUID. Matching is case-sensitive. A user in more than ~150 Entra groups hits
+> **"groups overage"**: Entra omits the `groups` claim entirely for that
+> assertion (substituting a Graph API link), so such users can never resolve
+> to admin via `--saml-admin-group` regardless of actual membership — use a
+> dedicated low-membership group for the mapping. At most 64 group values
+> from the configured attribute are considered.
 
 ### Known limitations in this release
 

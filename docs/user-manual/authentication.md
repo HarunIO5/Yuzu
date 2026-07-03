@@ -380,8 +380,39 @@ elevate privileges — mirrors the OIDC guard described above
 signature-verified assertion as `NameID`, so a forged or wrapped assertion
 element cannot inject group membership that the IdP didn't attest to.
 
+> **Configuring `--saml-admin-group` against a real IdP:**
+>
+> - The value must be the **exact identifier your IdP puts in the assertion**
+>   — not a human-friendly display name. Entra ID, for example, sends group
+>   **object ID GUIDs** (e.g. `4fb5b234-...`) in the group claim, not the
+>   group's display name; configure the GUID, not "Admins".
+> - Matching is **case-sensitive** — a value that differs only in case (or
+>   has stray leading/trailing whitespace copy-pasted from a portal — the
+>   admin-group value is trimmed automatically, but the group values inside
+>   the assertion itself are compared as the IdP sent them) will not match.
+> - **Entra ID "groups overage"**: a user who is a member of more than ~150
+>   groups gets **no `groups` claim at all** in the assertion — Entra
+>   substitutes a Graph API link instead. Such a user's assertion carries zero
+>   group values, so `--saml-admin-group` can never resolve them to admin
+>   regardless of actual group membership. Either keep the target admin's
+>   group count under the overage threshold or use a dedicated,
+>   low-membership group for the admin mapping.
+> - At most **64 group values** from the configured attribute are considered
+>   (a DoS guard); a value beyond the 64th is never evaluated.
+
 Changing either flag requires a server restart to take effect (no hot-reload,
 same as the other SAML flags).
+
+> **RBAC-sync divergence from OIDC:** unlike an OIDC login (which auto-syncs
+> every claimed group into `rbac_store` as an `"entra"`-sourced group, so
+> group-scoped RBAC role assignments apply — see [Group-to-Role
+> Mapping](#group-to-role-mapping) above), a SAML login does **not** sync any
+> assertion group into `rbac_store`. SAML groups are consulted for the
+> `--saml-admin-group` admin-or-user decision **only**, at session-mint time,
+> and are then discarded. A group-scoped RBAC role assignment (e.g. on an
+> `ApiTokenManager` securable) does **not** yet apply to SAML principals,
+> even for a group the IdP asserts. This is tracked as a follow-up, not a v1
+> gap in the admin-mapping guard itself.
 
 ### SAML Login Flow
 

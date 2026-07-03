@@ -557,6 +557,18 @@ std::filesystem::path default_cert_dir();
 std::string role_to_string(Role r);
 Role string_to_role(const std::string& s);
 
+/// Shared group→role resolution for federated (OIDC/SAML) session creation.
+/// Security-load-bearing: defaults to `Role::user`; promotes to `Role::admin`
+/// ONLY on an EXACT match between `admin_group` and one entry of `groups`.
+/// Never matches on NameID/email/display_name — those are attacker-controlled
+/// values that ride in the same assertion/claims. `admin_group` empty ⇒
+/// always `Role::user` (unconfigured deployment stays thin-slice-compatible).
+/// Extracted from create_oidc_session's original guard (byte-equivalent
+/// behaviour) and reused verbatim by create_saml_session — do not change
+/// this function's semantics without security-guardian review.
+Role resolve_role_from_groups(const std::vector<std::string>& groups,
+                              const std::string& admin_group);
+
 std::string pending_status_to_string(PendingStatus s);
 
 } // namespace yuzu::server::auth

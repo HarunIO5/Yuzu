@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server::auth {
@@ -282,6 +283,14 @@ struct Config {
     /// `--allow-unsigned-packs`.
     bool allow_unsigned_definitions{false};
 };
+
+/// Trim leading/trailing ASCII whitespace (space/tab/CR/LF). Used to
+/// normalize operator-supplied config values that are compared for EXACT
+/// string equality against IdP-attested data — a trailing space from a
+/// copy-pasted CLI arg would otherwise silently and permanently prevent any
+/// match (currently: SamlConfig's admin-group flag, UP-4). Pure/free so it is
+/// directly unit-testable without constructing a Server.
+std::string trim_ascii_whitespace(std::string_view s);
 
 /**
  * Server manages inbound agent connections and exposes a management gRPC API.
