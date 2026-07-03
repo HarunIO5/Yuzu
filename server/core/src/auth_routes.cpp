@@ -39,6 +39,59 @@ constexpr std::size_t kMaxJustificationLength = 1024;
 // known, the structured "<securable_type>:<operation>" permission field).
 // Callers below use detail::a4_denial(res, code, msg, {.permission = ...}).
 
+// system_clock time_point → ISO-8601 UTC ("YYYY-MM-DDTHH:MM:SSZ"). Mirrors
+// guardian_ingest.cpp's ts_to_iso8601 / rest_api_v1.cpp's iso_now pattern —
+// the established per-file idiom for this codebase (no shared formatter
+// header exists yet). Used for JIT elevation's `expires_at` (follow-up B,
+// security review 2026-06-30): the wall-clock projection of an internally
+// steady_clock-tracked window.
+std::string iso8601_utc(std::chrono::system_clock::time_point tp) {
+    std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm{};
+#if defined(_WIN32)
+    // gmtime_s returns nonzero on failure — don't silently format a
+    // zero-inited tm as 1970-01-01 (L1, adversarial review).
+    if (gmtime_s(&tm, &t) != 0)
+        return "invalid-time";
+#else
+    if (gmtime_r(&t, &tm) == nullptr)
+        return "invalid-time";
+#endif
+    char buf[32] = {};
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return std::string(buf);
+}
+
+/// Boundary-aware cookie-value extractor.
+///
+/// Splits the Cookie header on ";" — tolerating both the RFC 6265 §4.2.1
+/// canonical "; " separator and a bare ";" (some clients/proxies omit the
+/// trailing space) by skipping leading whitespace in each segment — and
+/// performs an exact-name match so a cookie named "foo__Host-yuzu_saml_bind"
+/// cannot shadow "__Host-yuzu_saml_bind".  Returns the value string or empty.
+///
+/// DOES NOT alter extract_session_cookie (which has a separate legacy call
+/// site and is not affected by the SAML binding-cookie shadowing risk).
+static std::string find_cookie_value(const std::string& hdr, const std::string& name) {
+    const std::string prefix = name + "=";
+    std::size_t pos = 0;
+    while (pos < hdr.size()) {
+        // Tolerate "; " and bare ";" separators: skip optional leading whitespace.
+        while (pos < hdr.size() && (hdr[pos] == ' ' || hdr[pos] == '\t')) ++pos;
+        const auto delim   = hdr.find(';', pos);
+        const auto seg_end = (delim == std::string::npos) ? hdr.size() : delim;
+        const auto seg_len = seg_end - pos;
+        // Exact name match: segment starts with "name=" and is at least that long.
+        if (seg_len >= prefix.size() &&
+            hdr.compare(pos, prefix.size(), prefix) == 0) {
+            return hdr.substr(pos + prefix.size(), seg_len - prefix.size());
+        }
+        if (delim == std::string::npos) break;
+        pos = delim + 1; // advance past ";"
+    }
+    return {};
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -49,10 +102,12 @@ AuthRoutes::AuthRoutes(Config& cfg, auth::AuthManager& auth_mgr, RbacStore* rbac
                        ApiTokenStore* api_token_store, AuditStore* audit_store,
                        ManagementGroupStore* mgmt_group_store, TagStore* tag_store,
                        AnalyticsEventStore* analytics_store, std::shared_mutex& oidc_mu,
-                       std::unique_ptr<oidc::OidcProvider>& oidc_provider)
+                       std::unique_ptr<oidc::OidcProvider>& oidc_provider,
+                       saml::SamlProvider* saml_provider)
     : cfg_(cfg), auth_mgr_(auth_mgr), rbac_store_(rbac_store), api_token_store_(api_token_store),
       audit_store_(audit_store), mgmt_group_store_(mgmt_group_store), tag_store_(tag_store),
-      analytics_store_(analytics_store), oidc_mu_(oidc_mu), oidc_provider_(oidc_provider) {}
+      analytics_store_(analytics_store), oidc_mu_(oidc_mu), oidc_provider_(oidc_provider),
+      saml_provider_(saml_provider) {}
 
 // ---------------------------------------------------------------------------
 // Static utilities
@@ -70,13 +125,31 @@ std::string AuthRoutes::extract_session_cookie(const httplib::Request& req) {
 }
 
 std::string AuthRoutes::url_decode(const std::string& s) {
+    // Use a hexval lookup instead of std::stoul so that malformed percent-
+    // sequences ("%GH", "%G", bare "%") never throw std::invalid_argument and
+    // 500 the request.  A malformed sequence is emitted literally — valid
+    // input behaviour (well-formed %HH + '+') is unchanged.
+    // Mirrors yuzu::server::url_decode in web_utils.hpp; kept as a static
+    // member so callers that already depend on AuthRoutes::url_decode
+    // (OIDC/login/SAML form parsing) do not need include changes.
+    auto hexval = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
     std::string out;
     out.reserve(s.size());
     for (std::size_t i = 0; i < s.size(); ++i) {
         if (s[i] == '%' && i + 2 < s.size()) {
-            auto hex = s.substr(i + 1, 2);
-            out += static_cast<char>(std::stoul(hex, nullptr, 16));
-            i += 2;
+            const int hi = hexval(s[i + 1]);
+            const int lo = hexval(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out += static_cast<char>((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+            out += s[i]; // malformed → emit literal '%'
         } else if (s[i] == '+') {
             out += ' ';
         } else {
@@ -88,13 +161,24 @@ std::string AuthRoutes::url_decode(const std::string& s) {
 
 std::string AuthRoutes::extract_form_value(const std::string& body, const std::string& key) {
     auto needle = key + "=";
-    auto pos = body.find(needle);
-    if (pos == std::string::npos)
-        return {};
-    pos += needle.size();
-    auto end = body.find('&', pos);
-    auto raw = body.substr(pos, end == std::string::npos ? end : end - pos);
-    return url_decode(raw);
+    std::size_t search_from = 0;
+    for (;;) {
+        auto pos = body.find(needle, search_from);
+        if (pos == std::string::npos)
+            return {};
+        // Boundary check: only accept a match at the very start of the body
+        // or immediately after an '&' field separator. Without this, a
+        // field name that merely ENDS in `key` (e.g. an attacker-supplied
+        // "fooSAMLResponse=attacker&SAMLResponse=real") would shadow the
+        // genuine field.
+        if (pos == 0 || body[pos - 1] == '&') {
+            pos += needle.size();
+            auto end = body.find('&', pos);
+            auto raw = body.substr(pos, end == std::string::npos ? end : end - pos);
+            return url_decode(raw);
+        }
+        search_from = pos + 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -124,8 +208,23 @@ std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request&
     if (token.size() > auth::kMaxSessionTokenLength)
         return std::nullopt;
     auto session = auth_mgr_.validate_session(token);
-    if (session)
+    if (session) {
+        // Lazily reap a passively-lapsed JIT elevation on the cookie chokepoint
+        // (residual-risk follow-up A, security review 2026-06-30): there is no
+        // background reaper, so the next authenticated request after a window
+        // lapses is where the `role.elevation.expired` audit row is minted.
+        // Uses audit_log_for_principal (not audit_log) because audit_log's
+        // make_audit_event() itself calls resolve_session(req) — calling that
+        // from inside resolve_session would re-enter this function. `session`
+        // already carries the base role (Session::role is never the elevated
+        // view), matching the `role.elevation.revoked` audit's principal_role.
+        if (auto expired_user = auth_mgr_.reap_expired_elevation(token)) {
+            audit_log_for_principal(req, "role.elevation.expired", "expired", *expired_user,
+                                    auth::role_to_string(session->role), "User", *expired_user,
+                                    "JIT admin elevation window lapsed");
+        }
         return session;
+    }
 
     // 2. Try Authorization: Bearer <token> (API token auth)
     auto auth_header = req.get_header_value("Authorization");
@@ -1512,7 +1611,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
 
         // Only LOCAL sessions can step up here: this endpoint verifies a
-        // TOTP / recovery code against a local `users` row. Two other
+        // TOTP / recovery code against a local `users` row. Three other
         // principal kinds reach this code and must be rejected with a
         // precise remediation rather than a misleading 401:
         //   - bearer (api_token/mcp_token): no session to step up; re-issue
@@ -1523,29 +1622,39 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         //     /auth/oidc/start; this 400 keeps the endpoint contract honest
         //     instead of silently dead-ending them on a 401 (governance
         //     cons-B1). Audit + correlation_id keep both branches traceable.
+        //   - SAML: no local secret exists (create_saml_session never
+        //     writes a users row); MFA attestation for SAML is deferred to
+        //     a future release. Return a clear denial rather than the
+        //     misleading API-token message (governance R12).
         if (session->auth_source != "local") {
             const bool is_oidc = session->auth_source == "oidc";
+            const bool is_saml = session->auth_source == "saml";
             const auto cid = detail::make_correlation_id();
             res.status = 400;
+            const char* msg =
+                is_oidc ? "OIDC sessions re-prove MFA by re-authenticating with the "
+                          "identity provider — start a new SSO sign-in at /auth/oidc/start, "
+                          "not local step-up"
+                : is_saml ? "MFA step-up is not available for SAML sessions in this release — "
+                            "re-authenticate via SAML at /auth/saml/start"
+                : "step-up is for session-cookie callers only — re-issue the API "
+                  "token to refresh MFA proof";
             nlohmann::json envelope = {
                 {"error",
                  {{"code", 400},
-                  {"message",
-                   is_oidc ? "OIDC sessions re-prove MFA by re-authenticating with the "
-                             "identity provider — start a new SSO sign-in at /auth/oidc/start, "
-                             "not local step-up"
-                           : "step-up is for session-cookie callers only — re-issue the API "
-                             "token to refresh MFA proof"},
+                  {"message", msg},
                   {"correlation_id", cid}}},
                 {"meta", {{"api_version", "v1"}}}};
             res.set_content(envelope.dump(), "application/json");
+            const char* audit_detail =
+                is_oidc ? "oidc session cannot local step up (re-SSO)"
+                : is_saml ? "saml session cannot local step up (no mfa this release)"
+                : "bearer credential cannot step up";
             audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
                                     auth::role_to_string(session->role), "User",
                                     session->username,
-                                    (is_oidc ? "oidc session cannot local step up (re-SSO)"
-                                             : "bearer credential cannot step up") +
-                                        std::string(" (auth_source=") + session->auth_source +
-                                        ")");
+                                    std::string(audit_detail) +
+                                        " (auth_source=" + session->auth_source + ")");
             return;
         }
 
@@ -1817,6 +1926,239 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     {"name", claims.name}});
 
         res.set_redirect("/");
+    });
+
+    // -- SAML 2.0 SSO endpoints ------------------------------------------------
+    //
+    // N4 safety: SamlProvider::is_enabled() returns false on Windows and whenever
+    // the required config is incomplete — both routes fail-closed to 404.
+    //
+    // RelayState open-redirect safety: only same-origin relative paths are
+    // accepted (starts with '/' but NOT '//').  All other values fall back to '/'.
+
+    sink.Get("/auth/saml/start", [this](const httplib::Request& req, httplib::Response& res) {
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
+        if (!saml_provider_ || !saml_provider_->is_enabled()) {
+            res.status = 404;
+            res.set_content(detail::error_json_a4(404, "SAML not configured", cid),
+                            "application/json");
+            return;
+        }
+
+        // Optional RelayState (return-to path passed through the IdP round-trip).
+        // The redirect target is validated in /saml/acs — here we pass it verbatim
+        // to the AuthnRequest and it bounces back as the POST body RelayState.
+        auto relay_state = req.get_param_value("RelayState");
+        // build_authn_request can throw under crypto/allocation failure (deflate,
+        // RNG, SHA-256); catch so we return a clean A4 500 rather than an
+        // uncaught exception that httplib would surface as a non-A4 500.
+        std::string authn_url;
+        std::string authn_cookie_secret;
+        try {
+            auto authn = saml_provider_->build_authn_request(relay_state);
+            authn_url           = authn.url;
+            authn_cookie_secret = authn.cookie_secret;
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(detail::error_json_a4(500, "Failed to build SAML AuthnRequest", cid),
+                            "application/json");
+            spdlog::error("SAML /auth/saml/start: build_authn_request threw: {}", e.what());
+            return;
+        }
+        if (authn_url.empty()) {
+            res.status = 500;
+            res.set_content(detail::error_json_a4(500, "Failed to build SAML AuthnRequest", cid),
+                            "application/json");
+            spdlog::error("SAML /auth/saml/start: build_authn_request returned empty URL");
+            return;
+        }
+        // Set the browser-binding cookie so the ACS can verify this browser
+        // initiated the login.  __Host- prefix enforces host-lock + Secure +
+        // Path=/ (cannot be set with a Domain attribute).  SameSite=None is
+        // REQUIRED because the IdP delivers the assertion via a cross-site POST
+        // directly to /saml/acs; Lax would suppress the cookie on that POST.
+        // Max-Age=600 matches kRequestTtl (10 minutes) so the cookie expires
+        // when the pending request does.
+        res.set_header("Set-Cookie",
+            "__Host-yuzu_saml_bind=" + authn_cookie_secret +
+            "; Path=/; Secure; HttpOnly; SameSite=None; Max-Age=600");
+        res.set_redirect(authn_url);
+    });
+
+    sink.Post("/saml/acs", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!saml_provider_ || !saml_provider_->is_enabled()) {
+            res.status = 404;
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            res.set_content(detail::error_json_a4(404, "SAML not configured", cid),
+                            "application/json");
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
+            return;
+        }
+
+        // Clear-cookie string used on both success and failure paths.
+        // Expiring the __Host- cookie immediately after use is defence-in-depth:
+        // even if an attacker extracts it, it is single-use (validated_response
+        // erases the pending entry on any match or mismatch).
+        static const std::string kBindCookieClear =
+            "__Host-yuzu_saml_bind=; Path=/; Secure; HttpOnly; SameSite=None; Max-Age=0";
+
+        // ── Forced-login CSRF guard: browser-binding cookie must be present ────
+        // The binding cookie is set by GET /auth/saml/start and is HttpOnly +
+        // SameSite=None + __Host-.  A CSRF-injected ACS POST from a victim's
+        // browser will NOT carry this cookie (the victim never initiated a login),
+        // so absence is an unambiguous forced-login attempt.
+        // Use find_cookie_value (boundary-aware) so a cookie named
+        // "foo__Host-yuzu_saml_bind" cannot shadow our binding cookie.
+        std::string binding_cookie;
+        {
+            const auto cookie_hdr = req.get_header_value("Cookie");
+            binding_cookie = find_cookie_value(cookie_hdr, "__Host-yuzu_saml_bind");
+        }
+        if (binding_cookie.empty()) {
+            spdlog::warn("SAML ACS: missing binding cookie — forced-login attempt rejected");
+            audit_log(req, "auth.saml_login_failed", "error", {}, {},
+                      "missing binding cookie");
+            emit_event("auth.saml_login_failed", req,
+                       {{"source_ip", req.remote_addr},
+                        {"error", "missing binding cookie"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
+            // Clear any stale binding cookie (belt-and-suspenders: may be absent,
+            // but Max-Age=0 on a non-existent cookie is a harmless no-op per RFC 6265).
+            res.set_header("Set-Cookie", kBindCookieClear);
+            res.set_redirect("/login?error=saml");
+            return;
+        }
+
+        // Reject oversized POST bodies before any parsing — 1 MiB cap (N5: DoS guard).
+        // A legitimate SAML Response with a signed assertion is well under 64 KiB;
+        // 1 MiB gives generous headroom while preventing a plaintext amplification attack
+        // via an enormous fake SAMLResponse field.
+        static constexpr std::size_t kSamlMaxBodyBytes = 1048576; // 1 MiB
+        if (req.body.size() > kSamlMaxBodyBytes) {
+            spdlog::warn("SAML ACS: oversized POST body ({} bytes) rejected", req.body.size());
+            audit_log(req, "auth.saml_login_failed", "error", {}, {}, "oversize");
+            emit_event("auth.saml_login_failed", req,
+                       {{"source_ip", req.remote_addr}, {"error", "oversize"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
+            res.set_header("Set-Cookie", kBindCookieClear);
+            res.set_redirect("/login?error=saml");
+            return;
+        }
+
+        // HTTP-POST binding: SAMLResponse and RelayState are form fields.
+        auto saml_response_b64 = extract_form_value(req.body, "SAMLResponse");
+        auto relay_state       = extract_form_value(req.body, "RelayState");
+
+        if (saml_response_b64.empty()) {
+            audit_log(req, "auth.saml_login_failed", "error", {}, {}, "missing SAMLResponse");
+            emit_event("auth.saml_login_failed", req,
+                       {{"source_ip", req.remote_addr}, {"error", "missing SAMLResponse"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
+            res.set_header("Set-Cookie", kBindCookieClear);
+            res.set_redirect("/login?error=saml");
+            return;
+        }
+
+        // validate_response verifies cryptographic signature + conditions +
+        // InResponseTo + browser-binding (SHA-256(cookie) == stored hash).
+        // Both validate_response and create_saml_session can throw under
+        // crypto/allocation/DB failure; catch so an exception yields the same
+        // clean redirect-to-login as an ordinary validation failure rather than
+        // an uncaught exception surfacing as a non-A4 500.
+        std::string saml_name_id;
+        std::string session_token;
+        try {
+            auto result = saml_provider_->validate_response(saml_response_b64, binding_cookie);
+            if (!result) {
+                spdlog::warn("SAML ACS validation failed: {}", result.error());
+                audit_log(req, "auth.saml_login_failed", "error", {}, {}, result.error());
+                emit_event("auth.saml_login_failed", req,
+                           {{"source_ip", req.remote_addr}, {"error", result.error()}}, {},
+                           Severity::kWarn);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+                }
+                res.set_header("Set-Cookie", kBindCookieClear);
+                res.set_redirect("/login?error=saml");
+                return;
+            }
+            saml_name_id  = result.value().name_id;
+            session_token = auth_mgr_.create_saml_session(saml_name_id);
+        } catch (const std::exception& e) {
+            spdlog::error("SAML ACS: internal error during validation/session: {}", e.what());
+            audit_log(req, "auth.saml_login_failed", "error", {}, {}, "internal error");
+            emit_event("auth.saml_login_failed", req,
+                       {{"source_ip", req.remote_addr}, {"error", "internal error"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
+            res.set_header("Set-Cookie", kBindCookieClear);
+            res.set_redirect("/login?error=saml");
+            return;
+        }
+
+        // Clear the binding cookie now that the round-trip is complete.
+        res.set_header("Set-Cookie", kBindCookieClear);
+        res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
+
+        // Explicit-principal audit row — request lands at /saml/acs with no session
+        // cookie yet, so the default resolve_session path would leave principal empty
+        // (same rationale as the OIDC /auth/callback audit, Gate 4 consistency B3).
+        audit_log_for_principal(req, "auth.saml_login", "ok", saml_name_id, "user",
+                                "User", saml_name_id, "auth_source=saml");
+        emit_event("auth.saml_login", req,
+                   {{"source_ip", req.remote_addr},
+                    {"username", saml_name_id},
+                    {"auth_method", "saml"}});
+        if (auto* m = auth_mgr_.metrics_registry()) {
+            m->counter("yuzu_auth_saml_login_total", {{"result", "ok"}}).increment();
+        }
+
+        // RelayState open-redirect safety: only accept same-origin relative paths.
+        // Reject:
+        //   - protocol-relative paths  ("//evil.com")
+        //   - backslash-second-char    ("/\evil.com" — browsers normalize '\' → '/')
+        //   - values containing '\'    (anywhere — same normalization risk)
+        //   - values containing control characters (tab, newline, CR, <0x20 — header injection)
+        //   - any byte ≥ 0x80 (non-ASCII — kills fullwidth/Unicode slash lookalikes
+        //     such as U+FF0F FULLWIDTH SOLIDUS which browsers may canonicalize to '/')
+        //   - any ".." path segment (H-D: url_decode runs before this check, so
+        //     "/%2e%2e/admin" → "/../admin" → rejected here)
+        auto is_safe_relay_state = [](const std::string& rs) -> bool {
+            if (rs.empty() || rs[0] != '/') return false;
+            if (rs.size() >= 2 && (rs[1] == '/' || rs[1] == '\\')) return false;
+            for (unsigned char c : rs) {
+                if (c < 0x20 || c >= 0x80 || c == '\\') return false;
+            }
+            // Reject any ".." path segment (prevents path traversal after url_decode).
+            {
+                std::size_t p = 1; // skip leading '/'
+                while (p <= rs.size()) {
+                    const auto slash = rs.find('/', p);
+                    const auto seg_end = (slash == std::string::npos) ? rs.size() : slash;
+                    if (rs.compare(p, seg_end - p, "..") == 0) return false;
+                    if (slash == std::string::npos) break;
+                    p = slash + 1;
+                }
+            }
+            return true;
+        };
+        auto target = is_safe_relay_state(relay_state) ? relay_state : std::string{"/"};
+        res.set_redirect(target);
     });
 
     // ── JIT admin elevation (SOC 2 CC6.3/CC6.6) — /auth-and-authz P1 #9 ───────
@@ -2115,15 +2457,38 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
             return;
         }
+        // `until` may be CLAMPED to the session's own absolute expiry
+        // (follow-up B, security review 2026-06-30) — report the TRUE
+        // remaining time, not the requested/capped `duration`. A live window
+        // is CEIL'd (never floor/truncated) — duration_cast truncates toward
+        // zero, so a genuinely-live sub-second remainder (e.g. duration_secs:1
+        // re-sampled a moment later) would falsely report 0 across all three
+        // channels (HIGH, adversarial review). Only a non-live/edge window
+        // (until <= now) floors to 0.
+        const auto elevate_now = std::chrono::steady_clock::now();
+        auto remaining = (*until > elevate_now)
+                              ? std::chrono::ceil<std::chrono::seconds>(*until - elevate_now)
+                              : std::chrono::seconds(0);
+        // steady_clock has no wall-clock meaning across a restart/off-process,
+        // so the absolute `expires_at` is a system_clock projection of the
+        // steady remaining duration, taken at essentially the same instant.
+        const std::string expires_at_str =
+            iso8601_utc(std::chrono::system_clock::now() + remaining);
         // FAIL-CLOSED on the mandatory grant audit (review UP-3): a privileged
         // activation must never stand without a durable record. If the audit row
         // can't persist, ROLL BACK the elevation (compensating revoke, mirrors
         // the break-glass arm) and 500 with Sec-Audit-Failed — rather than leave
         // a silent admin window.
+        // duration_secs is the TRUE post-clamp window (remaining.count()), NOT the
+        // requested/capped `duration` — so the audit row, the analytics event, and
+        // the JSON response all agree on the enforced window even when the window
+        // was clamped to the session's own absolute expiry (evidence integrity,
+        // docs/auth-architecture.md:238-240).
         if (!audit_log_for_principal(req, "role.elevation.granted", "ok", session->username, "admin",
                                      "User", session->username,
-                                     "duration_secs=" + std::to_string(duration) +
-                                         " justification=" + justification)) {
+                                     "duration_secs=" + std::to_string(remaining.count()) +
+                                         " justification=" + justification +
+                                         " expires_at=" + expires_at_str)) {
             auth_mgr_.revoke_elevation(token); // un-elevate — no record, no grant
             spdlog::error("role.elevation.granted audit FAILED for '{}' — elevation rolled back",
                           session->username);
@@ -2134,10 +2499,20 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                             "application/json");
             return;
         }
+        // duration_secs here is remaining.count() (the true post-clamp value),
+        // not the requested/capped `duration` — matches the audit row and the
+        // JSON response so all three channels agree (governance hardening
+        // round, consistency). With the ceil above, a live window is always
+        // >= 1 (never truncated to 0); only the dead-window edge case is 0.
+        // expires_at is carried too (L2, adversarial review) so this channel
+        // matches the audit row and the JSON response (docs/auth-architecture.md:238-240).
         emit_event("role.elevation.granted", req,
-                   {{"username", session->username}, {"duration_secs", std::to_string(duration)}}, {},
-                   Severity::kWarn);
-        nlohmann::json out = {{"status", "ok"}, {"expires_in", duration}};
+                   {{"username", session->username},
+                    {"duration_secs", std::to_string(remaining.count())},
+                    {"expires_at", expires_at_str}},
+                   {}, Severity::kWarn);
+        nlohmann::json out = {
+            {"status", "ok"}, {"expires_in", remaining.count()}, {"expires_at", expires_at_str}};
         res.set_content(out.dump(), "application/json");
     });
 
