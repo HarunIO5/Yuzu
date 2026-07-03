@@ -115,17 +115,22 @@ struct AgentUnpublisher {
 };
 
 void WINAPI service_main(DWORD, LPWSTR*) noexcept {
-    auto handle =
-        RegisterServiceCtrlHandlerExW(yuzu::agent::win::kServiceName, handler_ex, nullptr);
-    if (!handle) {
-        spdlog::error("RegisterServiceCtrlHandlerExW failed: {}", GetLastError());
-        return;
-    }
-    g_status_handle.store(handle, std::memory_order_release);
-
-    report_status(SERVICE_START_PENDING, NO_ERROR, 0, 30000);
-
+    // The try opens here, before RegisterServiceCtrlHandlerExW, not just around
+    // the agent construction/run() below: spdlog::error/report_status (fmt
+    // formatting, std::mutex::lock) are not statically noexcept, and nothing
+    // may cross this raw WINAPI callback boundary uncaught (Gate-2 re-review
+    // follow-up, #1822) -- even in this narrow pre-Agent window.
     try {
+        auto handle =
+            RegisterServiceCtrlHandlerExW(yuzu::agent::win::kServiceName, handler_ex, nullptr);
+        if (!handle) {
+            spdlog::error("RegisterServiceCtrlHandlerExW failed: {}", GetLastError());
+            return;
+        }
+        g_status_handle.store(handle, std::memory_order_release);
+
+        report_status(SERVICE_START_PENDING, NO_ERROR, 0, 30000);
+
         auto agent = g_factory ? g_factory() : nullptr;
         if (!agent) {
             spdlog::critical(
