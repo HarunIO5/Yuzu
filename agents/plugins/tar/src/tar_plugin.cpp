@@ -589,17 +589,21 @@ public:
                 // enumerate_mapdrive_history touches the registry / offline hives /
                 // subprocesses and does substantial allocation; a std::bad_alloc (or
                 // any future throwing edit) must not cross the plugin C-ABI boundary
-                // out of init(). Catch here and treat as an empty backfill (the
-                // dedup key stays unset below, so the next restart retries).
+                // out of init(). Catch here; a throw is NOT the same as "no history"
+                // — enumerated_ok gates the done-key so a throw leaves it unset and
+                // the next restart retries (only a clean empty result records done).
                 std::vector<yuzu::tar::MapDriveHistoryRow> hist;
+                bool enumerated_ok = false;
                 try {
                     hist = yuzu::tar::enumerate_mapdrive_history();
+                    enumerated_ok = true;
                 } catch (const std::exception& e) {
                     spdlog::warn("TAR: mapdrive historical backfill enumeration threw ({}) — "
-                                 "skipping this run",
+                                 "will retry on restart",
                                  e.what());
                 } catch (...) {
-                    spdlog::warn("TAR: mapdrive historical backfill enumeration threw — skipping");
+                    spdlog::warn("TAR: mapdrive historical backfill enumeration threw — "
+                                 "will retry on restart");
                 }
                 const auto snap = next_snapshot_id();
                 std::vector<yuzu::tar::MapDriveEvent> typed;
@@ -618,7 +622,10 @@ public:
                     ev.origin = "historical";
                     typed.push_back(std::move(ev));
                 }
-                if (typed.empty()) {
+                if (!enumerated_ok) {
+                    // Enumeration threw (already logged) — leave the key unset so the
+                    // next restart retries rather than permanently skipping history.
+                } else if (typed.empty()) {
                     spdlog::info("TAR: no historical mapped drives found to backfill");
                     db_->set_config("mapdrive_backfill_done", std::to_string(now_epoch_seconds()));
                 } else if (db_->insert_mapdrive_events(typed)) {
