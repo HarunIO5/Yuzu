@@ -937,25 +937,37 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
 
 // ── SAML session creation ───────────────────────────────────────────────────
 
-std::string AuthManager::create_saml_session(const std::string& name_id) {
+std::string AuthManager::create_saml_session(const std::string& name_id,
+                                             const std::vector<std::string>& groups,
+                                             const std::string& admin_group) {
     std::unique_lock lock(mu_);
 
-    // Thin slice: role defaults to user — no group→role mapping (deferred).
-    // Security: admin role is NEVER granted from SAML without explicit group
-    // mapping (analogous to the OIDC admin_group_id guard — see C3 fix comment
-    // in create_oidc_session). Do not change this default without adding group
-    // mapping that is reviewed by security-guardian.
+    // Determine role: admin if the assertion's IdP-attested groups contain the
+    // configured admin group. Security (mirrors the OIDC C3 fix in
+    // create_oidc_session): admin via SAML ONLY through explicit group
+    // membership. Do NOT match on NameID/email/display_name — these are
+    // attacker-controlled values that ride in the same assertion.
+    Role role = Role::user;
+    if (!admin_group.empty()) {
+        for (const auto& gid : groups) {
+            if (gid == admin_group) {
+                role = Role::admin;
+                break;
+            }
+        }
+    }
+
     auto token = generate_session_token();
     Session s;
     s.username                   = name_id;
-    s.role                       = Role::user;
+    s.role                       = role;
     s.expires_at                 = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source                = "saml";
     s.last_activity_at           = std::chrono::steady_clock::now();
     s.last_activity_persisted_at = s.last_activity_at;
     sessions_[token]             = std::move(s);
 
-    spdlog::info("SAML session created for '{}'", name_id);
+    spdlog::info("SAML session created for '{}' (role={})", name_id, role_to_string(role));
     return token;
 }
 

@@ -179,7 +179,8 @@ struct SamlTestFixture {
         const std::string& audience            = {},
         const std::string& recipient           = {},
         bool               inject_extra_assertion = false,
-        const std::string* signing_priv_key    = nullptr) const
+        const std::string* signing_priv_key    = nullptr,
+        const std::string& attribute_statement_xml = {}) const
     {
         const auto& aud = audience.empty()  ? sp_entity_id : audience;
         const auto& rec = recipient.empty() ? sp_acs_url   : recipient;
@@ -252,6 +253,7 @@ struct SamlTestFixture {
                   "<saml:Audience>" + aud + "</saml:Audience>"
                 "</saml:AudienceRestriction>"
               "</saml:Conditions>"
+              + attribute_statement_xml +
             "</saml:Assertion>";
         // clang-format on
 
@@ -302,6 +304,22 @@ struct SamlTestFixture {
         return b64_encode(
             reinterpret_cast<const unsigned char*>(signed_xml.data()),
             signed_xml.size());
+    }
+
+    /// Build a single <saml:AttributeStatement> containing one <saml:Attribute
+    /// Name="attr_name"> with one <saml:AttributeValue> per entry in `values`.
+    /// Pass the result as make_response's attribute_statement_xml parameter.
+    static std::string make_attribute_statement(const std::string& attr_name,
+                                                 const std::vector<std::string>& values) {
+        std::string value_elems;
+        for (const auto& v : values) {
+            value_elems += "<saml:AttributeValue>" + v + "</saml:AttributeValue>";
+        }
+        return "<saml:AttributeStatement>"
+                 "<saml:Attribute Name=\"" + attr_name + "\">"
+                   + value_elems +
+                 "</saml:Attribute>"
+               "</saml:AttributeStatement>";
     }
 
 private:
@@ -959,9 +977,275 @@ TEST_CASE("SAML ACS — valid signed SAMLResponse creates session with auth_sour
     REQUIRE_FALSE(events.empty());
     CHECK(events.front().action == "auth.saml_login");
     CHECK(events.front().result == "ok");
+    // No --saml-admin-group configured (thin-slice default) — audit must
+    // reflect the resolved "user" role, never a stale hard-coded value.
+    CHECK(events.front().principal_role == "user");
 
     // ── Step 9: Verify the Prometheus counter (review finding LOW) ───────────
     CHECK(fix.counter("yuzu_auth_saml_login_total", {{"result", "ok"}}) == 1.0);
+#endif
+}
+
+TEST_CASE("SAML ACS — assertion groups containing --saml-admin-group mint an admin session",
+          "[saml][auth_routes]") {
+#if defined(_WIN32)
+    SKIP("SamlProvider always disabled on Windows (N4)");
+#else
+    const auto& f = saml_test_fixture();
+
+    auto saml_cfg = f.make_config();
+    saml_cfg.group_attribute = "groups";
+    SamlProvider provider(std::move(saml_cfg));
+    REQUIRE(provider.is_enabled());
+
+    SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_admin_group = "admins";
+
+    auto start_res = fix.sink.Get("/auth/saml/start");
+    REQUIRE(start_res != nullptr);
+    REQUIRE(start_res->status == 302);
+    const auto redirect_location = start_res->get_header_value("Location");
+    REQUIRE_FALSE(redirect_location.empty());
+
+    std::string binding_secret;
+    {
+        const auto sc = start_res->get_header_value("Set-Cookie");
+        REQUIRE(sc.find("__Host-yuzu_saml_bind=") != std::string::npos);
+        const std::string pfx = "__Host-yuzu_saml_bind=";
+        const auto val_start = sc.find(pfx) + pfx.size();
+        const auto val_end   = sc.find(';', val_start);
+        binding_secret = sc.substr(val_start,
+            val_end == std::string::npos ? std::string::npos : val_end - val_start);
+    }
+    REQUIRE(binding_secret.size() == 64);
+
+    const auto request_id = extract_authn_request_id(redirect_location);
+    REQUIRE_FALSE(request_id.empty());
+
+    const std::string name_id = "admin_user@example.test";
+    const auto attr_stmt = SamlTestFixture::make_attribute_statement("groups", {"admins"});
+    const auto response_b64 =
+        f.make_response(request_id, name_id, 3600, {}, {}, false, nullptr, attr_stmt);
+
+    std::string encoded_response;
+    encoded_response.reserve(response_b64.size() + 16);
+    for (unsigned char c : response_b64) {
+        if (c == '+') {
+            encoded_response += "%2B";
+        } else {
+            encoded_response += static_cast<char>(c);
+        }
+    }
+    const auto form_body = "SAMLResponse=" + encoded_response + "&RelayState=%2F";
+
+    auto acs_res = fix.sink.dispatch(
+        "POST", "/saml/acs", form_body, "application/x-www-form-urlencoded",
+        {{"Cookie", "__Host-yuzu_saml_bind=" + binding_secret}});
+    REQUIRE(acs_res != nullptr);
+    CHECK(acs_res->status == 302);
+
+    std::string session_token;
+    {
+        const std::string tok_prefix = "yuzu_session=";
+        for (std::size_t i = 0; ; ++i) {
+            const auto sc = acs_res->get_header_value("Set-Cookie", "", i);
+            if (sc.empty()) break;
+            const auto pos = sc.find(tok_prefix);
+            if (pos == std::string::npos) continue;
+            const auto val_start = pos + tok_prefix.size();
+            const auto val_end   = sc.find(';', val_start);
+            session_token = sc.substr(val_start,
+                val_end == std::string::npos ? std::string::npos : val_end - val_start);
+            break;
+        }
+    }
+    REQUIRE_FALSE(session_token.empty());
+
+    auto maybe_session = fix.auth_mgr.validate_session(session_token);
+    REQUIRE(maybe_session.has_value());
+    CHECK(maybe_session->role == auth::Role::admin);
+    CHECK(maybe_session->username == name_id);
+
+    // Audit must reflect the RESOLVED admin role, not a hard-coded "user".
+    const auto events = fix.audit_events();
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.saml_login");
+    CHECK(events.front().result == "ok");
+    CHECK(events.front().principal_role == "admin");
+#endif
+}
+
+TEST_CASE("SAML ACS — assertion groups not containing --saml-admin-group mint a user session",
+          "[saml][auth_routes]") {
+#if defined(_WIN32)
+    SKIP("SamlProvider always disabled on Windows (N4)");
+#else
+    const auto& f = saml_test_fixture();
+
+    auto saml_cfg = f.make_config();
+    saml_cfg.group_attribute = "groups";
+    SamlProvider provider(std::move(saml_cfg));
+    REQUIRE(provider.is_enabled());
+
+    SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_admin_group = "admins";
+
+    auto start_res = fix.sink.Get("/auth/saml/start");
+    REQUIRE(start_res != nullptr);
+    REQUIRE(start_res->status == 302);
+    const auto redirect_location = start_res->get_header_value("Location");
+    REQUIRE_FALSE(redirect_location.empty());
+
+    std::string binding_secret;
+    {
+        const auto sc = start_res->get_header_value("Set-Cookie");
+        REQUIRE(sc.find("__Host-yuzu_saml_bind=") != std::string::npos);
+        const std::string pfx = "__Host-yuzu_saml_bind=";
+        const auto val_start = sc.find(pfx) + pfx.size();
+        const auto val_end   = sc.find(';', val_start);
+        binding_secret = sc.substr(val_start,
+            val_end == std::string::npos ? std::string::npos : val_end - val_start);
+    }
+    REQUIRE(binding_secret.size() == 64);
+
+    const auto request_id = extract_authn_request_id(redirect_location);
+    REQUIRE_FALSE(request_id.empty());
+
+    // Groups present but NOT the configured admin group — must NOT promote.
+    const std::string name_id = "plain_user@example.test";
+    const auto attr_stmt =
+        SamlTestFixture::make_attribute_statement("groups", {"engineering", "sales"});
+    const auto response_b64 =
+        f.make_response(request_id, name_id, 3600, {}, {}, false, nullptr, attr_stmt);
+
+    std::string encoded_response;
+    encoded_response.reserve(response_b64.size() + 16);
+    for (unsigned char c : response_b64) {
+        if (c == '+') {
+            encoded_response += "%2B";
+        } else {
+            encoded_response += static_cast<char>(c);
+        }
+    }
+    const auto form_body = "SAMLResponse=" + encoded_response + "&RelayState=%2F";
+
+    auto acs_res = fix.sink.dispatch(
+        "POST", "/saml/acs", form_body, "application/x-www-form-urlencoded",
+        {{"Cookie", "__Host-yuzu_saml_bind=" + binding_secret}});
+    REQUIRE(acs_res != nullptr);
+    CHECK(acs_res->status == 302);
+
+    std::string session_token;
+    {
+        const std::string tok_prefix = "yuzu_session=";
+        for (std::size_t i = 0; ; ++i) {
+            const auto sc = acs_res->get_header_value("Set-Cookie", "", i);
+            if (sc.empty()) break;
+            const auto pos = sc.find(tok_prefix);
+            if (pos == std::string::npos) continue;
+            const auto val_start = pos + tok_prefix.size();
+            const auto val_end   = sc.find(';', val_start);
+            session_token = sc.substr(val_start,
+                val_end == std::string::npos ? std::string::npos : val_end - val_start);
+            break;
+        }
+    }
+    REQUIRE_FALSE(session_token.empty());
+
+    auto maybe_session = fix.auth_mgr.validate_session(session_token);
+    REQUIRE(maybe_session.has_value());
+    CHECK(maybe_session->role == auth::Role::user);
+    CHECK(maybe_session->username == name_id);
+
+    const auto events = fix.audit_events();
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().principal_role == "user");
+#endif
+}
+
+TEST_CASE("SAML ACS — assertion with no AttributeStatement mints a user session even when "
+          "--saml-admin-group is configured",
+          "[saml][auth_routes]") {
+#if defined(_WIN32)
+    SKIP("SamlProvider always disabled on Windows (N4)");
+#else
+    const auto& f = saml_test_fixture();
+
+    // group_attribute IS configured but the assertion below carries no
+    // AttributeStatement at all — groups must resolve to empty, not error.
+    auto saml_cfg = f.make_config();
+    saml_cfg.group_attribute = "groups";
+    SamlProvider provider(std::move(saml_cfg));
+    REQUIRE(provider.is_enabled());
+
+    SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_admin_group = "admins";
+
+    auto start_res = fix.sink.Get("/auth/saml/start");
+    REQUIRE(start_res != nullptr);
+    REQUIRE(start_res->status == 302);
+    const auto redirect_location = start_res->get_header_value("Location");
+    REQUIRE_FALSE(redirect_location.empty());
+
+    std::string binding_secret;
+    {
+        const auto sc = start_res->get_header_value("Set-Cookie");
+        REQUIRE(sc.find("__Host-yuzu_saml_bind=") != std::string::npos);
+        const std::string pfx = "__Host-yuzu_saml_bind=";
+        const auto val_start = sc.find(pfx) + pfx.size();
+        const auto val_end   = sc.find(';', val_start);
+        binding_secret = sc.substr(val_start,
+            val_end == std::string::npos ? std::string::npos : val_end - val_start);
+    }
+    REQUIRE(binding_secret.size() == 64);
+
+    const auto request_id = extract_authn_request_id(redirect_location);
+    REQUIRE_FALSE(request_id.empty());
+
+    const std::string name_id = "no_groups_user@example.test";
+    const auto response_b64 = f.make_response(request_id, name_id); // no attribute_statement_xml
+
+    std::string encoded_response;
+    encoded_response.reserve(response_b64.size() + 16);
+    for (unsigned char c : response_b64) {
+        if (c == '+') {
+            encoded_response += "%2B";
+        } else {
+            encoded_response += static_cast<char>(c);
+        }
+    }
+    const auto form_body = "SAMLResponse=" + encoded_response + "&RelayState=%2F";
+
+    auto acs_res = fix.sink.dispatch(
+        "POST", "/saml/acs", form_body, "application/x-www-form-urlencoded",
+        {{"Cookie", "__Host-yuzu_saml_bind=" + binding_secret}});
+    REQUIRE(acs_res != nullptr);
+    CHECK(acs_res->status == 302);
+
+    std::string session_token;
+    {
+        const std::string tok_prefix = "yuzu_session=";
+        for (std::size_t i = 0; ; ++i) {
+            const auto sc = acs_res->get_header_value("Set-Cookie", "", i);
+            if (sc.empty()) break;
+            const auto pos = sc.find(tok_prefix);
+            if (pos == std::string::npos) continue;
+            const auto val_start = pos + tok_prefix.size();
+            const auto val_end   = sc.find(';', val_start);
+            session_token = sc.substr(val_start,
+                val_end == std::string::npos ? std::string::npos : val_end - val_start);
+            break;
+        }
+    }
+    REQUIRE_FALSE(session_token.empty());
+
+    auto maybe_session = fix.auth_mgr.validate_session(session_token);
+    REQUIRE(maybe_session.has_value());
+    CHECK(maybe_session->role == auth::Role::user);
+
+    const auto events = fix.audit_events();
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().principal_role == "user");
 #endif
 }
 

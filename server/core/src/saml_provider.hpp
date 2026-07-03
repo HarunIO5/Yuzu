@@ -25,8 +25,16 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace yuzu::server::saml {
+
+/// DoS guard on <AttributeStatement> parsing: at most this many group values
+/// are extracted from the configured group_attribute, across however many
+/// <Attribute Name="..."> elements carry that Name. Parsing stops once the
+/// cap is reached — remaining values (and remaining Attribute elements) are
+/// silently ignored rather than rejecting the whole assertion.
+inline constexpr std::size_t kMaxGroupValues = 64;
 
 /// Configuration for the SAML 2.0 SP. All string fields are UTF-8.
 struct SamlConfig {
@@ -36,13 +44,26 @@ struct SamlConfig {
     std::string sp_acs_url;     ///< SP Assertion Consumer Service URL
     std::string idp_cert_pem;   ///< PEM-encoded IdP signing certificate (PINNED KEY — N1)
     bool        enabled{false};
+
+    /// Name of the `<Attribute Name="...">` inside `<AttributeStatement>` whose
+    /// `<AttributeValue>` children are group identifiers (e.g. the Entra
+    /// `http://schemas.microsoft.com/ws/2008/06/identity/claims/groups` claim
+    /// URI). Empty (default) disables attribute parsing entirely — a SAML
+    /// deployment that never configures this behaves exactly like the thin
+    /// slice (SamlAssertion::groups always empty).
+    std::string group_attribute;
 };
 
 /// Claims extracted from a verified SAML assertion.
-/// attributes map is empty in this thin slice (follow-up: populate from AttributeStatement).
 struct SamlAssertion {
     std::string name_id;
-    // std::map<std::string, std::string> attributes; // follow-up
+
+    /// Group identifiers extracted from the configured `group_attribute`'s
+    /// `<AttributeValue>` children. Always empty when `SamlConfig::group_attribute`
+    /// is empty. Bounded to at most kMaxGroupValues entries (DoS guard).
+    /// Read from the SAME XSW-verified assertion node as name_id — never a
+    /// second document-wide search (see validate_response N2 discussion).
+    std::vector<std::string> groups;
 };
 
 /// SAML 2.0 SP verifier — pure library, no HTTP routes, no session minting.

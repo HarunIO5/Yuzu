@@ -2061,7 +2061,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 return;
             }
             saml_name_id  = result.value().name_id;
-            session_token = auth_mgr_.create_saml_session(saml_name_id);
+            session_token = auth_mgr_.create_saml_session(saml_name_id, result.value().groups,
+                                                           cfg_.saml_admin_group);
         } catch (const std::exception& e) {
             spdlog::error("SAML ACS: internal error during validation/session: {}", e.what());
             audit_log(req, "auth.saml_login_failed", "error", {}, {}, "internal error");
@@ -2083,7 +2084,16 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // Explicit-principal audit row — request lands at /saml/acs with no session
         // cookie yet, so the default resolve_session path would leave principal empty
         // (same rationale as the OIDC /auth/callback audit, Gate 4 consistency B3).
-        audit_log_for_principal(req, "auth.saml_login", "ok", saml_name_id, "user",
+        // Re-validate the freshly-minted session (mirrors the OIDC /auth/callback
+        // pattern) to capture the RESOLVED role — group-mapping may have made this
+        // login an admin — rather than hard-coding "user" and hiding an admin SAML
+        // login from the audit trail.
+        auto saml_effective_role = auth_mgr_.validate_session(session_token)
+                                       .transform([](const auth::Session& s) {
+                                           return auth::role_to_string(s.role);
+                                       })
+                                       .value_or(std::string{"user"});
+        audit_log_for_principal(req, "auth.saml_login", "ok", saml_name_id, saml_effective_role,
                                 "User", saml_name_id, "auth_source=saml");
         emit_event("auth.saml_login", req,
                    {{"source_ip", req.remote_addr},

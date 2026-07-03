@@ -366,11 +366,16 @@ public:
                                     std::chrono::steady_clock::time_point mfa_verified_at = {});
 
     /// Create an ephemeral session for a verified SAML assertion's NameID.
-    /// Thin slice: role defaults to `user` — no group→role mapping (deferred).
+    /// Role: admin if `groups` contains `admin_group` (exact match), user
+    /// otherwise — mirrors create_oidc_session's admin_group_id guard exactly.
+    /// Both `groups` and `admin_group` default-empty, so an unconfigured
+    /// deployment still mints `user` unconditionally (thin-slice-compatible).
     /// The session's `auth_source` is `"saml"`. `last_activity_at` is stamped
     /// per the standing invariant: any new session-creation site MUST stamp it
     /// or the idle-eviction gate will instantly expire the session (auth.hpp §78).
-    std::string create_saml_session(const std::string& name_id);
+    std::string create_saml_session(const std::string& name_id,
+                                    const std::vector<std::string>& groups = {},
+                                    const std::string& admin_group = {});
 
     const std::filesystem::path& config_path() const { return cfg_path_; }
 

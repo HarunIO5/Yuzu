@@ -811,7 +811,7 @@ Yuzu supports SAML 2.0 SP-initiated single sign-on as an alternative to OIDC for
 
 ### Configuration
 
-All five flags must be supplied for correct operation, and all five are validated at startup — a partial set leaves SAML disabled (fail-closed) until every flag is set.
+All five flags below must be supplied for correct operation, and all five are validated at startup — a partial set leaves SAML disabled (fail-closed) until every flag is set. The two group→role flags further down are optional and independent of this five-flag gate.
 
 | Flag | Env var | Description |
 |---|---|---|
@@ -834,9 +834,28 @@ Example startup:
   --saml-sp-acs-url    "https://yuzu.example.com/saml/acs"
 ```
 
+### Role mapping
+
+Two additional, optional flags grant admin access via IdP-attested group
+membership — mirroring the OIDC `--oidc-admin-group` mechanism:
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--saml-group-attribute` | `YUZU_SAML_GROUP_ATTRIBUTE` | `<Attribute Name="...">` in the assertion's `<AttributeStatement>` whose `<AttributeValue>`s are group identifiers. |
+| `--saml-admin-group` | `YUZU_SAML_ADMIN_GROUP` | The group value (from `--saml-group-attribute`) that grants `role=admin`. |
+
+A session is `role=admin` only when both flags are set and the assertion's
+group list contains an **exact match** for `--saml-admin-group`; otherwise
+(including when either flag is left empty, the default) the session is
+`role=user`. Group values are read from the same signature-verified assertion
+`NameID` is read from, and `NameID`/email/display name are never treated as
+group-membership evidence. Changing either flag requires a server restart
+(no hot-reload). JIT elevation remains non-functional for SAML users (no
+local `users` row in auth.db) regardless of role — a group-mapped admin gets
+`role=admin` directly at login, not via the elevation endpoint.
+
 ### Known limitations in this release
 
-- **Role:** All SAML users are permanently `role=user`. JIT elevation is non-functional for SAML users (no local `users` row in auth.db). For admin access, use OIDC or a local account.
 - **MFA step-up:** MFA step-up is not supported for SAML sessions — a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement`. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
 - **`--auth-mode=sso-only`:** Requires OIDC configuration. A SAML-only deployment cannot disable local-password login.
 - **HA / multi-replica:** Pending AuthnRequest state is in-process. Configure load-balancer sticky sessions (session affinity) on `/auth/saml/start` + `/saml/acs`. Without affinity, approximately `(N−1)/N` of logins fail as unsolicited. OIDC shares this limitation.

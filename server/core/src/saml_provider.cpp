@@ -351,6 +351,59 @@ static std::string get_text(xmlNodePtr node) {
     return s.substr(b, e - b + 1);
 }
 
+/// Extract group identifier values from the verified assertion's
+/// <AttributeStatement>/<Attribute Name="group_attribute">/<AttributeValue>
+/// text content.
+///
+/// SECURITY (N2 parity): reads ONLY from `assertion` — the SAME XSW-verified
+/// node that name_id is read from in validate_response — never a second
+/// XPath/search over the whole document. Callers MUST pass the single
+/// verified assertion node, never `root` or any other document-wide handle.
+///
+/// SAML core permits more than one <AttributeStatement> and more than one
+/// <Attribute> with the same Name; this walks all of them but ignores any
+/// <Attribute> whose Name does not exactly equal `group_attribute`.
+///
+/// DoS guard: stops once kMaxGroupValues values have been collected, so an
+/// attacker-signed or IdP-misconfigured assertion cannot force unbounded
+/// allocation (the overall response is also already size- and depth-capped
+/// upstream in validate_response).
+static std::vector<std::string> extract_group_values(xmlNodePtr assertion,
+                                                       const std::string& group_attribute) {
+    std::vector<std::string> groups;
+    if (group_attribute.empty()) return groups;
+
+    constexpr std::size_t kMax = yuzu::server::saml::kMaxGroupValues;
+
+    for (xmlNodePtr stmt = xmlFirstElementChild(assertion); stmt && groups.size() < kMax;
+         stmt = xmlNextElementSibling(stmt)) {
+        if (stmt->type != XML_ELEMENT_NODE || !stmt->name ||
+            !xmlStrEqual(stmt->name, BAD_CAST "AttributeStatement") || !stmt->ns ||
+            !stmt->ns->href || !xmlStrEqual(stmt->ns->href, BAD_CAST kSamlAssertionNs)) {
+            continue;
+        }
+        for (xmlNodePtr attr = xmlFirstElementChild(stmt); attr && groups.size() < kMax;
+             attr = xmlNextElementSibling(attr)) {
+            if (attr->type != XML_ELEMENT_NODE || !attr->name ||
+                !xmlStrEqual(attr->name, BAD_CAST "Attribute") || !attr->ns || !attr->ns->href ||
+                !xmlStrEqual(attr->ns->href, BAD_CAST kSamlAssertionNs)) {
+                continue;
+            }
+            if (get_attr(attr, "Name") != group_attribute) continue;
+            for (xmlNodePtr val = xmlFirstElementChild(attr); val && groups.size() < kMax;
+                 val = xmlNextElementSibling(val)) {
+                if (val->type != XML_ELEMENT_NODE || !val->name ||
+                    !xmlStrEqual(val->name, BAD_CAST "AttributeValue") || !val->ns ||
+                    !val->ns->href || !xmlStrEqual(val->ns->href, BAD_CAST kSamlAssertionNs)) {
+                    continue;
+                }
+                groups.push_back(get_text(val));
+            }
+        }
+    }
+    return groups;
+}
+
 /// Maximum element-nesting depth we will traverse in the XSW walks. libxml2
 /// already caps parse depth (XML_PARSE_HUGE is off → default 256), but we bound
 /// our own recursion explicitly so these walks are provably stack-safe
@@ -1041,8 +1094,15 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
         return std::unexpected("no NameID found in verified assertion");
     }
 
-    spdlog::info("SamlProvider: assertion accepted (name_id={})", name_id);
-    return SamlAssertion{std::move(name_id)};
+    // ── 15. Extract group attribute values (all reads from the verified
+    // 'assertion' node — see extract_group_values' N2 parity comment). Empty
+    // config_.group_attribute (the default) yields an empty groups vector,
+    // preserving the thin slice's behaviour exactly.
+    std::vector<std::string> groups = extract_group_values(assertion, config_.group_attribute);
+
+    spdlog::info("SamlProvider: assertion accepted (name_id={}, groups={})", name_id,
+                 groups.size());
+    return SamlAssertion{std::move(name_id), std::move(groups)};
 }
 
 // ── cleanup ───────────────────────────────────────────────────────────────────

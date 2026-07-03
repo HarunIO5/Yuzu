@@ -1020,6 +1020,7 @@ public:
                         saml_cfg.sp_entity_id   = cfg_.saml_sp_entity_id;
                         saml_cfg.sp_acs_url     = cfg_.saml_sp_acs_url;
                         saml_cfg.idp_cert_pem   = std::move(cert_pem);
+                        saml_cfg.group_attribute = cfg_.saml_group_attribute;
                         saml_cfg.enabled        = true;
                         // Construct in the single-threaded startup phase — xmlsec global init
                         // is not thread-safe; the std::call_once guard in saml_provider.cpp
