@@ -289,6 +289,40 @@ TEST_CASE("perf: Linux parse — memory fallback, overcommit gate, degrade paths
         auto c = parse_linux_perf_counters(kLinuxStat, "MemFree: 400 kB\n", "", "", "0\n", 1);
         CHECK(!c.valid);
     }
+    SECTION("non-numeric MemTotal token invalidates the reading — never half-parses") {
+        auto c = parse_linux_perf_counters(kLinuxStat, "MemTotal: abc kB\n", "", "", "0\n", 1);
+        CHECK(!c.valid);
+    }
+    SECTION("empty overcommit payload (masked /proc/sys) keeps commit populated") {
+        // The Linux shell feeds "" when the file is unreadable; anything that
+        // is not exactly "1" reads as not-always — fail-safe toward keeping
+        // the signal.
+        auto c = parse_linux_perf_counters(kLinuxStat, kLinuxMeminfo, "", "", "", 1);
+        REQUIRE(c.valid);
+        CHECK(c.commit_total_bytes == 9000000ULL * 1024);
+        CHECK(c.commit_limit_bytes == 12000000ULL * 1024);
+    }
+    SECTION("MemAvailable AND MemFree both absent: avail 0 (reads as 100% used) — deliberate") {
+        auto c = parse_linux_perf_counters(kLinuxStat, "MemTotal: 1000 kB\n", "", "", "0\n", 1);
+        REQUIRE(c.valid);
+        CHECK(c.mem_avail_bytes == 0);
+    }
+    SECTION("loopback-only netdev still sets net_valid — content was seen, sums stay 0") {
+        auto c = parse_linux_perf_counters(
+            kLinuxStat, kLinuxMeminfo, "",
+            "h1\nh2\n    lo: 1000 1 0 0 0 0 0 0 1000 1 0 0 0 0 0 0\n", "0\n", 1);
+        REQUIRE(c.valid);
+        CHECK(c.net_valid); // the false-spike guard depends on exactly this
+        CHECK(c.net_rx_bytes == 0);
+    }
+    SECTION("a diskstats row with exactly 11 fields is accepted") {
+        auto c = parse_linux_perf_counters(kLinuxStat, kLinuxMeminfo,
+                                           "8 0 sda 100 0 2000 30 50 0 1000 20\n", "", "0\n", 1);
+        REQUIRE(c.valid);
+        REQUIRE(c.disk_valid);
+        CHECK(c.disk_reads == 100);
+        CHECK(c.disk_write_time_100ns == 20ULL * 10'000);
+    }
     SECTION("malformed /proc/stat invalidates the reading (core read)") {
         auto c = parse_linux_perf_counters("garbage\n", kLinuxMeminfo, "", "", "0\n", 1);
         CHECK(!c.valid);
@@ -323,6 +357,8 @@ TEST_CASE("perf: Linux parse — memory fallback, overcommit gate, degrade paths
             "MemTotal: 1000 kB\r\nMemAvailable: 400 kB\r\n", "", "", "0\r\n", 1);
         REQUIRE(crlf.valid); // CRLF content parses normally
         CHECK(crlf.mem_total_bytes == 1000ULL * 1024);
+        CHECK(crlf.cpu_idle == 82000);  // CR never contaminates the CPU fields
+        CHECK(crlf.cpu_user == 14300);
     }
 }
 

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <cstddef>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -207,11 +208,12 @@ std::optional<ProcCounter> parse_linux_pid_stat(std::uint32_t pid, std::string_v
     const std::string_view comm = stat_content.substr(open + 1, close - open - 1);
     p.name.reserve(comm.size());
     for (const char ch : comm) {
+        const auto uc = static_cast<unsigned char>(ch);
         if (ch == '\\')
             p.name += "\\\\";
         else if (ch == '\n')
             p.name += "\\n";
-        else if (ch == '|' || static_cast<unsigned char>(ch) < 0x20)
+        else if (ch == '|' || uc < 0x20 || uc == 0x7f)
             p.name += '_';
         else
             p.name += ch;
@@ -475,7 +477,7 @@ void resolve_proc_versions(std::vector<ProcPerfSample>& samples,
 #include <cstring>
 #include <ctime>
 #include <fstream>
-#include <iterator>
+#include <memory>
 #include <string>
 
 namespace yuzu::tar {
@@ -486,24 +488,26 @@ ProcSnapshot read_proc_counters() {
     // Process-lifetime constants — thread-safe magic statics, fetched once.
     static const long clk = ::sysconf(_SC_CLK_TCK);
     static const long page = ::sysconf(_SC_PAGESIZE);
-    DIR* dir = ::opendir("/proc");
-    if (!dir || clk <= 0 || page <= 0) {
-        if (dir)
-            ::closedir(dir);
+    // RAII owner (the HandleGuard rationale): allocations inside the walk can
+    // throw bad_alloc, and a manual closedir after the loop would leak the fd
+    // on every such unwind — a repeatable per-tick leak, since the trigger
+    // engine catches and re-ticks.
+    const std::unique_ptr<DIR, int (*)(DIR*)> dir{::opendir("/proc"), &::closedir};
+    if (!dir || clk <= 0 || page <= 0)
         return snap; // valid stays false
-    }
     // One /proc/<pid>/stat read per numeric entry. Kernel threads are
     // deliberately INCLUDED (parity with Windows recording pid 4 `System`):
     // rss 0 keeps them out of the working-set top-N, and a genuinely hot
     // kworker surfacing in the CPU top-N is signal, not noise. A hidepid
     // mount just yields fewer rows — never an invalid snapshot. The path and
-    // content buffers are hoisted and reused so the ~hundreds-of-PIDs walk
-    // does not churn the heap every 30 s tick.
+    // content buffers are hoisted and refilled via chunked read() so the
+    // ~hundreds-of-PIDs walk reuses their capacity instead of churning the
+    // heap every 30 s tick.
     snap.procs.reserve(256);
     std::string path;
     std::string content;
     content.reserve(1024); // a pid stat payload is well under 1 KB
-    while (const dirent* de = ::readdir(dir)) {
+    while (const dirent* de = ::readdir(dir.get())) {
         std::uint32_t pid = 0;
         const char* name = de->d_name;
         const char* end = name + std::strlen(name);
@@ -514,11 +518,14 @@ ProcSnapshot read_proc_counters() {
         std::ifstream f(path);
         if (!f)
             continue; // pid exited between readdir and open — expected churn
-        content.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        char buf[1024];
+        content.clear();
+        while (f.read(buf, sizeof buf))
+            content.append(buf, static_cast<std::size_t>(f.gcount()));
+        content.append(buf, static_cast<std::size_t>(f.gcount()));
         if (auto pc = parse_linux_pid_stat(pid, content, clk, page))
             snap.procs.push_back(std::move(*pc));
     }
-    ::closedir(dir);
     snap.ncores = static_cast<int>(::sysconf(_SC_NPROCESSORS_ONLN));
     snap.valid = snap.ncores > 0 && !snap.procs.empty();
     return snap;

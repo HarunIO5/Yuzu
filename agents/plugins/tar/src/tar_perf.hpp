@@ -51,7 +51,9 @@ struct PerfCounters {
     // CPU, summed across cores, in a platform-consistent monotonic time unit
     // (100 ns on Windows, jiffies on Linux — derive_sample takes ratios only,
     // so the unit cancels). kernel INCLUDES idle (the GetSystemTimes contract;
-    // the Linux mapping reproduces it — see parse_linux_perf_counters).
+    // the Linux mapping reproduces it — see parse_linux_perf_counters). Any
+    // future platform (macOS host_statistics) can satisfy the contract the
+    // same way: cpu_idle = cpu_kernel = idle ticks, cpu_user = busy ticks.
     std::uint64_t cpu_idle{0};
     std::uint64_t cpu_kernel{0};
     std::uint64_t cpu_user{0};

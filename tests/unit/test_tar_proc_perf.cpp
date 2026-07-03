@@ -342,12 +342,36 @@ TEST_CASE("procperf: Linux pid-stat parse — field indices and unit conversions
 
     SECTION("clk_tck scaling") {
         const char* line = "1 (a) S 0 0 0 0 0 0 0 0 0 0 1500 1500 0 0 20 0 1 0 5000 0 10 0";
-        CHECK(parse_linux_pid_stat(1, line, 250, 4096)->cpu_100ns == 3000ULL * 40'000);
-        CHECK(parse_linux_pid_stat(1, line, 1000, 4096)->cpu_100ns == 3000ULL * 10'000);
+        const auto p250 = parse_linux_pid_stat(1, line, 250, 4096);
+        REQUIRE(p250);
+        CHECK(p250->cpu_100ns == 3000ULL * 40'000);
+        const auto p1000 = parse_linux_pid_stat(1, line, 1000, 4096);
+        REQUIRE(p1000);
+        CHECK(p1000->cpu_100ns == 3000ULL * 10'000);
     }
     SECTION("page-size scaling") {
         const char* line = "1 (a) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 1 0 10 0";
-        CHECK(parse_linux_pid_stat(1, line, 100, 16384)->ws_bytes == 10ULL * 16384);
+        const auto pp = parse_linux_pid_stat(1, line, 100, 16384);
+        REQUIRE(pp);
+        CHECK(pp->ws_bytes == 10ULL * 16384);
+    }
+    SECTION("negative rss clamps to 0; negative starttime rejects the row") {
+        const auto neg_rss = parse_linux_pid_stat(
+            1, "1 (a) S 0 0 0 0 0 0 0 0 0 0 5 5 0 0 20 0 1 0 5000 0 -1 0", 100, 4096);
+        REQUIRE(neg_rss);
+        CHECK(neg_rss->ws_bytes == 0);
+        // starttime parses as uint64 — "-1" fails full consumption → nullopt.
+        CHECK(!parse_linux_pid_stat(
+            1, "1 (a) S 0 0 0 0 0 0 0 0 0 0 5 5 0 0 20 0 1 0 -1 0 10 0", 100, 4096));
+    }
+    SECTION("empty comm \"()\" parses with an empty name — derive drops it, never a row") {
+        const auto p = parse_linux_pid_stat(
+            1, "1 () S 0 0 0 0 0 0 0 0 0 0 5 5 0 0 20 0 1 0 5000 0 10 0", 100, 4096);
+        REQUIRE(p);
+        CHECK(p->name.empty());
+    }
+    SECTION("reversed parens \")(\" is malformed — close before open rejects") {
+        CHECK(!parse_linux_pid_stat(1, "1 )( S 0 0 0 0 0", 100, 4096));
     }
 }
 
@@ -394,10 +418,10 @@ TEST_CASE("procperf: Linux comm is sanitized for the wire, escaped for the name 
     // inject separators into the pipe-delimited sql/export/app_perf formats;
     // '\' and '\n' must match the kernel's /proc status Name: escaping (what
     // the process source records) so the name join holds.
-    SECTION("pipe and control bytes become '_'") {
-        const auto p = parse_linux_pid_stat(9, std::string("9 (ev|l\tname)") + tail, 100, 4096);
+    SECTION("pipe, control bytes, and DEL become '_'") {
+        const auto p = parse_linux_pid_stat(9, std::string("9 (ev|l\tna\177me)") + tail, 100, 4096);
         REQUIRE(p);
-        CHECK(p->name == "ev_l_name");
+        CHECK(p->name == "ev_l_na_me");
     }
     SECTION("backslash doubles, newline becomes literal \\n — status Name: parity") {
         const auto p =
