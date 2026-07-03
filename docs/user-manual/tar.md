@@ -108,7 +108,8 @@ Use the `configure` action to adjust TAR behavior.
 | `perf_enabled` | `true` / `false` | `true` | Toggle the device performance sampler on this host |
 | `software_enabled` | `true` / `false` | **`false`** | Toggle the software install/uninstall source (`software` → `$Software_*`) on this host. **Off by default** (opt-in) — a cautious posture for a new capture source. On Windows it covers **machine-wide** installs (HKLM) only: **machine scope only, no user identity / no PII** — asset-management and vulnerability-relevance data like Services and User sessions. Set to `true` to opt in. Disabling leaves existing rows queryable. |
 | `procperf_enabled` | `true` / `false` | **`false`** | Toggle the per-application top-N sampler on this host. **Off by default** — per-application CPU/working-set reveals which applications run on a device, which is usage-class telemetry under the works-council posture (device-level `perf` carries no per-app identity and stays on by default). Set to `true` to opt in; independent of `perf_enabled`. |
-| `netqual_enabled` | `true` / `false` | **`false`** | Toggle the per-connection TCP-quality sampler (`netqual` source → `$NetQual_Live`) on this host. **Off by default** — per-connection quality is usage-class telemetry under the works-council posture. Only a coarse destination *class* (`loopback`/`private`/`public`) is stored; raw remote addresses are dropped at the edge and never persisted, and the owning process is recorded as its image name only. Linux only. Set to `true` to opt in; independent of `tcp_enabled`. |
+| `netqual_enabled` | `true` / `false` | **`false`** | Toggle the per-connection TCP-quality sampler (`netqual` source → `$NetQual_Live`, plus the per-boot retrospective baseline `$NetQual_Boot`) on this host. **Off by default** — per-connection quality is usage-class telemetry under the works-council posture. Only a coarse destination *class* (`loopback`/`private`/`public`) is stored; raw remote addresses are dropped at the edge and never persisted, and the owning process is recorded as its image name only. Linux, and Windows via TCP ESTATS (ADR-0020) — **Windows needs an elevated agent** (non-elevated records nothing; `tar.status` reports `netqual_capture_method|none`). Set to `true` to opt in; independent of `tcp_enabled`. |
+| `netconn_enabled` | `true` / `false` | **`false`** | Toggle the connectivity-transition source (`netconn` → `$NetConn_Live`, ADR-0020). **Off by default** (opt-in). Windows reads the OS-retained NetworkProfile / NCSI / WLAN-AutoConfig event logs, so the FIRST read backfills days-to-weeks of history from **before TAR was enabled** (or installed) — network connect/disconnect, internet-capability changes, Wi-Fi connect/fail/disconnect with reason codes. Only closed enum tokens and numeric reason codes are stored: **no SSID, BSSID, profile name, interface GUID, or MAC is ever extracted**. Linux/macOS are planned (schema registered, queryable-empty). Set to `true` to opt in. |
 | `module_enabled` | `true` / `false` | **`false`** | Toggle the image-load / module-stream capture source (`module` source → `$Module_*`). **Off by default** — module-load capture is high-volume usage-class telemetry (every DLL/dylib/`.so` load and driver/kext/kmod load per process, with a code-signing verdict) under the works-council posture. Loaded-image **directories are captured** (the search-order-hijack signal is the path) but the user-profile segment of a path is scrubbed at the edge (`C:\Users\<redacted>\…`); no command line is ever captured. **No data is recorded until a collector for the host's OS ships** — the `$Module_*` tables are queryable but return zero rows until then (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd; see [`tar-module-loads.md`](../tar-module-loads.md)). Set to `true` to opt in. |
 | `arp_enabled` | `true` / `false` | **`false`** | Toggle the ARP / neighbour-table capture source (`arp` source → `$ARP_Live`/`$ARP_Hourly`) on this host (ADR-0015). **Off by default** (opt-in). Captures IP↔MAC bindings per interface for Layer-2 adjacency / ARP-spoofing forensics. **Windows only today** (`GetIpNetTable2`); Linux/macOS are planned (schema registered, queryable-empty). Set to `true` to opt in; collected at `fast_interval`. |
 | `dns_enabled` | `true` / `false` | **`false`** | Toggle the DNS resolver-cache capture source (`dns` source → `$DNS_Live`/`$DNS_Hourly`) on this host (ADR-0015). **Off by default** — the DNS cache reveals which domains a host resolved (**usage-class telemetry under the works-council posture; enabling is audited**). **Device-level state only — no per-process attribution** (the cache carries no PID). **Windows only today** (`DnsGetCacheDataTable`, cache-only — never issues a wire query); Linux/macOS planned. Set to `true` to opt in; collected at `fast_interval`. |
@@ -254,8 +255,12 @@ config|software_last_run_ts|1711050000
 
 A block is emitted for every capture source. The opt-in sources report
 `<source>_enabled|false` on a fresh agent — `module`, `software` (both shown
-above), `procperf`, `netqual`, `arp`, and `dns` are off by default and must be
-enabled explicitly via `configure` (see the configuration table above). The
+above), `procperf`, `netqual`, `netconn`, `arp`, and `dns` are off by default and
+must be enabled explicitly via `configure` (see the configuration table above).
+`netqual_capture_method` reports the per-connection quality mechanism actually
+in effect — `inetdiag` (Linux), `estats` (Windows, elevated agent), or `none`
+(Windows non-elevated, macOS) — so "opted in but the agent can't collect" is
+distinguishable from "off". The
 default-ON sources — `process`, `tcp`, `service`, `user`, and `perf` — report
 `<source>_enabled|true`. `module_live_rows` stays `0` until a collector for the
 host's OS ships; likewise `arp`/`dns` are **Windows-only today** (planned on
@@ -382,8 +387,9 @@ TAR is designed for minimal performance overhead:
 > because it is usage-class data subject to works-council/DPA review (see
 > `docs/enterprise-readiness-soc2-first-customer.md`). To enable it, set
 > `procperf_enabled=true` via the `configure` action (fleet-wide or per-device).
-> The same applies to `netqual_enabled` (per-connection TCP quality, Linux) and
-> `module_enabled` (image-load capture) — both ship **off by default**. On
+> The same applies to `netqual_enabled` (per-connection TCP quality, Linux +
+> Windows) and `module_enabled` (image-load capture) — both ship **off by
+> default**. On
 > upgrade to this release `tar.status` now correctly reports these opt-in
 > sources as `<source>_enabled|false` on an agent that has never set them (a
 > previous release misreported them as `true` even though nothing was being

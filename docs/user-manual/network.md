@@ -129,7 +129,19 @@ warehouse** as `$NetQual_Live`. It is governed independently of the heartbeat:
 - **On-device.** These rows stay in the local warehouse (queryable via the
   Execute-gated TAR SQL surface as `$NetQual_Live`); they are not shipped to the
   server. A per-tick top-N cap and a row-count retention ceiling bound storage.
-- **Linux only** in this version.
+- **Linux and Windows.** Linux reads netlink INET_DIAG; Windows reads TCP ESTATS
+  (ADR-0020) and **requires an elevated agent** — non-elevated it records
+  nothing and `tar.status` reports `netqual_capture_method|none`. Windows RTT is
+  ms-resolution and `retrans`/`segs_out` count from first observation of the
+  connection, not connection start (constraints listed in the compatibility
+  matrix). macOS is planned.
+- **Retrospective companions (ADR-0020).** `$NetQual_Boot` records one row per
+  boot from since-boot OS counters — a coarse "network quality before TAR was
+  running this boot" baseline — and the separate opt-in **`netconn`** source
+  (`$NetConn_Live`, `netconn_enabled`) backfills OS-retained connectivity
+  transitions (connect/disconnect, internet-capability changes, Wi-Fi drops with
+  reason codes) reaching days-to-weeks before TAR existed on the box, storing
+  enum tokens and reason codes only.
 
 This tier has no dashboard consumer yet — it is the foundation for the deferred
 per-destination drill. See the [TAR dashboard](tar.md) for the query surface.

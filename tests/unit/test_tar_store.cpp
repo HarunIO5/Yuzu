@@ -7,6 +7,7 @@
 
 #include "tar_db.hpp"
 #include "tar_netqual.hpp"
+#include "tar_netqual_boot.hpp"
 #include "tar_sql_executor.hpp"
 #include "test_helpers.hpp"
 
@@ -14,6 +15,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -954,6 +956,100 @@ TEST_CASE("netqual: select_netqual_rows with cap=0 keeps everything", "[tar][net
     }
     auto rows = select_netqual_rows(samples, 1, 1, /*cap=*/0);
     CHECK(rows.size() == 5);
+}
+
+TEST_CASE("netqual: collect_netqual_boot per-platform contract", "[tar][netqual]") {
+    // Pattern: test_tar_proc_etw.cpp — the collector compiles everywhere;
+    // Windows reads the real since-boot counters, elsewhere the no-op contract
+    // is pinned. Counter VALUES are host-dependent; assert shape, not history.
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    auto row = yuzu::tar::collect_netqual_boot(now);
+#ifdef _WIN32
+    REQUIRE(row.has_value());
+    CHECK(row->ts == now);
+    CHECK(row->boot_ts > 0);
+    CHECK(row->boot_ts <= now);
+    CHECK(row->window_s == now - row->boot_ts);
+    // Any live Windows host has sent TCP segments by the time tests run.
+    CHECK(row->segs_out > 0);
+    CHECK(row->retrans_segs >= 0);
+    CHECK(row->snapshot_id == 0); // the caller's to fill
+    // ...and the row round-trips into the warehouse tier.
+    auto t = make_test_db();
+    row->snapshot_id = 7;
+    REQUIRE(t.db.insert_netqual_boot_row(*row));
+    auto res = t.db.execute_query("SELECT boot_ts, window_s, segs_out FROM netqual_boot");
+    REQUIRE(res.has_value());
+    REQUIRE(res->rows.size() == 1);
+    CHECK(res->rows[0][0] == std::to_string(row->boot_ts));
+#else
+    CHECK_FALSE(row.has_value()); // Linux/macOS baselines are a follow-up
+#endif
+}
+
+TEST_CASE("netqual: nq_win_ca_state severity precedence", "[tar][netqual]") {
+    using yuzu::tar::NqPathDeltas;
+    using yuzu::tar::nq_win_ca_state;
+
+    CHECK(nq_win_ca_state({}) == 0); // no signals => Open
+
+    // Each signal alone maps to its state.
+    CHECK(nq_win_ca_state({.dup_acks_in = 3}) == 1);                      // Disorder
+    CHECK(nq_win_ca_state({.ecn_signals = 1}) == 2);                      // CWR
+    CHECK(nq_win_ca_state({.pkts_retrans = 2}) == 3);                     // Recovery
+    CHECK(nq_win_ca_state({.fast_retran = 1}) == 3);                      // Recovery
+    CHECK(nq_win_ca_state({.timeouts = 1}) == 4);                         // Loss (RTO fired)
+    CHECK(nq_win_ca_state({.cur_timeout_count = 1}) == 4);                // Loss (RTO in progress)
+
+    // Precedence: the most severe signal wins when several fire in one tick.
+    CHECK(nq_win_ca_state({.timeouts = 1, .fast_retran = 5, .pkts_retrans = 9,
+                           .dup_acks_in = 20, .ecn_signals = 2}) == 4);
+    CHECK(nq_win_ca_state({.fast_retran = 1, .dup_acks_in = 20, .ecn_signals = 2}) == 3);
+    CHECK(nq_win_ca_state({.dup_acks_in = 20, .ecn_signals = 2}) == 2);
+}
+
+TEST_CASE("netqual: nq_win_build_sample scales ms->us, deltas lost, clamps wrap",
+          "[tar][netqual]") {
+    using yuzu::tar::NqWinCounters;
+    using yuzu::tar::nq_win_build_sample;
+
+    NqWinCounters prev;
+    prev.pkts_retrans = 10;
+    prev.timeouts = 1;
+    prev.segs_out = 1000;
+
+    NqWinCounters cur;
+    cur.smoothed_rtt_ms = 42;
+    cur.rtt_var_ms = 7;
+    cur.pkts_retrans = 14; // +4 this tick
+    cur.timeouts = 1;      // unchanged
+    cur.segs_out = 5000;
+
+    auto s = nq_win_build_sample(cur, prev, "tcp", "203.0.113.9", "edge");
+    CHECK(s.proto == "tcp");
+    CHECK(s.remote_addr == "203.0.113.9"); // raw here — select_netqual_rows buckets it away
+    CHECK(s.process_name == "edge");
+    CHECK(s.rtt_us == 42000); // ESTATS ms -> schema µs
+    CHECK(s.rtt_var_us == 7000);
+    CHECK(s.lost == 4);       // delta, not cumulative
+    CHECK(s.retrans == 14);   // cumulative since stats-enable — context
+    CHECK(s.segs_out == 5000);
+    CHECK(s.ca_state == 3);   // retrans activity, no new/live RTO => Recovery
+
+    // Counter reset/wrap (another ESTATS consumer toggled collection): negative
+    // deltas clamp to 0 — "unknown this tick", never a bogus loss spike.
+    NqWinCounters reset; // all-zero cur vs non-zero prev
+    auto z = nq_win_build_sample(reset, cur, "tcp6", "2001:db8::1", "svc");
+    CHECK(z.lost == 0);
+    CHECK(z.ca_state == 0);
+
+    // A live RTO episode (cur_timeout_count gauge) forces Loss even with no
+    // completed-timeout delta.
+    NqWinCounters rto = cur;
+    rto.cur_timeout_count = 2;
+    CHECK(nq_win_build_sample(rto, cur, "tcp", "198.51.100.2", "db").ca_state == 4);
 }
 
 TEST_CASE("TarDatabase: insert_netqual_samples returns false (no crash) when the table is gone",

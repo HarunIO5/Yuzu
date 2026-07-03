@@ -427,10 +427,14 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "`ss -ti` uses — no packet capture, no CAP_NET_ADMIN: a "
                  "non-root agent reads system TCP_INFO), joined to the "
                  "connection's owning process by 4-tuple."},
-                {"windows", OsSupportStatus::kPlanned,   "estats",
-                 "ESTATS (GetPerTcpConnectionEStats) for smoothed RTT, or the "
-                 "Microsoft-Windows-TCPIP ETW provider for retransmit/loss — "
-                 "the mechanism is a spike (see /network design)."},
+                {"windows", OsSupportStatus::kSupportedConstrained, "estats",
+                 "TCP ESTATS (Get/SetPerTcpConnectionEStats) over the "
+                 "ESTABLISHED table (ADR-0020). Constraints: enabling stats is "
+                 "admin-only, so a non-elevated agent records NOTHING (status "
+                 "reports netqual_capture_method=none); RTT is ms-resolution "
+                 "(sub-ms LAN RTTs read 0); retrans/segs_out count since "
+                 "stats-enable, not connection start; lost/ca_state are "
+                 "delta-derived approximations of the Linux gauges."},
                 {"macos",   OsSupportStatus::kPlanned,   "nstat",
                  "per-socket tcp_connection_info via the private nstat / "
                  "PRIVATE_TCP_INFO path."},
@@ -455,6 +459,36 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"retrans",       "INTEGER"},
                         {"segs_out",      "INTEGER"},
                         {"ca_state",      "INTEGER"},
+                    },
+                },
+                // Boot baseline (ADR-0020): ONE row per boot, written at plugin
+                // init from cumulative-since-boot OS counters (Windows:
+                // GetTcpStatisticsEx2 v4+v6 + GetIfTable2 non-loopback totals).
+                // It summarizes network quality over the window BEFORE TAR was
+                // running this boot (window_s = ts - boot_ts) — no provisioning,
+                // no elevation. SIGNAL DISCIPLINE: a since-boot retrans/segs
+                // ratio is coarse retrospective CONTEXT, never a current-loss
+                // verdict (the device-aggregate ratio was disproven for live
+                // signals — see NetQualRow). No rollup; `boot` is not a rollup
+                // suffix, so the aggregator skips it and retention orders by ts.
+                {
+                    .suffix = "boot",
+                    .retention_type = RetentionType::kRowCount,
+                    .retention_default = 400, // ~a year of daily reboots
+                    .columns = {
+                        {"ts",              "INTEGER"}, // t_live (agent start)
+                        {"snapshot_id",     "INTEGER"},
+                        {"boot_ts",         "INTEGER"},
+                        {"window_s",        "INTEGER"}, // pre-TAR window length
+                        {"retrans_segs",    "INTEGER"}, // since boot, v4+v6
+                        {"segs_out",        "INTEGER"}, // since boot, v4+v6
+                        {"estab_resets",    "INTEGER"},
+                        {"if_in_errors",    "INTEGER"}, // non-loopback totals
+                        {"if_in_discards",  "INTEGER"},
+                        {"if_out_errors",   "INTEGER"},
+                        {"if_out_discards", "INTEGER"},
+                        {"if_in_octets",    "INTEGER"},
+                        {"if_out_octets",   "INTEGER"},
                     },
                 },
             },
@@ -750,6 +784,58 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"record_type",  "TEXT"},
                         {"appear_count", "INTEGER"},
                         {"remove_count", "INTEGER"},
+                    },
+                },
+            },
+        },
+
+        // ── netconn (ADR-0020 — connectivity-transition timeline) ─────────
+        // One row per OS-logged network transition: network connect/disconnect
+        // (NetworkProfile 10000/10001), NCSI internet-capability changes
+        // (4042), Wi-Fi connect/fail/disconnect + reason (WLAN-AutoConfig
+        // 8001/8002/8003). Windows reads the OS-RETAINED operational event
+        // logs (EvtQuery), so the first backfill reaches days-to-weeks BEFORE
+        // TAR — or the agent — existed on the box: this is the retrospective
+        // "was the network flapping before we started watching?" source.
+        // PRIVACY: an allow-list parser extracts ONLY the enum/numeric fields
+        // below; SSID, BSSID, profile names, interface GUIDs and MACs are
+        // never extracted and the raw event XML is never persisted (stricter
+        // than the wifi plugin — this table ships fleet-wide). Opt-in like
+        // every usage-class source.
+        {
+            .name = "netconn",
+            .dollar_name = "NetConn",
+            .default_enabled = false,
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported, "wevtapi",
+                 "EvtQuery over the NetworkProfile / NCSI / WLAN-AutoConfig "
+                 "operational channels (default-enabled ~1MB circular logs — "
+                 "history depth is event-rate-dependent, typically days to "
+                 "weeks). Backfill at init from the last high-water mark, "
+                 "incremental reads on the slow cadence. A missing or "
+                 "ACL-denied channel degrades to fewer rows, never an error."},
+                {"linux",   OsSupportStatus::kPlanned,   "journald",
+                 "NetworkManager / systemd-networkd connectivity transitions "
+                 "from the journal."},
+                {"macos",   OsSupportStatus::kPlanned,   "oslog",
+                 "configd/Wi-Fi subsystem transitions via OSLog."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    .retention_default = 20000,
+                    .columns = {
+                        {"ts",          "INTEGER"},
+                        {"snapshot_id", "INTEGER"},
+                        {"action",      "TEXT"}, // connected/disconnected/wifi_connected/
+                                                 // wifi_connect_failed/wifi_disconnected/
+                                                 // capability_changed
+                        {"channel",     "TEXT"}, // networkprofile/ncsi/wlan
+                        {"category",    "TEXT"}, // public/private/domain ("" when n/a)
+                        {"capability",  "TEXT"}, // none/local/internet ("" when n/a)
+                        {"iface_kind",  "TEXT"}, // wifi ("" when unknown)
+                        {"reason_code", "INTEGER"}, // WLAN reason / NCSI change reason
                     },
                 },
             },

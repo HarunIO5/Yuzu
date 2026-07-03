@@ -181,6 +181,8 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('wintrust') # tar_module_etw.cpp WinVerifyTrust
   tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CryptQueryObject
   tar_test_deps += cxx.find_library('version')  # tar_proc_perf.cpp GetFileVersionInfoW
+  tar_test_deps += cxx.find_library('wevtapi')  # tar_netconn_win.cpp EvtQuery/EvtRender
+  tar_test_deps += cxx.find_library('ws2_32')   # tar_netqual_boot.cpp winsock2 deps
 elif host_machine.system() == 'darwin'
   # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
   # audit-token helpers, gated on the framework being present (full Xcode SDK).
@@ -200,6 +202,7 @@ tar_test_exe = executable(
   'yuzu_tar_tests',
   files(
     'unit/test_tar_diff.cpp',
+    'unit/test_tar_netconn.cpp',
     'unit/test_tar_software.cpp',
     'unit/test_tar_store.cpp',
     'unit/test_tar_schema_registry.cpp',
@@ -226,6 +229,8 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_proc_etw.cpp',
     '../agents/plugins/tar/src/tar_proc_es.cpp',
     '../agents/plugins/tar/src/tar_module_etw.cpp',
+    '../agents/plugins/tar/src/tar_netqual_boot.cpp',
+    '../agents/plugins/tar/src/tar_netconn_win.cpp',
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [

@@ -480,7 +480,12 @@ TEST_CASE("TAR #538: every registered capture source is classified by diff_state
     // module is a stream-drained source (EventRing, like the process ETW/ES
     // stream) with no snapshot-diff baseline, so diff_state_key("module") is
     // empty and disabling it is a state no-op — non-diff, same as perf/netqual.
-    const std::set<std::string_view> non_diff_sources = {"perf", "procperf", "netqual", "module"};
+    // netconn (ADR-0020) is high-water-mark based: its only state is the
+    // netconn_backfill_hwm config key, and keeping it across a disable is the
+    // FEATURE (the OS event log retains the paused window, so a re-enable
+    // recovers it losslessly — no ghost events possible, nothing to clear).
+    const std::set<std::string_view> non_diff_sources = {"perf", "procperf", "netqual", "module",
+                                                          "netconn"};
 
     for (const auto& src : capture_sources()) {
         const bool is_diff = diff_sources.contains(src.name);
