@@ -209,15 +209,35 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   full admin), so — unlike the other step-up sites where the actor is already
   admin — an eligible operator with no enrolled second factor is refused (403,
   `role.elevation.denied`). Sets
-  `Session::elevated_until = now + min(duration, --jit-max-elevation-secs)`
+  `Session::elevated_until = min(now + min(duration, --jit-max-elevation-secs), session.expires_at)`
   (default cap 1h, max 24h; an absent/0 `duration_secs` defaults to the cap, a
-  negative one is a 400, a present-but-wrong-typed field is a 400). The
-  justification is sanitised (control bytes incl. DEL → space) and capped (1 KiB)
-  into the audit detail. The `role.elevation.granted` audit is **fail-closed**:
-  if it can't persist, the elevation is rolled back (compensating
-  `revoke_elevation`) and the call 500s with `Sec-Audit-Failed` — a privileged
-  activation never stands without a record. Audits `role.elevation.granted`
-  (justification + duration); `role.elevation.denied` for an ineligible /
+  negative one is a 400, a present-but-wrong-typed field is a 400). **The window
+  is also clamped to the session's own absolute `expires_at`** (follow-up B,
+  shipped) — an elevation can never outlive the cookie session that carries it,
+  even when the requested/capped duration would otherwise extend past it.
+  **A session already AT or PAST its own `expires_at` — e.g. one that crosses
+  its absolute lifetime in the window between `validate_session` and
+  `elevate_session` — is REJECTED (401), not granted a zero-or-negative-length
+  window** (governance hardening round, UP-1/UP-4 dead-window guard): a `200
+  ok` response with `expires_in:0` would mislead a scripted caller into
+  believing it holds admin, and the lapsed window would later mint a spurious
+  `role.elevation.expired` for privilege that was never actually conferred.
+  `AuthManager::elevate_session` computes this and leaves the session
+  unmutated when it applies; the handler's existing nullopt→401 path (already
+  used for "session vanished between validate and elevate") covers it, no
+  separate branch needed. The response reports the TRUE remaining time as
+  `expires_in` (seconds, computed after any clamp — always `<=` the
+  requested/capped duration) alongside an absolute `expires_at` (RFC3339 UTC —
+  a `system_clock` projection of the `steady_clock`-tracked remaining
+  duration, since `elevated_until` itself has no wall-clock meaning
+  off-process). The justification is sanitised (control bytes incl. DEL →
+  space) and capped (1 KiB) into the audit detail. The `role.elevation.granted`
+  audit is **fail-closed**: if it can't persist, the elevation is rolled back
+  (compensating `revoke_elevation`) and the call 500s with `Sec-Audit-Failed`
+  — a privileged activation never stands without a record. Audits
+  `role.elevation.granted` (justification + the true post-clamp duration +
+  `expires_at` — kept in sync across the audit row, the JSON response, and the
+  analytics event); `role.elevation.denied` for an ineligible /
   failed-eligibility / not-MFA-enrolled caller.
 - **Effective role** — `auth::effective_role(session)` returns `admin` while
   `steady_clock::now() < elevated_until`, else the base `role`. THE authorization
@@ -238,11 +258,36 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   gated on the OIDC `amr` MFA assertion (so an IdP-MFA'd SSO operator can elevate
   without a local TOTP) is a tracked follow-up.
 - **Step-down** — `POST /api/v1/elevate/revoke` clears the window
-  (`role.elevation.revoked`). Passive expiry on lapse is implicit from the
-  `granted` row + its `duration_secs` (no separate `role.elevation.expired` event
-  in v1 — there is no natural hook for a passive timer; a lazy/reaper-emitted
-  expiry row is a tracked follow-up). Implementation: `Session::elevated_until` +
-  `AuthManager::elevate_session`/`revoke_elevation` (auth.cpp); the three
+  (`role.elevation.revoked`). **Passive expiry on lapse is now audited too
+  (follow-up A, shipped)** — `role.elevation.expired` — but LAZILY, not via a
+  background reaper thread: there is no standing timer, so the row is emitted
+  by `AuthManager::reap_expired_elevation` at the `AuthRoutes::resolve_session`
+  cookie chokepoint, on the FIRST authenticated request the operator makes
+  *after* the window has lapsed. `elevated_until` is cleared to the sentinel on
+  that first observing call, so emission is exactly-once — a request that finds
+  the sentinel already cleared (a prior reap, or a manual
+  `revoke_elevation`/`revoke_user_elevations`, which clear to the same
+  sentinel) emits nothing, so a manual step-down never ALSO produces a spurious
+  `expired` row. **The `role.elevation.expired` emission is itself best-effort
+  / at-most-once** (governance hardening round, UP-3): `elevated_until` is
+  cleared to the sentinel BEFORE the audit call, so a store failure loses only
+  the confirmatory `expired` row, never the reap itself (the session still
+  correctly reverts to base role) — and the window's end remains
+  reconstructible from the earlier, fail-closed `role.elevation.granted` row's
+  `duration_secs`/`expires_at`. **Boundary: an operator who elevates and never
+  issues another authenticated request before abandoning the session (closing
+  the browser, letting the tab idle) never triggers the lazy reap** — there is
+  no event for that lapse, only the deterministic `granted` row + its
+  `duration_secs`/`expires_at`, from which the window's end is still
+  computable for audit reconstruction. **The same boundary applies to idle
+  (inactivity) eviction** — see "Inactivity session timeout" below: if the
+  idle reaper evicts the session (erases it from `sessions_`) before the
+  operator's next request, that request never reaches `resolve_session`'s
+  cookie-found branch at all, so the lazy reap likewise never fires; the
+  window's end is, again, reconstructible from the `granted` row rather than
+  from a live `expired` event. Implementation: `Session::elevated_until` +
+  `AuthManager::elevate_session`/`revoke_elevation`/`reap_expired_elevation`
+  (auth.cpp); the three
   endpoints in `auth_routes.cpp`; `Config::jit_max_elevation_secs`.
 
 ## Hardened mode (sso-only) + break-glass (SOC 2 CC6.3/CC6.6)
@@ -319,6 +364,194 @@ pre-check and `verify_password`); accessors `AuthDB::break_glass_status` /
 `break_glass_user` / `break_glass_window_secs` in `server.hpp`. Tests:
 `tests/unit/server/test_auth_break_glass.cpp` (DB accessors) +
 `test_auth_routes_hardened.cpp` (wire path).
+
+## SAML 2.0 SP
+
+`/auth-and-authz` skill gap matrix P1 #6. Thin first slice: SP-initiated login
+against a single, statically-pinned IdP. Mirrors the OIDC SSO session seam
+(same cookie / `auth_source` / RBAC funnel) but uses the SAML 2.0 protocol.
+**Linux and macOS only — SAML is unsupported on Windows builds and fails closed
+there** (a Windows server logs an error at startup and does not enable SAML
+regardless of flag values).
+
+### Configuration
+
+SAML is enabled only when **all five flags** below are set; supplying any
+subset produces a startup warning (naming the missing flag) and SAML is
+disabled (fail-closed). All five are validated at startup as one unit — a
+partial configuration never yields a "SAML SP initialized" log.
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--saml-idp-entity-id` | `YUZU_SAML_IDP_ENTITY_ID` | Entity ID URI of the IdP (e.g. `https://idp.example.com/saml`) |
+| `--saml-idp-sso-url` | `YUZU_SAML_IDP_SSO_URL` | IdP's HTTP-Redirect SSO endpoint URL |
+| `--saml-idp-cert` | `YUZU_SAML_IDP_CERT` | Filesystem path to the IdP's signing certificate (PEM) |
+| `--saml-sp-entity-id` | `YUZU_SAML_SP_ENTITY_ID` | Entity ID URI the SP advertises to the IdP |
+| `--saml-sp-acs-url` | `YUZU_SAML_SP_ACS_URL` | Full URL of this server's Assertion Consumer Service (`POST /saml/acs`) |
+
+Example startup:
+
+```bash
+./yuzu-server \
+  --https-cert         /etc/yuzu/server.crt \
+  --https-key          /etc/yuzu/server.key \
+  --saml-idp-entity-id "https://idp.example.com/saml" \
+  --saml-idp-sso-url   "https://idp.example.com/saml/sso" \
+  --saml-idp-cert      /etc/yuzu/idp-signing.pem \
+  --saml-sp-entity-id  "https://yuzu.example.com" \
+  --saml-sp-acs-url    "https://yuzu.example.com/saml/acs"
+```
+
+> **HTTPS is required.** The `__Host-yuzu_saml_bind` browser-binding cookie is
+> `Secure`-only; browsers silently drop `Secure` cookies over plain HTTP. If
+> `--https-cert`/`--https-key` are not configured, the server logs an error at
+> startup and leaves SAML disabled (fail-closed). Do not run SAML over HTTP.
+
+### Login flow
+
+SP-initiated via HTTP-Redirect binding; assertion consumed via HTTP-POST
+binding.
+
+1. The operator navigates to `GET /auth/saml/start`. There is no "Sign in with
+   SAML" button on the login page in this release — the login-page SSO button
+   for SAML is a deferred item (see Deferred items below).
+2. The server builds a `<samlp:AuthnRequest>` (SP entity ID, ACS URL,
+   `ID`=random, `IssueInstant`, `ForceAuthn=false`) and redirects the browser
+   to the IdP's SSO URL via HTTP-Redirect binding (deflate-compressed,
+   URL-encoded `SAMLRequest` query parameter). **AuthnRequest signing is not
+   implemented in this slice** — the request is unsigned.
+3. The user authenticates at the IdP.
+4. The IdP POSTs a `<samlp:Response>` containing a signed `<saml:Assertion>`
+   to the ACS endpoint (`POST /saml/acs`).
+5. The server validates the response (see Security posture below) and, on
+   success, mints an ephemeral session cookie.
+
+```
+Browser           Yuzu Server               IdP
+  |                    |                          |
+  |-- GET /auth/saml/start -->                    |
+  |                    |-- 302 SAMLRequest? ---->|
+  |                    |                          |
+  |                    |      (user authenticates)|
+  |                    |                          |
+  |                    |<--- POST /saml/acs ------|
+  |<-- Set-Cookie -----|                          |
+```
+
+### Session
+
+The minted session is **in-memory and ephemeral** (lost on server restart,
+identical lifetime to OIDC sessions — 8-hour absolute, subject to
+`--session-inactivity-secs`). Session fields:
+
+- `auth_source = "saml"`
+- `role = user` for all SAML logins in this slice — **no group→role mapping is
+  implemented**. **SAML-authenticated users are permanently `role=user` in this
+  release; there is no admin path for them.** JIT elevation is non-functional
+  for SAML users: the elevation endpoint checks `is_elevation_eligible` and
+  `mfa_status` in `auth.db`, and SAML users have no row in the local `users`
+  table — both lookups fail-closed and the elevation is denied. For admin
+  access use OIDC or a local account.
+
+### Audit actions
+
+| Action | Result | When |
+|---|---|---|
+| `auth.saml_login` | `ok` | ACS validation passed; session minted |
+| `auth.saml_login_failed` | `error` | ACS validation failed (signature, audience, expiry, replay, etc.) |
+
+### Security posture
+
+- **Assertion signature verified against the pinned IdP cert only.** The cert
+  at `--saml-idp-cert` is the sole trusted signing authority. In-document
+  `<KeyInfo>` values are ignored — the IdP cannot nominate its own trust
+  anchor.
+- **XML signature-wrapping (XSW) defended.** The server locates the signed
+  element by `ID` attribute and verifies that the element under the
+  `<Signature>` is the one that was actually consumed, preventing a wrapped
+  unsigned sibling from being treated as validated.
+- **Audience validated.** The `<saml:AudienceRestriction>` must include
+  `--saml-sp-entity-id`.
+- **Recipient validated.** The `<saml:SubjectConfirmationData Recipient>` must
+  equal `--saml-sp-acs-url`.
+- **Expiry validated.** `NotOnOrAfter` on `<saml:Conditions>` and
+  `<saml:SubjectConfirmationData>` are enforced.
+- **Solicited-only + single-use `InResponseTo` (replay-protected).** The
+  server generates a random `ID` for each `AuthnRequest`, stores it in memory,
+  and requires the `<samlp:Response>` `InResponseTo` to match exactly. The ID
+  is consumed on first use; a replayed response is rejected.
+
+### MFA enforcement with SAML
+
+**MFA step-up is not supported for SAML sessions in this release.** A SAML
+session hitting any of the 11 step-up-gated endpoints (token mint/revoke,
+session revoke, Guardian rule write, software deploy, user delete/role change)
+receives a `403` with `"MFA step-up is not available for SAML sessions in this
+release"` — regardless of `--mfa-enforcement` mode. The gate (`require_mfa_step_up`
+in `mfa_step_up.cpp`) exits with an honest denial before reaching the local
+`mfa_status` lookup, which would fail anyway (SAML users have no local `users`
+row). This means:
+
+- `--mfa-enforcement=required` — SAML users are denied at every step-up gate.
+- `--mfa-enforcement=admin-only` — SAML users (always `role=user`) are not
+  required to step up by the enforcement rule, but the SAML-specific early exit
+  denies them anyway.
+- `--mfa-enforcement=optional` — same: the SAML-specific exit fires before
+  enforcement mode is consulted.
+
+**Recommendation:** Use `--mfa-enforcement=optional` or `--mfa-enforcement=admin-only`
+when SAML is in use, and configure your IdP to enforce MFA at login time. Avoid
+`required` unless you are prepared for SAML users to be denied at all step-up
+gates. The recommended pattern for a SAML deployment is `optional` with IdP-side
+MFA enforcement.
+
+### `--auth-mode=sso-only` is OIDC-only in this release
+
+`--auth-mode=sso-only` requires OIDC configuration (`--oidc-issuer` +
+`--oidc-client-id`); a SAML-only deployment cannot disable local-password login
+in this release. The boot guard explicitly requires OIDC — SAML configuration
+alone does not satisfy it and the server refuses to start.
+
+### HA / multi-replica
+
+Pending `AuthnRequest` state (the random `ID` stored for replay protection) is
+kept in process memory. In a multi-replica deployment, load-balancer **sticky
+sessions (session affinity)** must be configured on `GET /auth/saml/start` and
+`POST /saml/acs` so the ACS POST for a given request is always routed to the
+replica that generated it. Without affinity, approximately `(N−1)/N` of logins
+fail as "unsolicited" (no matching pending ID). OIDC shares this limitation via
+its in-process PKCE state.
+
+### Rotating the IdP signing certificate
+
+Update `--saml-idp-cert` and **restart the server** — there is no hot-reload
+for the IdP cert in this release.
+
+### Deferred items (not in this slice)
+
+- **Group→role mapping.** All SAML users land as `role=user`. Admin via SAML
+  requires group→role mapping, which is not implemented. Compliance impact:
+  CC6.6 (role assignment is manual / out-of-band for SAML principals).
+- **Login-page SSO button.** There is no "Sign in with SAML" button on the
+  login page; users must navigate directly to `GET /auth/saml/start`.
+- **AuthnRequest signing.** The SP does not sign its `<samlp:AuthnRequest>`; the
+  IdP must be configured to accept unsigned requests. If the IdP requires signed
+  AuthnRequests, use OIDC.
+- **`--auth-mode=sso-only` for SAML.** A SAML-only deployment cannot disable
+  local-password login. Compliance impact: CC6.3 (local-password fallback
+  remains active). OIDC is the path to `sso-only`.
+- **AttributeStatement parsing.** No user attributes from the assertion are
+  stored or surfaced beyond the `NameID` used as the session principal.
+- **SP metadata endpoint.** No `GET /saml/metadata` endpoint is provided; IdP
+  registration uses the manual flag values.
+- **Windows support.** SAML depends on an XML processing library whose Windows
+  build is not yet wired in the vcpkg manifest. The server detects Windows at
+  startup, logs an error, and does not enable the SAML routes.
+- **IdP-metadata auto-fetch.** The IdP cert and SSO URL are supplied statically
+  via flags; SAML metadata XML auto-discovery is not implemented.
+- **Settings-UI runtime reconfigure.** SAML can only be configured via CLI
+  flags or environment variables; there is no dashboard panel for it in this
+  slice. A server restart is required to change the configuration.
 
 ## Granular RBAC (Phase 3)
 
