@@ -22,7 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity; opt out with `perf_enabled=false`); `procperf` remains opt-in on
   every OS, and enabling it now also feeds the `app_perf` daily sync (B1/B2)
   from Linux devices — no server change, the plumbing was already
-  platform-agnostic. macOS remains planned for both sources.
+  platform-agnostic. **Enabling
+  `procperf` syncs per-app names + versions off-device** to the central
+  `app_perf` store (not local-triage-only); the agent emits a `notice|…` line
+  on the enabling `configure`, and it is documented in the config table.
+  **Linux `procperf` redaction is best-effort against the kernel's 15-byte
+  comm** — a pattern only redacts reliably when its sensitive substring is a
+  ≤15-byte, prefix-aligned comm slice (a token past byte 15 is truncated away);
+  operator patterns are matched in the same sanitized space as the stored name
+  (so `*evil|app*` redacts a process that named itself `evil|app`), and comm
+  bytes are scrubbed to valid UTF-8. macOS remains planned for both sources.
 - **`/inventory` Devices tab shows real device-CI data.** The Serial/Model/CPU-RAM
   columns (previously greyed placeholders) now read from `DeviceInventoryStore`, and
   the per-device drill grows a full CI-record panel (manufacturer, model, serial,

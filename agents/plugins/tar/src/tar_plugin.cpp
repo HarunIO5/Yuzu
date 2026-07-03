@@ -2167,6 +2167,17 @@ private:
                 return 1;
             }
             ctx.write_output(std::format("config|{}_enabled|{}", src_name, v));
+            // Consent clarity (#1831 review): enabling procperf does more than
+            // collect on-device — the top-N per-app names + versions feed the
+            // daily app_perf sync to the central server (B1/B2). An operator
+            // opting in for local triage must see that the app identity leaves
+            // the device. Surfaced here, in the manual, and in the CHANGELOG.
+            if (src_name == "procperf" && v == "true")
+                ctx.write_output(
+                    "notice|procperf: per-app names + versions are now sampled AND "
+                    "synced off-device to the central app_perf store (daily); disable "
+                    "with procperf_enabled=false or --inventory-disable to keep the "
+                    "device fully local");
             // Echo the resulting paused_at so the dashboard sees the transition
             // timestamp without an extra status round-trip — single source of
             // truth (re-read, not re-derived).

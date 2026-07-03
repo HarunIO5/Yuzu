@@ -393,22 +393,31 @@ PerfCounters read_perf_counters() {
 #elif defined(__linux__)
 
 #include <fstream>
-#include <sstream>
 
 namespace yuzu::tar {
 
 namespace {
 
-// Whole-file slurp; "" on failure (the parser reads an empty payload as that
-// domain being absent). Each existing /proc consumer keeps its own small
-// reader (dex_linux_collector, agent.cpp) — a shared one is a bigger diff.
+// Whole-file slurp; "" on open failure OR a mid-read I/O error. Returning ""
+// on a bad read (not just EOF) is load-bearing for the net domain: a
+// truncated /proc/net/dev that still carried the `lo` line would otherwise set
+// net_valid=true with the non-loopback counters baselined at 0, reproducing
+// the exact one-interval false since-boot spike net_valid exists to prevent.
+// Chunked read() so a short read sets eofbit (normal) while a real error sets
+// badbit (rejected). Each existing /proc consumer keeps its own small reader
+// (dex_linux_collector, agent.cpp) — a shared one is a bigger diff.
 std::string read_proc(const char* path) {
     std::ifstream f(path);
     if (!f)
         return {};
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+    std::string content;
+    char buf[4096];
+    while (f.read(buf, sizeof buf))
+        content.append(buf, static_cast<std::size_t>(f.gcount()));
+    content.append(buf, static_cast<std::size_t>(f.gcount()));
+    if (f.bad())
+        return {}; // I/O error mid-read — treat the whole file as absent
+    return content;
 }
 
 } // namespace

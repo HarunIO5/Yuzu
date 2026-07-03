@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -429,6 +430,45 @@ TEST_CASE("procperf: Linux comm is sanitized for the wire, escaped for the name 
         REQUIRE(p);
         CHECK(p->name == "dom\\\\svc\\nx");
     }
+    SECTION("valid multi-byte UTF-8 survives; ill-formed bytes become '_'") {
+        // A legitimate non-ASCII name must round-trip; a lone lead byte, a
+        // stray continuation, or a sequence truncated by the 15-byte comm cap
+        // must be scrubbed so the stored name is always valid UTF-8 (else the
+        // server's app_perf Postgres text insert would reject that device's row).
+        const auto ok = parse_linux_pid_stat(9, std::string("9 (caf\xC3\xA9)") + tail, 100, 4096);
+        REQUIRE(ok);
+        CHECK(ok->name == "caf\xC3\xA9"); // é (U+00E9) preserved intact
+        const auto bad = parse_linux_pid_stat(9, std::string("9 (a\xC3z\x80)") + tail, 100, 4096);
+        REQUIRE(bad);
+        CHECK(bad->name == "a_z_"); // truncated lead + stray continuation → '_'
+        const auto overlong =
+            parse_linux_pid_stat(9, std::string("9 (\xC0\xAF)") + tail, 100, 4096);
+        REQUIRE(overlong);
+        CHECK(overlong->name == "__"); // overlong '/' encoding rejected
+    }
+    SECTION("CR in the post-comm fields is whitespace, not a token byte") {
+        // A CRLF-shaped stat line must parse identically to LF (the tokenizer's
+        // whitespace set includes '\r', matching tar_perf's split_ws).
+        const auto p = parse_linux_pid_stat(
+            9, "9 (proc)\r\nR 1 2 2 0 -1 0 0 0 0 0 700 300 0 0 20 0 1 0 900 0 512 0\r\n", 100,
+            4096);
+        REQUIRE(p);
+        CHECK(p->name == "proc");
+        CHECK(p->cpu_100ns == 1000ULL * 100'000); // utime 700 + stime 300, unaffected by CR
+    }
+    SECTION("hostile huge fields saturate instead of wrapping to a small value") {
+        // A forged /proc mount could put 2^64-scale integers in a field; the
+        // saturating products must pin at the max, never wrap. (rss is parsed
+        // as int64, so INT64_MAX is its hostile bound.)
+        const auto p = parse_linux_pid_stat(
+            1,
+            "1 (x) R 0 0 0 0 0 0 0 0 0 0 18446744073709551615 0 0 0 20 0 1 0 0 0 "
+            "9223372036854775807",
+            100, 4096);
+        REQUIRE(p);
+        CHECK(p->cpu_100ns == std::numeric_limits<std::uint64_t>::max() / 100);
+        CHECK(p->ws_bytes == std::numeric_limits<std::uint64_t>::max());
+    }
 }
 
 TEST_CASE("procperf derive: comm-width redaction fallback catches long pattern cores",
@@ -456,6 +496,31 @@ TEST_CASE("procperf derive: comm-width redaction fallback catches long pattern c
     p2.procs.push_back(proc(12, 1, 0, 100, "outlook"));
     c2.procs.push_back(proc(12, 1, kSec100ns, 100, "outlook"));
     CHECK(derive_proc_samples(p2, c2, win_pattern).size() == 1);
+}
+
+TEST_CASE("procperf derive: redaction matches in the SANITIZED comm space (mismatch fix)",
+          "[tar][procperf][linux]") {
+    // A process names itself with a wire-hostile byte (prctl). parse stores the
+    // sanitized form (evil|app -> evil_app). An operator pattern written against
+    // the RAW name (*evil|app*) must STILL redact it — the pattern is run through
+    // the identical sanitization before matching, closing the mismatch a
+    // raw-pattern match would leave (the app would otherwise leak into
+    // procperf_live and the off-device app_perf sync).
+    const char* tail = " R 1 2 2 0 -1 0 0 0 0 0 100 100 0 0 20 0 1 0 900 0 512 0";
+    const auto pcur = parse_linux_pid_stat(20, std::string("20 (evil|app)") + tail, 100, 4096);
+    const auto pprev = parse_linux_pid_stat(20, std::string("20 (evil|app)") + tail, 100, 4096);
+    REQUIRE(pcur);
+    REQUIRE(pcur->name == "evil_app"); // stored sanitized
+    auto prev = snap(1000), cur = snap(1030);
+    prev.procs.push_back(*pprev);
+    cur.procs.push_back(*pcur);
+    prev.procs.push_back(proc(21, 1, 0, 100, "innocent"));
+    cur.procs.push_back(proc(21, 1, kSec100ns, 100, "innocent"));
+
+    const std::vector<std::string> redaction{"*evil|app*"};
+    const auto rows = derive_proc_samples(prev, cur, redaction);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].name == "innocent"); // evil_app was redacted despite the '|' mangle
 }
 
 TEST_CASE("procperf: Linux round-trip — parsed lines through derive_proc_samples",
