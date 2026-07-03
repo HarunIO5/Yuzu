@@ -739,14 +739,19 @@ std::expected<void, AuthDBError> AuthDB::upsert_sso_identity(const std::string& 
     // header note). role='user' on first insert only; the ON CONFLICT arm
     // deliberately omits role/elevation_eligible so a standing grant on
     // this principal survives re-login (#1852 CRITICAL invariant).
+    // governance round — the ON CONFLICT arm deliberately does NOT set
+    // `is_active = 1`. A first INSERT still defaults is_active=1 (schema
+    // default), but re-login must never RESURRECT a row that a future
+    // deprovisioning path (#1859) has soft-deleted (is_active=0) — that
+    // would let a revoked SSO operator regain a working account merely by
+    // logging in again, silently defeating the deprovisioning control.
     static const char* sql = R"(
         INSERT INTO users(username, password_hash, salt_hex, role, identity_source,
                           external_iss, external_sub, display_name, last_seen_at)
         VALUES (?, '', '', 'user', ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(username) DO UPDATE SET
             display_name = excluded.display_name,
-            last_seen_at = CURRENT_TIMESTAMP,
-            is_active = 1
+            last_seen_at = CURRENT_TIMESTAMP
     )";
 
     sqlite3_stmt* stmt = nullptr;
@@ -774,8 +779,11 @@ std::expected<void, AuthDBError> AuthDB::upsert_sso_identity(const std::string& 
 }
 
 std::expected<auth::UserEntry, AuthDBError> AuthDB::get_user(const std::string& username) {
+    // #1852 governance round — identity_source is selected so callers (in
+    // particular the /api/v1/elevate source-scope guard) can tell an
+    // OIDC-provisioned row apart from a local one without a second query.
     static const char* sql = R"(
-        SELECT username, role, password_hash, salt_hex
+        SELECT username, role, password_hash, salt_hex, identity_source
         FROM users
         WHERE username = ? AND is_active = 1
     )";
@@ -810,6 +818,9 @@ std::expected<auth::UserEntry, AuthDBError> AuthDB::get_user(const std::string& 
     entry.role = auth::string_to_role(col_text(stmt, 1));
     entry.hash_hex = col_text(stmt, 2);
     entry.salt_hex = col_text(stmt, 3);
+    // col_text is null-safe; identity_source is NOT NULL DEFAULT 'local'
+    // (migration v6) so this is defensive against schema drift only.
+    entry.identity_source = col_text(stmt, 4);
     // Note: is_active and last_login_at exist in DB but not in UserEntry struct.
     // DB query filters is_active=1, so all returned users are active.
 
@@ -1113,9 +1124,24 @@ std::expected<void, AuthDBError> AuthDB::invalidate_all_sessions(const std::stri
     // truncates at the first NUL byte, so a NUL-embedded username would
     // delete the wrong rows while the in-memory `==` comparison in
     // AuthManager would match no one — the layers would silently
-    // diverge. Sibling primitives `add_user` and `update_role` validate
-    // here for the same reason.
-    if (!is_valid_username(username)) {
+    // diverge.
+    //
+    // governance round (cons-S1) — gated on `is_valid_principal`, not the
+    // strict `is_valid_username`: this is a target-lookup DELETE against
+    // the `sessions` table (no row is ever CREATED here), so accepting a
+    // durable SSO principal (`oidc:<iss>#<sub>`) is safe by the same
+    // reasoning as the REST `DELETE /api/v1/sessions?username=` route
+    // (rest_api_v1.cpp). Before this fix, force-logging-out an SSO
+    // operator via that route always hit `InvalidUsername` here (OIDC
+    // sessions are never persisted to the `sessions` table in the first
+    // place, so the DELETE would have deleted 0 rows and succeeded) —
+    // the handler then audited `result="partial"`/`db_error=true` for an
+    // action that fully succeeded, corrupting the audit trail (cons-S1).
+    // The other two callers of this method, `remove_user` and
+    // `update_role`, are local-account-only call sites (their own inputs
+    // are already `is_valid_username`-checked upstream), so widening the
+    // gate here does not loosen anything for them.
+    if (!is_valid_principal(username)) {
         spdlog::warn("invalidate_all_sessions: invalid username");
         return std::unexpected(AuthDBError::InvalidUsername);
     }

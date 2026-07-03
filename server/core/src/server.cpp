@@ -727,6 +727,14 @@ public:
         // "Sign out everywhere" which also revokes API tokens).
         metrics_.describe("yuzu_auth_sessions_revoked_total",
                           "Total session revocations, by caller, result, and scope", "counter");
+        // Durable SSO identity provisioning observability (#1852 governance
+        // round, sec-LOW/UP-5). Incremented on every successful
+        // upsert_sso_identity call (first-provision AND re-login refresh),
+        // labelled by source so an IdP-side provisioning flood is visible
+        // independently of ordinary login volume.
+        metrics_.describe("yuzu_auth_sso_provision_total",
+                          "Total durable SSO identity provision/refresh upserts, by source",
+                          "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning

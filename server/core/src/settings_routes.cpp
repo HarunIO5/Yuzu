@@ -67,6 +67,39 @@ namespace yuzu::server {
 
 namespace {
 
+// governance round (arch-S1) — percent-encode a URL query-PARAMETER VALUE
+// (RFC 3986 unreserved set — alnum, `-`, `_`, `.`, `~` pass through
+// unchanged; everything else, including `#`, `&`, `%`, `+`, and space, is
+// percent-escaped). Distinct from `html_escape`: `html_escape` neutralises
+// HTML metacharacters for BODY text and does NOT touch `#`, so a value
+// containing `#` (e.g. the durable SSO principal `oidc:<iss>#<sub>`,
+// #1852) embedded via `html_escape` alone into an
+// `hx-delete="...?username=" + html_escape(v)` attribute is silently
+// truncated by the browser, which treats the un-encoded `#` as a URL
+// fragment separator — the server then receives a truncated query value
+// with no error signal. Use `url_encode` for the query-parameter VALUE and
+// reserve `html_escape` for the surrounding HTML-attribute quoting / any
+// body-text rendering of the same value. Mirrors the identical helper
+// already local to device_ui.cpp / dex_routes.cpp / inventory_ui.cpp et al.
+// (deliberately per-file, not centralised in web_utils.hpp — several of
+// those files declare the same name in their own anonymous namespace, so a
+// namespace-scope version there is ambiguous against unqualified lookup).
+std::string url_encode(const std::string& s) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += static_cast<char>(c);
+        } else {
+            out += '%';
+            out += kHex[c >> 4];
+            out += kHex[c & 0x0F];
+        }
+    }
+    return out;
+}
+
 std::string highlight_yaml_value(const std::string& val) {
     if (val.empty())
         return {};
@@ -490,11 +523,20 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                         "hx-on::after-request=\"window.location='/login'\""
                         ">Sign out everywhere</button>";
             } else {
+                // governance round (arch-S1) — the query-parameter VALUE
+                // must be URL-encoded, not HTML-escaped: `html_escape`
+                // leaves `#` untouched, and a durable SSO principal
+                // (`oidc:<iss>#<sub>`, #1852) embedded raw here has its
+                // `#` treated by the browser as a URL-fragment separator,
+                // silently truncating the request the server receives —
+                // a no-op "Revoke sessions" click with no visible error.
+                // `html_escape` is still applied to the confirm-dialog TEXT
+                // below (a body-text rendering, not a URL).
                 html += "<button class=\"btn btn-danger\" "
                         "style=\"padding:0.2rem 0.6rem;font-size:0.7rem;"
                         "margin-right:0.3rem\" "
                         "hx-delete=\"/api/v1/sessions?username=" +
-                        html_escape(u.username) +
+                        url_encode(u.username) +
                         "\" "
                         "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
                         "hx-confirm=\"Force &quot;" +

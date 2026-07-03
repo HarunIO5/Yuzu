@@ -1036,6 +1036,16 @@ void AuthManager::provision_sso_identity(const std::string& principal, const std
         spdlog::warn("provision_sso_identity failed for '{}': error={} (login proceeds; this "
                      "principal cannot elevate until a future login provisions it)",
                      principal, static_cast<int>(result.error()));
+        return;
+    }
+    // governance round (sec-LOW/UP-5) — observable IdP-provisioning volume.
+    // Every successful login re-runs this upsert (it is also the re-login
+    // refresh path, not just first-provision), so a sustained spike is a
+    // signal worth alerting on: either a legitimate onboarding wave or an
+    // IdP-side provisioning flood/credential-stuffing sweep against the SSO
+    // login path.
+    if (metrics_) {
+        metrics_->counter("yuzu_auth_sso_provision_total", {{"source", "oidc"}}).increment();
     }
 }
 

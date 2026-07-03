@@ -760,7 +760,7 @@ The admin route emits two distinct 400 bodies — operators scripting the endpoi
 }
 ```
 
-The `username` parameter is validated with the same character set used at user creation (`is_valid_username`). NUL bytes, control characters, and newlines are rejected — passing them through to the SQL bind would silently truncate at the NUL while the audit log records the full string, producing a target/effect mismatch (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
+The `username` parameter accepts either a strict local username OR a durable SSO principal (`is_valid_principal`, #1852) — `oidc:<iss>#<sub>` / `saml:<idp>#<nameid>` / `ad:...`, so an admin can force-log-out an SSO operator too. Local usernames stay on the strict alphanumeric/`._-` charset; an SSO principal permits the `: # / . _ - @ ~ % |` alphabet a real IdP issuer URL and opaque subject need. NUL bytes, control characters, newlines, and shell/SQL metacharacters (`;`, `=`, `\`, quotes, backtick, space) are rejected in both cases — passing them through to the SQL bind would silently truncate/diverge from the audited target string (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
 
 **Error (403) -- caller lacks `UserManagement:Write`:**
 
@@ -870,15 +870,22 @@ Grant or revoke a user's **JIT-admin-elevation eligibility** — who may activat
 
 **Side effect:** setting `eligible=false` immediately terminates any in-flight elevation for that user.
 
+The `{username}` path segment accepts the same shapes as `DELETE /api/v1/sessions` above (`is_valid_principal`, #1852): a strict local username, or a durable SSO principal (`oidc:<iss>#<sub>`, URL-encode the `#` and any other reserved characters in the path segment). This is an `UPDATE`-only operation against an existing `users` row, never an `INSERT` — an SSO principal only has a row once the operator has **logged in at least once** (first login auto-provisions it). Granting eligibility against a principal with no row yet returns `404`, which for an SSO principal specifically means "this operator has never signed in" rather than "no such user was ever created".
+
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
   -H "Content-Type: application/json" -d '{"eligible":true}' \
   "https://yuzu.example.com/api/v1/users/alice/elevation-eligibility"
+
+# SSO principal — note the URL-encoded '#' (%23):
+curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+  -H "Content-Type: application/json" -d '{"eligible":true}' \
+  'https://yuzu.example.com/api/v1/users/oidc:https://idp.example.com/%23sub-4821/elevation-eligibility'
 ```
 
 **Response (200):** `{"status":"ok"}`.
 
-**Errors:** `400` — invalid username or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found; `503` — no `auth.db` (`--data-dir` unset).
+**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found (for an SSO principal: the operator has never logged in); `503` — no `auth.db` (`--data-dir` unset).
 
 **Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` on a 403).
 

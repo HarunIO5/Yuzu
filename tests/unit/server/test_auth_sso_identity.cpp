@@ -461,3 +461,139 @@ TEST_CASE("POST /api/v1/elevate: an OIDC session with no amr-attested MFA is den
     REQUIRE(s.has_value());
     CHECK_FALSE(auth::is_elevated(*s));
 }
+
+// ── governance round: source-scope the elevation eligibility (UP-6/UP-7/cons-N2) ──
+
+TEST_CASE("POST /api/v1/elevate: an OIDC session cannot borrow a legacy identity_source='local' "
+          "row's eligibility grant even when the principal strings collide",
+          "[sso][jit][routes]") {
+    SsoJitHarness h;
+    // Simulate the exact landmine cons-N2 describes: a row named exactly
+    // like a durable OIDC principal, but whose identity_source is 'local'
+    // (a legacy row from before #1852, or one an admin somehow created
+    // with this shape) — and that row happens to carry
+    // elevation_eligible=1. `upsert_sso_identity`'s `source` parameter
+    // writes straight into `identity_source`, so passing "local" here
+    // constructs exactly that shape via the public API.
+    auto [token, principal] = h.oidc_session("sub-mallory");
+    REQUIRE(h.auth_db
+                .upsert_sso_identity(principal, "https://idp.example.com/", "sub-mallory",
+                                     "Legacy Row", "local")
+                .has_value());
+    REQUIRE(h.auth_db.set_elevation_eligible(principal, true).has_value());
+
+    // Without the source-scope guard, is_elevation_eligible(principal) alone
+    // would report true (it only reads the flag, not identity_source) and
+    // the OIDC session would elevate on a grant that was never actually
+    // made against an OIDC-sourced row.
+    auto res = h.post("/api/v1/elevate", token,
+                      R"({"justification":"prod incident","duration_secs":600})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("not authorized to elevate") != std::string::npos);
+
+    auto s = h.auth_mgr.validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(auth::is_elevated(*s));
+}
+
+TEST_CASE("POST /api/v1/elevate: a SAML session whose NameID collides with a provisioned OIDC "
+          "principal is denied (identity-source mismatch, not just the no-amr gate)",
+          "[sso][jit][routes][saml]") {
+    SsoJitHarness h;
+    // The other half of cons-N2: a crafted SAML NameID equal to a real,
+    // eligible OIDC principal string. SAML sessions already fail closed at
+    // the amr-proof / MFA gates further down this handler (SAML carries no
+    // amr claim), but this pins that the identity-source guard denies it
+    // FIRST and independently — so a future SAML-MFA workstream that adds
+    // an amr-equivalent for SAML cannot accidentally reopen this specific
+    // cross-protocol collision.
+    const std::string iss = "https://idp.example.com/";
+    const std::string sub = "sub-mallory-saml";
+    const std::string principal = "oidc:" + iss + "#" + sub;
+
+    REQUIRE(h.auth_db.upsert_sso_identity(principal, iss, sub, "Real OIDC User", "oidc")
+                .has_value());
+    REQUIRE(h.auth_db.set_elevation_eligible(principal, true).has_value());
+
+    // A SAML session whose NameID is crafted to equal the OIDC principal
+    // string verbatim.
+    auto token = h.auth_mgr.create_saml_session(principal);
+
+    auto res = h.post("/api/v1/elevate", token, R"({"justification":"x"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+
+    auto s = h.auth_mgr.validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(auth::is_elevated(*s));
+}
+
+// ── governance round: don't resurrect a disabled SSO row (UP-3) ────────────
+
+TEST_CASE("AuthDB::upsert_sso_identity does not reactivate a deprovisioned row on re-login",
+          "[sso][authdb]") {
+    auto dir = yuzu::test::TempDir{};
+    fs::create_directories(dir.path);
+    AuthDB db(dir.path, /*cleanup_interval_secs=*/0);
+    REQUIRE(db.initialize().has_value());
+
+    const std::string principal = "oidc:https://idp.example.com/#sub-deprovisioned";
+    REQUIRE(db.upsert_sso_identity(principal, "https://idp.example.com/", "sub-deprovisioned",
+                                   "Dave", "oidc")
+                .has_value());
+
+    // Simulate a future deprovisioning sweep (#1859) soft-deleting the row.
+    // remove_user takes no is_valid_username gate (it's a target-lookup
+    // UPDATE, like set_elevation_eligible/is_elevation_eligible), so it
+    // works against the durable SSO principal string directly.
+    auto removed = db.remove_user(principal);
+    REQUIRE(removed.has_value());
+    CHECK(*removed == true);
+    CHECK_FALSE(db.get_user(principal).has_value()); // is_active=0 now
+
+    // Re-login (the IdP still asserts this identity — there is no push
+    // signal into Yuzu on an IdP-side removal) must NOT resurrect the
+    // deactivated row. Before this fix the ON CONFLICT arm unconditionally
+    // set is_active=1, silently undoing the deprovisioning.
+    REQUIRE(db.upsert_sso_identity(principal, "https://idp.example.com/", "sub-deprovisioned",
+                                   "Dave", "oidc")
+                .has_value());
+    CHECK_FALSE(db.get_user(principal).has_value()); // still inactive
+}
+
+// ── governance round: SSO force-logout audit fidelity (cons-S1) ────────────
+
+TEST_CASE("AuthManager::invalidate_user_sessions reports db_persisted=true for a durable SSO "
+          "principal (not InvalidUsername)",
+          "[sso][authdb]") {
+    auto dir = yuzu::test::TempDir{};
+    fs::create_directories(dir.path);
+    AuthDB db(dir.path, /*cleanup_interval_secs=*/0);
+    REQUIRE(db.initialize().has_value());
+    auth::AuthManager mgr;
+    mgr.set_auth_db(&db);
+
+    const std::string principal = "oidc:https://idp.example.com/#sub-revoke";
+    // Before this fix, AuthDB::invalidate_all_sessions gated on the strict
+    // is_valid_username (rejects ':'/'#'), so this call always returned
+    // AuthDBError::InvalidUsername for a durable SSO principal — even
+    // though OIDC sessions are never persisted to the `sessions` table in
+    // the first place (0 matched rows IS success). The REST DELETE
+    // /api/v1/sessions handler surfaced that as result="partial" +
+    // db_error=true for an action that fully succeeded end-to-end.
+    auto result = mgr.invalidate_user_sessions(principal);
+    CHECK(result.db_persisted);
+}
+
+// Direct AuthDB-level pin, independent of AuthManager's wrapping —
+// confirms the store method itself now accepts the principal shape.
+TEST_CASE("AuthDB::invalidate_all_sessions accepts a durable SSO principal", "[sso][authdb]") {
+    auto dir = yuzu::test::TempDir{};
+    fs::create_directories(dir.path);
+    AuthDB db(dir.path, /*cleanup_interval_secs=*/0);
+    REQUIRE(db.initialize().has_value());
+
+    const std::string principal = "oidc:https://idp.example.com/#sub-revoke2";
+    CHECK(db.invalidate_all_sessions(principal).has_value());
+}

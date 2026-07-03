@@ -206,9 +206,9 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   be eligible **and** present a mandatory second factor **and** pass a fresh MFA
   step-up. The mandatory second factor is **local TOTP enrollment** for a local
   session, or a **fresh IdP-attested MFA `amr` proof** for an OIDC session when
-  `--jit-oidc-amr-elevation` is enabled (the OIDC path is **temporarily severed**
-  on this branch — an OIDC session is denied at the eligibility gate; see
-  "OIDC-amr elevation" below and #1852). This
+  `--jit-oidc-amr-elevation` is enabled (OIDC elevation is **restored** by #1852's
+  durable SSO identity provisioning — an OIDC session's stable principal now has a
+  `users` row to key eligibility on; see "OIDC-amr elevation" below). This
   requirement is mandatory **unconditionally** here, NOT gated on
   `--mfa-enforcement`: elevation is the privilege-crossing boundary (non-admin →
   full admin), so — unlike the other step-up sites where the actor is already
@@ -335,6 +335,29 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   A one-time INFO log line is emitted at boot when OIDC is configured and the
   toggle is on, so an incident responder can discover the posture without
   reading source or an individual audit row.
+- **`--mfa-step-up-window-secs` governs the OIDC-elevation proof-freshness
+  bound too.** The elevate route's shared `elevation_step_up` gate (which
+  every session — local and OIDC — must additionally clear after the
+  unconditional enrolled/amr checks above) floors its window to
+  `cfg.mfa_step_up_window_secs` (default 300 s; floored to 300 s even if the
+  operator has globally disabled step-up via `<= 0`, so the privilege
+  boundary always requires a fresh proof). For an OIDC session this is the
+  same `Session::mfa_verified_at` freshness check the local branch uses —
+  there is no separate OIDC-specific timer; an operator narrows the window
+  operator-wide with the one flag.
+- **Incident response for a compromised SSO operator (no reaper/SCIM yet —
+  #1859, tracked).** Until a deprovisioning sweep ships, stopping a
+  compromised SSO operator's privileged access is two manual levers, both
+  immediate: (1) `POST /api/v1/users/{principal}/elevation-eligibility
+  {"eligible":false}` — stops future JIT elevation and drops any
+  currently-active elevation window (`AuthManager::revoke_user_elevations`);
+  (2) `DELETE /api/v1/sessions?username=<principal>` — force-logs-out the
+  operator's current cookie session(s). Neither lever deactivates the
+  `auth.db` row itself or stops the IdP from minting the operator a fresh
+  session on next login (that requires IdP-side deprovisioning today); (1)+
+  (2) together are the full standing-access kill switch available in this
+  slice. #1859 will add a durable-side deactivation/reaper so a stale IdP
+  removal ages the row out even without an admin doing this manually.
 - **Step-down** — `POST /api/v1/elevate/revoke` clears the window
   (`role.elevation.revoked`). **Passive expiry on lapse is now audited too
   (follow-up A, shipped)** — `role.elevation.expired` — but LAZILY, not via a
@@ -716,6 +739,35 @@ fixed:
   future render site could join `users.display_name` by principal instead
   of relying only on a live session or an audit-row `detail` field — but no
   such render site is wired in this slice; that remains a fast-follow.
+
+**Governance hardening round (2026-07-03) — see
+`docs/security-reviews/sso-durable-identity-2026-07-03.md` for the full
+record.** Four fixes on top of the base restoration above:
+
+- **Source-scope guard on the eligibility grant.** `is_elevation_eligible`
+  keys on the raw principal string alone, which is a landmine: a crafted SAML
+  NameID equal to a provisioned OIDC principal, or a legacy
+  `identity_source='local'` row that happens to be named `oidc:<iss>#<sub>`
+  with `elevation_eligible=1`, would otherwise let a session borrow a grant
+  never made against its own identity source. The elevate handler now fetches
+  the target row's `identity_source` (`AuthDB::get_user`, which selects it)
+  immediately after the eligibility check and requires it match the session's
+  `auth_source` (`oidc`↔`oidc`; everything else↔`local`) — denying with
+  `role.elevation.denied` / `detail=identity-source mismatch` otherwise.
+- **`upsert_sso_identity` no longer resurrects a deactivated row.** The
+  `ON CONFLICT` refresh arm dropped `is_active = 1` from its `SET` clause — a
+  re-login against a row a future deprovisioning sweep (#1859) had
+  soft-deleted no longer silently reactivates it.
+- **`AuthDB::invalidate_all_sessions` moved to `is_valid_principal`.** Force-
+  logging-out an SSO principal via `DELETE /api/v1/sessions?username=`
+  previously hit `InvalidUsername` at this inner call even though the REST
+  layer had already accepted the principal — corrupting the audit trail with
+  `result="partial"`/`db_error=true` for an action that fully succeeded (OIDC
+  sessions are never persisted to `sessions`, so 0 matched rows IS success).
+- **Settings → Users "Revoke sessions" URL-encodes the principal.** The
+  button previously built its `hx-delete` URL with `html_escape` alone, which
+  does not touch `#` — a durable SSO principal's `#` was silently truncated
+  by the browser's URL-fragment parsing before the request left the client.
 
 SAML is unaffected by this restoration: `create_saml_session` still keys
 `username` on the raw NameID (no reserved-prefix stable principal — see

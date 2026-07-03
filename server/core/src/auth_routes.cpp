@@ -2638,6 +2638,47 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                             "application/json");
             return;
         }
+        // governance round (UP-6/UP-7/cons-N2) — source-scope the eligibility
+        // grant: `is_elevation_eligible` above keyed on the raw principal
+        // STRING alone, so a session whose principal happens to collide
+        // with an eligible row's username (a crafted SAML NameID equal to
+        // `oidc:<iss>#<sub>`, or a legacy `identity_source='local'` row
+        // literally named `oidc:x#y` that somehow has
+        // `elevation_eligible=1`) would otherwise borrow that row's grant.
+        // Require the row's `identity_source` to MATCH the session's own
+        // `auth_source`: an OIDC session may only elevate an
+        // `identity_source='oidc'` row; every other session (local,
+        // and — until SAML provisioning exists — saml) requires
+        // `identity_source='local'`. Read fresh via `get_user` rather than
+        // trusting anything cached on `session` (SQLite is the source of
+        // truth for identity_source).
+        auto row = db->get_user(session->username);
+        if (!row) {
+            audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                    auth::role_to_string(session->role), "User", session->username,
+                                    "identity-source lookup failed");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "not authorized to elevate", cid), "application/json");
+            return;
+        }
+        // The eligible row's `identity_source` must equal the session's own
+        // `auth_source` — a DIRECT mapping (`local`↔`local`, `oidc`↔`oidc`,
+        // `saml`↔`saml`), NOT "oidc-or-else-local". A SAML session therefore
+        // expects `identity_source=="saml"`, which no row carries today (SAML
+        // is not provisioned — #1852 fast-follow), so SAML is fail-closed at
+        // this gate; and a SAML NameID crafted to collide with a `local` (or
+        // `oidc`) row can no longer satisfy it. This keeps the guard correct
+        // when SAML provisioning + SAML-MFA land, without a rework (Hermes
+        // cyber-review finding, #1852 hardening).
+        const std::string& expected_identity_source = session->auth_source;
+        if (row->identity_source != expected_identity_source) {
+            audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                    auth::role_to_string(session->role), "User", session->username,
+                                    "identity-source mismatch");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "not authorized to elevate", cid), "application/json");
+            return;
+        }
         // MFA is MANDATORY to elevate (review #JIT security-F1). Elevation is the
         // privilege-crossing boundary (non-admin → full admin), so — UNLIKE the
         // other step-up sites where the actor is already admin — a second factor

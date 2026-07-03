@@ -205,7 +205,10 @@ public:
     /// Destroy a single session (logout).
     std::expected<void, AuthDBError> invalidate_session(const std::string& token);
 
-    /// Destroy all sessions for a user (logout all devices).
+    /// Destroy all sessions for a user (logout all devices). `username` is
+    /// validated with `is_valid_principal` (governance round cons-S1) — a
+    /// target-lookup DELETE, so a durable SSO principal (`oidc:<iss>#<sub>`)
+    /// is accepted alongside a strict local username.
     std::expected<void, AuthDBError> invalidate_all_sessions(const std::string& username);
 
     /// Remove expired sessions. Returns count of sessions removed.
