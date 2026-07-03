@@ -1817,17 +1817,53 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // 'entra'-sourced memberships that were NOT re-asserted this login,
         // which is the deprovisioning-bypass fix — IdP-side group removal
         // now takes effect on the user's next SSO login instead of
-        // accumulating forever. Local memberships are never touched. See
-        // `docs/user-manual/authentication.md` "OIDC group provisioning".
+        // accumulating forever. Local memberships are never touched.
+        //
+        // UP-1 hardening: reconciliation only runs when
+        // `groups_claim_reconcilable(claims)` is true — i.e. the token
+        // actually carried a `groups` key AND it was not replaced by an
+        // Entra group-overage pointer. A user in >200 Entra groups gets
+        // NEITHER of those, and treating the resulting empty `claims.groups`
+        // as "this user is in zero groups" would DELETE every one of their
+        // existing entra:-owned memberships on this login — silent mass
+        // deprovisioning of a legitimate, heavily-grouped user. That case is
+        // SKIPPED entirely (existing memberships left untouched; the login
+        // itself still proceeds — this is fail-OPEN on membership, never on
+        // authentication). See `docs/user-manual/authentication.md` "RBAC
+        // Group Provisioning" (the real heading — keep this anchor in sync).
         if (rbac_store_) {
-            if (claims.groups.size() > RbacStore::kMaxIdpGroupsPerLogin) {
+            if (!oidc::groups_claim_reconcilable(claims)) {
+                const std::string reason =
+                    claims.groups_overage ? "groups_overage" : "groups_absent";
+                spdlog::info("OIDC group provisioning skipped for '{}': reason={}", username,
+                            reason);
+                audit_log_for_principal(req, "auth.sso_group_provision", "skipped", username,
+                                        "user", "", "", "reason=" + reason + ";source=entra");
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_sso_group_provision_total",
+                              {{"source", "entra"}, {"result", "skipped"}})
+                        .increment();
+                }
+            } else if (claims.groups.size() > RbacStore::kMaxIdpGroupsPerLogin) {
                 spdlog::warn(
                     "OIDC group provisioning denied for '{}': {} asserted groups exceeds cap {}",
                     username, claims.groups.size(), RbacStore::kMaxIdpGroupsPerLogin);
                 audit_log_for_principal(
-                    req, "auth.sso_group_provision", "failed", username, "user", "", "",
+                    req, "auth.sso_group_provision", "error", username, "user", "", "",
                     "reason=group_count_exceeded;count=" +
                         std::to_string(claims.groups.size()) + ";source=entra");
+                // cons-S2 — also emit the same failed-OIDC-login signal the
+                // sibling token-exchange-failure branch emits above, so a
+                // SIEM query counting failed OIDC logins by
+                // `auth.oidc_login_failed` doesn't miss a provisioning-denied
+                // login (this branch denies the login just as surely).
+                audit_log_for_principal(req, "auth.oidc_login_failed", "error", username, "user",
+                                        "", "", "reason=group_count_exceeded");
+                emit_event("auth.oidc_login_failed", req,
+                          {{"source_ip", req.remote_addr},
+                           {"username", username},
+                           {"error", "group_count_exceeded"}},
+                          {}, Severity::kWarn);
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_sso_group_provision_total",
                               {{"source", "entra"}, {"result", "error"}})
@@ -1835,35 +1871,53 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 }
                 res.set_redirect("/login?error=sso_failed");
                 return;
-            }
+            } else {
+                std::vector<std::pair<std::string, std::string>> asserted;
+                asserted.reserve(claims.groups.size());
+                for (const auto& gid : claims.groups)
+                    asserted.emplace_back(gid, gid);
 
-            std::vector<std::pair<std::string, std::string>> asserted;
-            asserted.reserve(claims.groups.size());
-            for (const auto& gid : claims.groups)
-                asserted.emplace_back(gid, gid);
+                auto reconciled =
+                    rbac_store_->reconcile_idp_memberships(username, "entra", asserted);
+                if (!reconciled) {
+                    spdlog::warn("OIDC group provisioning failed for '{}': {}", username,
+                                reconciled.error());
+                    audit_log_for_principal(req, "auth.sso_group_provision", "error", username,
+                                            "user", "", "",
+                                            "reason=" + reconciled.error() + ";source=entra");
+                    // cons-S2 — see the over-cap branch above.
+                    audit_log_for_principal(req, "auth.oidc_login_failed", "error", username,
+                                            "user", "", "", "reason=" + reconciled.error());
+                    emit_event("auth.oidc_login_failed", req,
+                              {{"source_ip", req.remote_addr},
+                               {"username", username},
+                               {"error", reconciled.error()}},
+                              {}, Severity::kWarn);
+                    if (auto* m = auth_mgr_.metrics_registry()) {
+                        m->counter("yuzu_auth_sso_group_provision_total",
+                                  {{"source", "entra"}, {"result", "error"}})
+                            .increment();
+                    }
+                    res.set_redirect("/login?error=sso_failed");
+                    return;
+                }
 
-            auto reconciled = rbac_store_->reconcile_idp_memberships(username, "entra", asserted);
-            if (!reconciled) {
-                spdlog::warn("OIDC group provisioning failed for '{}': {}", username,
-                            reconciled.error());
-                audit_log_for_principal(req, "auth.sso_group_provision", "failed", username,
-                                        "user", "", "",
-                                        "reason=" + reconciled.error() + ";source=entra");
+                // cons-S3 — a no-op reconcile (nothing added or removed; the
+                // asserted set exactly matched what was already on record)
+                // writes no provisioning audit row. Every login after the
+                // first steady-state one is typically a no-op; auditing each
+                // would swamp the log with rows carrying no new information.
+                if (reconciled->added + reconciled->removed > 0) {
+                    audit_log_for_principal(
+                        req, "auth.sso_group_provision", "ok", username, "user", "", "",
+                        "source=entra;added=" + std::to_string(reconciled->added) +
+                            ";removed=" + std::to_string(reconciled->removed));
+                }
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_sso_group_provision_total",
-                              {{"source", "entra"}, {"result", "error"}})
+                              {{"source", "entra"}, {"result", "ok"}})
                         .increment();
                 }
-                res.set_redirect("/login?error=sso_failed");
-                return;
-            }
-
-            audit_log_for_principal(req, "auth.sso_group_provision", "ok", username, "user", "",
-                                    "", "source=entra;asserted=" + std::to_string(asserted.size()));
-            if (auto* m = auth_mgr_.metrics_registry()) {
-                m->counter("yuzu_auth_sso_group_provision_total",
-                          {{"source", "entra"}, {"result", "ok"}})
-                    .increment();
             }
         }
 

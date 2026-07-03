@@ -8,6 +8,7 @@
 #include <sqlite3.h>
 
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <shared_mutex>
 #include <string_view>
@@ -18,20 +19,51 @@ namespace yuzu::server {
 
 namespace {
 
-/// Reserved IdP-namespace prefixes (see `namespaced_group_name`). A
-/// `source=='local'` group create is rejected if `name` starts with one of
-/// these + ':' — it would otherwise be indistinguishable from (and could be
-/// used to pre-seed roles for) a same-named IdP group. #1832.
-constexpr std::array<std::string_view, 4> kReservedIdpPrefixes = {"local:", "entra:", "saml:",
-                                                                   "ad:"};
+/// Single source of truth for the identity-provider `source` values
+/// `reconcile_idp_memberships` / `namespaced_group_name` recognize. Adding a
+/// future IdP (e.g. "okta") here is the ONLY edit required to also reserve
+/// its `okta:` prefix from local-group creation below — `kReservedIdpPrefixes`
+/// is derived from this list, never maintained as a second parallel array.
+/// #1832 hardening sec-L2.
+constexpr std::array<std::string_view, 3> kRecognizedIdpSources = {"entra", "saml", "ad"};
 
+/// "local:" is reserved too even though "local" itself is never a
+/// `reconcile_idp_memberships` source (rejected outright — see UP-6 below):
+/// a local group literally named "local:x" is confusing enough to preclude
+/// pre-emptively, and doing so costs nothing.
+constexpr std::string_view kLocalPrefix = "local:";
+
+/// A `source=='local'` group create is rejected if `name` starts with one of
+/// `kRecognizedIdpSources` + ':' (or `kLocalPrefix`) — it would otherwise be
+/// indistinguishable from (and could be used to pre-seed roles for) a
+/// same-named IdP group. #1832.
 bool has_reserved_idp_prefix(std::string_view name) {
-    for (auto prefix : kReservedIdpPrefixes) {
-        if (name.size() >= prefix.size() && name.compare(0, prefix.size(), prefix) == 0)
+    if (name.size() >= kLocalPrefix.size() && name.compare(0, kLocalPrefix.size(), kLocalPrefix) == 0)
+        return true;
+    for (auto source : kRecognizedIdpSources) {
+        if (name.size() > source.size() && name[source.size()] == ':' &&
+            name.compare(0, source.size(), source) == 0)
             return true;
     }
     return false;
 }
+
+/// Whitespace-only or empty (UP-9 input validation) — an asserted IdP group
+/// entry with a blank `external_id` would otherwise create a garbage
+/// `<source>:` or `<source>:   ` group row.
+bool is_blank(std::string_view s) {
+    for (unsigned char c : s) {
+        if (!std::isspace(c))
+            return false;
+    }
+    return true; // empty also counts as blank
+}
+
+/// Upper bound on a single asserted `external_id`'s length. Generous relative
+/// to any real IdP group-id format (Entra object IDs are 36-char GUIDs); this
+/// is defense-in-depth against a malformed/hostile assertion, not a format
+/// constraint. #1832 hardening UP-9.
+constexpr size_t kMaxExternalIdLength = 512;
 
 } // namespace
 
@@ -971,13 +1003,48 @@ std::expected<void, std::string> RbacStore::remove_group_member(const std::strin
     return {};
 }
 
-std::expected<void, std::string> RbacStore::reconcile_idp_memberships(
+std::expected<ReconcileResult, std::string> RbacStore::reconcile_idp_memberships(
     const std::string& username, const std::string& source,
     const std::vector<std::pair<std::string, std::string>>& asserted) {
     // Cap check runs BEFORE the lock/transaction — an over-cap call mutates
     // nothing, per the documented contract.
     if (asserted.size() > kMaxIdpGroupsPerLogin)
         return std::unexpected("group_count_exceeded");
+
+    // UP-6: the stale-membership DELETE below is scoped to
+    // `groups.source = ?` and is safe ONLY because every real caller passes
+    // an IdP source ("entra"/"saml"/"ad"). A miswired call with "local" (or
+    // an empty source) would mass-DELETE every local group membership
+    // fleet-wide on the very next reconcile. Reject outright, before the
+    // lock/transaction — no mutation on this rejection either.
+    if (source.empty() || source == "local")
+        return std::unexpected("invalid_source");
+
+    // UP-9: drop asserted entries whose external_id can't produce a sane
+    // group name — blank/whitespace-only, or implausibly long (a
+    // malformed/hostile assertion). Filtering happens BEFORE `namespaced` is
+    // computed so the upsert loop and the stale-membership NOT-IN list agree
+    // on exactly what "asserted" means (same invariant the original code
+    // preserved for duplicate external_ids).
+    std::vector<std::pair<std::string, std::string>> valid;
+    valid.reserve(asserted.size());
+    for (const auto& a : asserted) {
+        if (is_blank(a.first)) {
+            spdlog::warn(
+                "reconcile_idp_memberships: skipping asserted entry with blank external_id "
+                "(user='{}', source='{}')",
+                username, source);
+            continue;
+        }
+        if (a.first.size() > kMaxExternalIdLength) {
+            spdlog::warn(
+                "reconcile_idp_memberships: skipping asserted external_id exceeding {} bytes "
+                "(user='{}', source='{}')",
+                kMaxExternalIdLength, username, source);
+            continue;
+        }
+        valid.push_back(a);
+    }
 
     std::unique_lock lock(mtx_);
     if (!db_)
@@ -992,8 +1059,8 @@ std::expected<void, std::string> RbacStore::reconcile_idp_memberships(
     // exactly what "asserted" means even if a caller passes duplicate
     // external_ids.
     std::vector<std::string> namespaced;
-    namespaced.reserve(asserted.size());
-    for (const auto& a : asserted)
+    namespaced.reserve(valid.size());
+    for (const auto& a : valid)
         namespaced.push_back(namespaced_group_name(source, a.first));
 
     if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK)
@@ -1004,6 +1071,8 @@ std::expected<void, std::string> RbacStore::reconcile_idp_memberships(
     // statements.
     SqliteTxn txn(db_);
 
+    ReconcileResult result;
+
     {
         SqliteStmt ins_group;
         if (sqlite3_prepare_v2(db_,
@@ -1011,15 +1080,29 @@ std::expected<void, std::string> RbacStore::reconcile_idp_memberships(
                                "external_id, created_at) VALUES (?, ?, ?, ?, ?);",
                                -1, ins_group.addr(), nullptr) != SQLITE_OK)
             return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+        // sec-L1: verify the (possibly pre-existing) group row's source
+        // before joining a membership to it. `INSERT OR IGNORE` above never
+        // overwrites a pre-existing row, so a name collision with a
+        // DIFFERENT-source row (e.g. a local group literally named
+        // `entra:<gid>`, created before the `create_group` reserved-prefix
+        // guard existed) leaves that row exactly as it was — this check is
+        // what stops the membership INSERT that follows from joining it.
+        SqliteStmt check_source;
+        if (sqlite3_prepare_v2(db_, "SELECT source FROM groups WHERE name = ?;", -1,
+                               check_source.addr(), nullptr) != SQLITE_OK)
+            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+        // RETURNING (not sqlite3_changes()) carries the "was a NEW row
+        // inserted" signal in the step result itself — #1033.
         SqliteStmt ins_member;
-        if (sqlite3_prepare_v2(
-                db_, "INSERT OR IGNORE INTO group_members (group_name, username) VALUES (?, ?);",
-                -1, ins_member.addr(), nullptr) != SQLITE_OK)
+        if (sqlite3_prepare_v2(db_,
+                               "INSERT OR IGNORE INTO group_members (group_name, username) "
+                               "VALUES (?, ?) RETURNING 1;",
+                               -1, ins_member.addr(), nullptr) != SQLITE_OK)
             return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
 
-        for (size_t i = 0; i < asserted.size(); ++i) {
-            const auto& external_id = asserted[i].first;
-            const auto& display = asserted[i].second;
+        for (size_t i = 0; i < valid.size(); ++i) {
+            const auto& external_id = valid[i].first;
+            const auto& display = valid[i].second;
             const auto& name = namespaced[i];
             const auto description = std::string("IdP-provisioned group (") + source + "): " +
                                      (display.empty() ? external_id : display);
@@ -1033,12 +1116,33 @@ std::expected<void, std::string> RbacStore::reconcile_idp_memberships(
             if (sqlite3_step(ins_group.get()) != SQLITE_DONE)
                 return std::unexpected(std::string("group upsert failed: ") + sqlite3_errmsg(db_));
 
+            sqlite3_reset(check_source.get());
+            sqlite3_bind_text(check_source.get(), 1, name.c_str(), -1, SQLITE_TRANSIENT);
+            bool source_mismatch = false;
+            if (sqlite3_step(check_source.get()) == SQLITE_ROW) {
+                const auto* existing =
+                    reinterpret_cast<const char*>(sqlite3_column_text(check_source.get(), 0));
+                if (existing && source != existing)
+                    source_mismatch = true;
+            }
+            if (source_mismatch) {
+                spdlog::warn(
+                    "reconcile_idp_memberships: NOT joining '{}' to pre-existing group '{}' — "
+                    "row source differs from reconcile source '{}' (confused-deputy guard)",
+                    username, name, source);
+                continue;
+            }
+
             sqlite3_reset(ins_member.get());
             sqlite3_bind_text(ins_member.get(), 1, name.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(ins_member.get(), 2, username.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(ins_member.get()) != SQLITE_DONE)
+            int rc = sqlite3_step(ins_member.get());
+            if (rc == SQLITE_ROW) {
+                ++result.added;
+            } else if (rc != SQLITE_DONE) {
                 return std::unexpected(std::string("membership upsert failed: ") +
                                        sqlite3_errmsg(db_));
+            }
         }
     }
 
@@ -1051,6 +1155,8 @@ std::expected<void, std::string> RbacStore::reconcile_idp_memberships(
     // user) removes ALL of the user's source-scoped memberships, which is the
     // deprovisioning-bypass fix: the next SSO login after a full IdP-group
     // removal drops every role that flowed through that source. #1832.
+    // RETURNING (not sqlite3_changes()) carries the removed-row count in the
+    // step results — #1033.
     {
         std::string sql = "DELETE FROM group_members "
                           "WHERE username = ? "
@@ -1061,7 +1167,7 @@ std::expected<void, std::string> RbacStore::reconcile_idp_memberships(
                 sql += (i == 0 ? "?" : ",?");
             sql += ")";
         }
-        sql += ";";
+        sql += " RETURNING group_name;";
 
         SqliteStmt del;
         if (sqlite3_prepare_v2(db_, sql.c_str(), -1, del.addr(), nullptr) != SQLITE_OK)
@@ -1071,7 +1177,10 @@ std::expected<void, std::string> RbacStore::reconcile_idp_memberships(
         int idx = 3;
         for (const auto& name : namespaced)
             sqlite3_bind_text(del.get(), idx++, name.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(del.get()) != SQLITE_DONE)
+        int rc;
+        while ((rc = sqlite3_step(del.get())) == SQLITE_ROW)
+            ++result.removed;
+        if (rc != SQLITE_DONE)
             return std::unexpected(std::string("stale-membership delete failed: ") +
                                    sqlite3_errmsg(db_));
     }
@@ -1080,7 +1189,7 @@ std::expected<void, std::string> RbacStore::reconcile_idp_memberships(
         return std::unexpected(std::string("commit failed: ") + sqlite3_errmsg(db_));
 
     invalidate_perm_cache();
-    return {};
+    return result;
 }
 
 // ── Authorization check ──────────────────────────────────────────────────────

@@ -45,6 +45,16 @@ struct RbacGroup {
     int64_t created_at{0};
 };
 
+/// Membership counts changed by a `reconcile_idp_memberships` call — how many
+/// asserted memberships were newly ADDED and how many stale memberships were
+/// REMOVED. Both are 0 for a no-op reconcile (the asserted set exactly
+/// matched what was already on record), which callers use to skip writing a
+/// provisioning audit row for a login that changed nothing. #1832 hardening.
+struct ReconcileResult {
+    size_t added{0};
+    size_t removed{0};
+};
+
 class RbacStore {
 public:
     explicit RbacStore(const std::filesystem::path& db_path);
@@ -108,26 +118,44 @@ public:
     static constexpr size_t kMaxIdpGroupsPerLogin = 200;
 
     /// Reconcile the IdP-asserted group memberships for `username` under
-    /// `source` ("entra"/"saml"/"ad" — never "local") against what
-    /// `group_members` currently records for that (user, source) pair.
+    /// `source` ("entra"/"saml"/"ad" — never "local"/empty, rejected below)
+    /// against what `group_members` currently records for that (user,
+    /// source) pair.
     ///
     /// In one transaction:
-    ///   1. Upserts a namespaced group (`namespaced_group_name(source, id)`)
-    ///      and membership row for every asserted `{external_id, display}`.
-    ///   2. Deletes any of the user's memberships in a `source`-owned group
-    ///      that was NOT in the asserted set — this is what makes IdP-group
-    ///      removal (deprovisioning) take effect on next login instead of
-    ///      accumulating stale grants forever.
+    ///   1. Skips any asserted entry whose `external_id` is empty/whitespace-
+    ///      only or longer than 512 bytes (defends against a malformed/hostile
+    ///      assertion seeding a garbage group; #1832 hardening UP-9).
+    ///   2. For each remaining `{external_id, display}`: upserts a namespaced
+    ///      group (`namespaced_group_name(source, id)`, `INSERT OR IGNORE` so
+    ///      a pre-existing row's `source`/description is never overwritten),
+    ///      then — ONLY if that group row's `source` matches this call's
+    ///      `source` — upserts the membership row. A namespaced name that
+    ///      collides with a PRE-EXISTING row of a DIFFERENT source (e.g. a
+    ///      local group literally named `entra:<gid>`, created before the
+    ///      `create_group` reserved-prefix guard existed) is never joined —
+    ///      that would leak the local group's already-granted roles to the
+    ///      IdP-authenticated user (#1832 hardening sec-L1).
+    ///   3. Deletes any of the user's memberships in a `source`-owned group
+    ///      that was NOT in the (filtered) asserted set — this is what makes
+    ///      IdP-group removal (deprovisioning) take effect on next login
+    ///      instead of accumulating stale grants forever.
     /// Local memberships (`groups.source == 'local'`) are never touched: the
     /// stale-membership DELETE is scoped to `groups.source = ?` (the caller's
     /// `source`), so a user's local group memberships survive every IdP login.
     ///
     /// Returns `unexpected("group_count_exceeded")` WITHOUT mutating anything
-    /// if `asserted.size() > kMaxIdpGroupsPerLogin`. Callers (the OIDC/SAML
-    /// callback handlers) MUST treat any `unexpected` result as fail-closed:
-    /// deny the login rather than mint a session with unreconciled/stale
-    /// roles. #1832.
-    std::expected<void, std::string>
+    /// if `asserted.size() > kMaxIdpGroupsPerLogin`, and
+    /// `unexpected("invalid source: ...")` WITHOUT mutating anything if
+    /// `source` is empty or `"local"` — the source-scoped stale-membership
+    /// DELETE is only safe for IdP sources; a miswired caller passing
+    /// `"local"` would mass-delete every local group membership fleet-wide
+    /// (#1832 hardening UP-6). Callers (the OIDC/SAML callback handlers) MUST
+    /// treat any `unexpected` result as fail-closed: deny the login rather
+    /// than mint a session with unreconciled/stale roles. On success, returns
+    /// the `{added, removed}` membership counts so a no-op login (nothing
+    /// added or removed) can skip writing a provisioning audit row. #1832.
+    std::expected<ReconcileResult, std::string>
     reconcile_idp_memberships(const std::string& username, const std::string& source,
                               const std::vector<std::pair<std::string, std::string>>& asserted);
 
