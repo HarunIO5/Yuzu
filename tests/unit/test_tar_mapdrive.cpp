@@ -168,11 +168,18 @@ TEST_CASE("mapdrive insert: historical + live rows round-trip through TarDatabas
     REQUIRE(res.has_value());
     REQUIRE(res->rows.size() == 3);
 
-    // Historical row with a real timestamp.
+    // Historical row with a real timestamp. Assert the string columns individually
+    // (remote_path/remote_host/username/provider) so a bind-order transposition in
+    // insert_mapdrive_events cannot pass undetected.
     CHECK(res->rows[0][0] == "1000");
     CHECK(res->rows[0][1] == "historical");
-    CHECK(res->rows[0][8] == "historical");
-    CHECK(res->rows[0][5] == "srv");
+    CHECK(res->rows[0][2] == "outbound");
+    CHECK(res->rows[0][3] == "Z:");
+    CHECK(res->rows[0][4] == "\\\\srv\\share"); // remote_path
+    CHECK(res->rows[0][5] == "srv");            // remote_host
+    CHECK(res->rows[0][6] == "alice");          // username
+    CHECK(res->rows[0][7] == "SMB");            // provider
+    CHECK(res->rows[0][8] == "historical");     // origin
 
     // Historical row with ts=0 is preserved as 0 (not dropped / defaulted away).
     CHECK(res->rows[1][0] == "0");
@@ -201,4 +208,33 @@ TEST_CASE("mapdrive diff: fields with ':' '\\' and spaces do not collide",
     // Three distinct mappings — no key collision despite shared host/user and the
     // ':' / '\\' / space characters in the fields.
     REQUIRE(ev.size() == 3);
+}
+
+// ── dedup_history: identity collapse keeps the earliest non-zero ts ────────────
+
+TEST_CASE("mapdrive dedup_history: collapses by identity, keeps earliest non-zero ts",
+          "[tar][mapdrive][history]") {
+    auto row = [](int64_t ts, const char* host) {
+        MapDriveHistoryRow r;
+        r.ts = ts;
+        r.entry.direction = "outbound";
+        r.entry.remote_path = std::string("\\\\") + host + "\\share";
+        r.entry.remote_host = host;
+        r.entry.username = "alice";
+        r.entry.provider = "SMB";
+        return r;
+    };
+    // Same identity three times (ts 0, 300, 100) collapses to one row keeping the
+    // smallest NON-ZERO ts (100); a distinct host stays separate.
+    std::vector<MapDriveHistoryRow> in = {row(0, "srv"), row(300, "srv"), row(100, "srv"),
+                                          row(0, "nas")};
+    auto out = dedup_history(in);
+    REQUIRE(out.size() == 2);
+    // Find the srv row.
+    const MapDriveHistoryRow* srv = nullptr;
+    for (auto& r : out)
+        if (r.entry.remote_host == "srv")
+            srv = &r;
+    REQUIRE(srv != nullptr);
+    CHECK(srv->ts == 100); // earliest non-zero sighting wins over 0 and 300
 }

@@ -586,7 +586,21 @@ public:
             if (!db_->get_config("mapdrive_backfill_done", "").empty()) {
                 spdlog::info("TAR: mapdrive historical backfill already done — skipped");
             } else {
-                auto hist = yuzu::tar::enumerate_mapdrive_history();
+                // enumerate_mapdrive_history touches the registry / offline hives /
+                // subprocesses and does substantial allocation; a std::bad_alloc (or
+                // any future throwing edit) must not cross the plugin C-ABI boundary
+                // out of init(). Catch here and treat as an empty backfill (the
+                // dedup key stays unset below, so the next restart retries).
+                std::vector<yuzu::tar::MapDriveHistoryRow> hist;
+                try {
+                    hist = yuzu::tar::enumerate_mapdrive_history();
+                } catch (const std::exception& e) {
+                    spdlog::warn("TAR: mapdrive historical backfill enumeration threw ({}) — "
+                                 "skipping this run",
+                                 e.what());
+                } catch (...) {
+                    spdlog::warn("TAR: mapdrive historical backfill enumeration threw — skipping");
+                }
                 const auto snap = next_snapshot_id();
                 std::vector<yuzu::tar::MapDriveEvent> typed;
                 typed.reserve(hist.size());

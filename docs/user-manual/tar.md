@@ -6,7 +6,7 @@ The TAR plugin continuously captures system state snapshots and records changes 
 
 ## What TAR captures
 
-TAR monitors these categories of system activity. Processes, network connections, services, user sessions, and device performance are **always-on**; **software**, **ARP**, and **DNS** are opt-in (off by default), Windows-only today (software is machine scope only — ADR-0015 covers ARP/DNS). Further opt-in and planned sources — per-app performance, module loads, per-connection network quality — are covered under Configuration and the OS compatibility matrix below.
+TAR monitors these categories of system activity. Processes, network connections, services, user sessions, and device performance are **always-on**; **software**, **ARP**, **DNS**, and **mapped drives** are opt-in (off by default) — software/ARP/DNS are Windows-only today (software is machine scope only — ADR-0015 covers ARP/DNS), while **mapdrive** (network-share mappings in both directions, §3.8) also runs on Linux. Further opt-in and planned sources — per-app performance, module loads, per-connection network quality — are covered under Configuration and the OS compatibility matrix below.
 
 | Category | Collection interval | Events detected |
 |----------|-------------------|-----------------|
@@ -158,6 +158,7 @@ TAR runs on Windows, Linux, and macOS, but each capture source has platform-spec
 | **software** | supported (`registry`), **opt-in (off by default)** — diffs the registry Uninstall keys on the `tar.software` tick: HKLM 64-bit + WOW6432Node 32-bit (**machine scope only, no user identity / no PII**). `SystemComponent` entries (canonically a `REG_DWORD` set to a non-zero value) are excluded — system components and OS patches are not reported as installed software; names, versions, and publisher only. First run seeds the baseline silently. | planned (`dpkg_rpm`) — dpkg/rpm/pacman diff. Records nothing until wired. | planned (`pkgutil`) — `system_profiler` + pkgutil diff. Records nothing until wired. |
 | **arp** | supported (`iphlpapi`), **opt-in (off by default)** — `GetIpNetTable2(AF_UNSPEC)`: ARP + IPv6 neighbour cache; full interface/IP/MAC/entry_type (ADR-0015). | planned (`procfs`) — `/proc/net/arp`. Records nothing until wired. | planned (`route_sysctl`) — `sysctl NET_RT_FLAGS`; `entry_type` will be `unknown` (constrained). Records nothing until wired. |
 | **dns** | supported (`dnsapi`), **opt-in (off by default)** — `DnsGetCacheDataTable` + cache-only `DnsQuery_W`: name/record_type/data/TTL (ADR-0015). Device-level resolver-cache state; **no per-process attribution**. | planned (`systemd-resolved`) — resolve1 D-Bus / `/etc/hosts` fallback (constrained). Records nothing until wired. | planned (`dscacheutil`) — subprocess; TTL unavailable (`ttl_remaining_s = -1`, constrained). Records nothing until wired. |
+| **mapdrive** | supported (`wnet`/`netapi32`/`registry`), **opt-in (off by default)** — both directions (§3.8). Outbound live `WNetEnumResourceW`; outbound history registry `Network`/MRU/`MountPoints2` across offline profiles. Inbound live `NetSessionEnum` (needs local-admin/Server-Operator, degrades to empty); inbound history Security log 4624 network logons. | constrained (`procfs`) — outbound live `/proc/mounts` (no username) + history `/etc/fstab` (ts=0); inbound `smbstatus` + `/var/log/samba` connect logs, both requiring Samba (empty otherwise). | planned (`getfsstat`) — outbound via `getfsstat`/`mount`, inbound via `smbutil`. Records nothing until wired. |
 
 Status values:
 
@@ -255,8 +256,9 @@ config|software_last_run_ts|1711050000
 
 A block is emitted for every capture source. The opt-in sources report
 `<source>_enabled|false` on a fresh agent — `module`, `software` (both shown
-above), `procperf`, `netqual`, `arp`, and `dns` are off by default and must be
-enabled explicitly via `configure` (see the configuration table above). The
+above), `procperf`, `netqual`, `arp`, `dns`, and `mapdrive` are off by default
+and must be enabled explicitly via `configure` (see the configuration table
+above). The
 default-ON sources — `process`, `tcp`, `service`, `user`, and `perf` — report
 `<source>_enabled|true`. `module_live_rows` stays `0` until a collector for the
 host's OS ships; likewise `arp`/`dns` are **Windows-only today** (planned on

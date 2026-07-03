@@ -252,7 +252,7 @@ spec:
       type:
         type: string
         displayName: Event Type Filter
-        description: Filter by event type (process, network, service, user, software, arp, dns).
+        description: Filter by event type (process, network, service, user, software, arp, dns, mapdrive).
       limit:
         type: string
         displayName: Result Limit

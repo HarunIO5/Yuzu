@@ -188,10 +188,15 @@ std::string extract_paren_ip(const std::string& line) {
         if (end == std::string::npos)
             continue;
         std::string inside = line.substr(pos, end - pos);
-        // ipv4:1.2.3.4:445 -> drop the trailing :port; ipv6 keeps its colons, so
-        // strip only the final :digits port suffix if present.
+        // ipv4:1.2.3.4:445 -> drop the trailing :port. IPv6 addresses contain
+        // colons, so strip only a final :digits suffix AND only when it is not
+        // itself part of the address — i.e. the char before the last ':' is not
+        // another ':' (which would make it the "::" of a portless address like
+        // 2001:db8::1). Without that guard the last hextet of a portless IPv6
+        // address is lopped off.
         auto last = inside.find_last_of(':');
-        if (last != std::string::npos && last + 1 < inside.size() &&
+        if (last != std::string::npos && last > 0 && last + 1 < inside.size() &&
+            inside[last - 1] != ':' &&
             std::isdigit(static_cast<unsigned char>(inside[last + 1])))
             inside = inside.substr(0, last);
         return inside;
@@ -211,32 +216,6 @@ std::string word_after(const std::string& line, const std::string& marker) {
     while (pos < line.size() && !std::isspace(static_cast<unsigned char>(line[pos])))
         ++pos;
     return line.substr(start, pos - start);
-}
-
-// Collapse duplicate history rows by mapping identity, preferring the smallest
-// non-zero timestamp (the earliest known sighting). Applies the cap.
-// [[maybe_unused]]: the macOS build's enumerate_* are stubs, so nothing calls it.
-[[maybe_unused]] std::vector<MapDriveHistoryRow> dedup_history(std::vector<MapDriveHistoryRow> rows) {
-    std::unordered_map<std::string, std::size_t> seen;
-    std::vector<MapDriveHistoryRow> out;
-    out.reserve(rows.size());
-    for (auto& r : rows) {
-        std::string key = r.entry.direction + "\x1f" + r.entry.local_mount + "\x1f" +
-                          r.entry.remote_path + "\x1f" + r.entry.remote_host + "\x1f" +
-                          r.entry.username;
-        auto it = seen.find(key);
-        if (it == seen.end()) {
-            seen.emplace(std::move(key), out.size());
-            out.push_back(std::move(r));
-        } else {
-            auto& kept = out[it->second];
-            if (r.ts != 0 && (kept.ts == 0 || r.ts < kept.ts))
-                kept.ts = r.ts;
-        }
-        if (out.size() >= kMapDriveHistoryCap)
-            break;
-    }
-    return out;
 }
 
 // popen/_popen capture (constant command strings only — see the header note; no
@@ -272,7 +251,61 @@ std::string word_after(const std::string& line, const std::string& marker) {
     return ss.str();
 }
 
+// Read at most the LAST max_bytes of a file. Samba's log.smbd on a busy file
+// server can be hundreds of MB (or unbounded with `max log size = 0`); slurping
+// it whole on the init-critical backfill path is a memory/latency hazard. The
+// most recent connects are at the tail, which is what the backfill wants anyway.
+// Starts at a line boundary so parse_samba_logs never sees a half-truncated line.
+[[maybe_unused]] std::string read_file_tail(const std::string& path, std::size_t max_bytes) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f)
+        return {};
+    std::streamoff size = f.tellg();
+    if (size <= 0)
+        return {};
+    std::size_t want = static_cast<std::size_t>(size);
+    bool truncated = want > max_bytes;
+    if (truncated)
+        want = max_bytes;
+    f.seekg(static_cast<std::streamoff>(static_cast<std::size_t>(size) - want), std::ios::beg);
+    std::string buf(want, '\0');
+    f.read(buf.data(), static_cast<std::streamsize>(want));
+    buf.resize(static_cast<std::size_t>(f.gcount()));
+    // Drop a leading partial line if we started mid-file.
+    if (truncated) {
+        if (auto nl = buf.find('\n'); nl != std::string::npos)
+            buf.erase(0, nl + 1);
+    }
+    return buf;
+}
+
 } // namespace
+
+// Collapse duplicate history rows by mapping identity, preferring the smallest
+// non-zero timestamp (the earliest known sighting). Applies the cap. Defined at
+// yuzu::tar scope (not the anonymous namespace) so it is unit-testable.
+std::vector<MapDriveHistoryRow> dedup_history(std::vector<MapDriveHistoryRow> rows) {
+    std::unordered_map<std::string, std::size_t> seen;
+    std::vector<MapDriveHistoryRow> out;
+    out.reserve(rows.size());
+    for (auto& r : rows) {
+        std::string key = r.entry.direction + "\x1f" + r.entry.local_mount + "\x1f" +
+                          r.entry.remote_path + "\x1f" + r.entry.remote_host + "\x1f" +
+                          r.entry.username;
+        auto it = seen.find(key);
+        if (it == seen.end()) {
+            seen.emplace(std::move(key), out.size());
+            out.push_back(std::move(r));
+        } else {
+            auto& kept = out[it->second];
+            if (r.ts != 0 && (kept.ts == 0 || r.ts < kept.ts))
+                kept.ts = r.ts;
+        }
+        if (out.size() >= kMapDriveHistoryCap)
+            break;
+    }
+    return out;
+}
 
 // ── Pure parsers (compiled everywhere; unit-tested off-OS) ────────────────────
 
@@ -595,6 +628,19 @@ struct RegKeyGuard {
     }
 };
 
+// RAII unload for a RegLoadKeyW-mounted offline hive. Construct it BEFORE the
+// RegKeyGuard for the mounted root so destruction order (reverse of
+// construction) closes the root key first, then unloads — and the unload runs on
+// EVERY exit including an exception (e.g. std::bad_alloc from a string/vector
+// grow while reading the hive). A leaked mount locks NTUSER.DAT until reboot.
+struct HiveUnloadGuard {
+    std::wstring mount;
+    ~HiveUnloadGuard() {
+        if (!mount.empty())
+            RegUnLoadKeyW(HKEY_USERS, mount.c_str());
+    }
+};
+
 int64_t filetime_to_epoch(const FILETIME& ft) {
     ULARGE_INTEGER u;
     u.LowPart = ft.dwLowDateTime;
@@ -632,10 +678,13 @@ std::string reg_read_sz(HKEY key, const wchar_t* name) {
 std::string decode_mountpoints2(const std::wstring& name) {
     if (name.rfind(L"##", 0) != 0)
         return {}; // volume GUIDs / drive letters are not remote shares
-    std::string u = "\\\\";
+    // Rebuild as wide (mapping '#' -> '\\') then convert once through the shared
+    // UTF-16->UTF-8 helper — a raw static_cast<char> would mangle any non-ASCII
+    // code unit in an internationalized server/share name.
+    std::wstring w = L"\\\\";
     for (std::size_t i = 2; i < name.size(); ++i)
-        u += (name[i] == L'#') ? '\\' : static_cast<char>(name[i]);
-    return u;
+        w += (name[i] == L'#') ? L'\\' : name[i];
+    return yuzu::win::from_wide(w.c_str());
 }
 
 // Read the three per-user outbound artifacts under an opened user-root hive key.
@@ -649,6 +698,8 @@ void read_user_outbound_history(HKEY user_root, const std::string& profile_user,
             DWORD idx = 0, len = 256;
             while (RegEnumKeyExW(net.h, idx, sub, &len, nullptr, nullptr, nullptr, nullptr) ==
                    ERROR_SUCCESS) {
+                if (out.size() >= kMapDriveHistoryCap)
+                    return; // per-key cap (a corrupt/huge key must not run unbounded)
                 RegKeyGuard drive;
                 if (RegOpenKeyExW(net.h, sub, 0, KEY_READ, &drive.h) == ERROR_SUCCESS) {
                     MapDriveHistoryRow r;
@@ -679,6 +730,8 @@ void read_user_outbound_history(HKEY user_root, const std::string& profile_user,
             wchar_t vname[128];
             DWORD vidx = 0, vlen = 128;
             for (;; vidx++, vlen = 128) {
+                if (out.size() >= kMapDriveHistoryCap)
+                    return; // per-key cap
                 LONG er = RegEnumValueW(mru.h, vidx, vname, &vlen, nullptr, nullptr, nullptr, nullptr);
                 if (er != ERROR_SUCCESS)
                     break;
@@ -708,6 +761,8 @@ void read_user_outbound_history(HKEY user_root, const std::string& profile_user,
             DWORD idx = 0, len = 256;
             while (RegEnumKeyExW(mp.h, idx, sub, &len, nullptr, nullptr, nullptr, nullptr) ==
                    ERROR_SUCCESS) {
+                if (out.size() >= kMapDriveHistoryCap)
+                    return; // per-key cap
                 std::string unc = decode_mountpoints2(sub);
                 if (!unc.empty()) {
                     RegKeyGuard sk;
@@ -760,7 +815,17 @@ void enum_registry_outbound_history(std::vector<MapDriveHistoryRow>& out) {
             if (!img.empty()) {
                 auto slash = img.find_last_of("\\/");
                 profile_user = (slash == std::string::npos) ? img : img.substr(slash + 1);
-                ntuser = yuzu::win::to_wide(img) + L"\\NTUSER.DAT";
+                // ProfileImagePath is REG_EXPAND_SZ and reg_read_sz does NOT expand
+                // it; a literal token (e.g. %SystemDrive%\Users\name on some
+                // provisioning setups) would make RegLoadKeyW fail and silently drop
+                // that profile. Expand it, matching installed_apps::do_list_per_user.
+                std::wstring imgw = yuzu::win::to_wide(img);
+                wchar_t expanded[1024]{};
+                DWORD en = ExpandEnvironmentStringsW(imgw.c_str(), expanded,
+                                                     static_cast<DWORD>(std::size(expanded)));
+                std::wstring base = (en > 0 && en <= std::size(expanded)) ? std::wstring(expanded)
+                                                                          : imgw;
+                ntuser = base + L"\\NTUSER.DAT";
             }
         }
 
@@ -772,17 +837,14 @@ void enum_registry_outbound_history(std::vector<MapDriveHistoryRow>& out) {
             std::wstring mount = L"YUZU_TAR_" + sid_str;
             LONG lr = RegLoadKeyW(HKEY_USERS, mount.c_str(), ntuser.c_str());
             if (lr == ERROR_SUCCESS) {
-                // Inner scope: every handle into the hive (the mounted root here,
-                // plus the child keys opened inside read_user_outbound_history)
-                // must be closed BEFORE RegUnLoadKeyW, or the unload fails and
-                // leaks a hive that locks NTUSER.DAT until reboot.
-                {
-                    RegKeyGuard mounted;
-                    if (RegOpenKeyExW(HKEY_USERS, mount.c_str(), 0, KEY_READ, &mounted.h) ==
-                        ERROR_SUCCESS)
-                        read_user_outbound_history(mounted.h, profile_user, out);
-                }
-                RegUnLoadKeyW(HKEY_USERS, mount.c_str());
+                // unload constructed FIRST so it destructs LAST (after `mounted`
+                // closes the root key). Both run on an exceptional unwind too, so
+                // the hive is always unloaded — no NTUSER.DAT lock-until-reboot.
+                HiveUnloadGuard unload{mount};
+                RegKeyGuard mounted;
+                if (RegOpenKeyExW(HKEY_USERS, mount.c_str(), 0, KEY_READ, &mounted.h) ==
+                    ERROR_SUCCESS)
+                    read_user_outbound_history(mounted.h, profile_user, out);
             }
             // ERROR_PRIVILEGE_NOT_HELD / sharing violation -> skip this offline user.
         }
@@ -804,11 +866,14 @@ std::vector<MapDriveEntry> enumerate_mapdrive() {
 std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
     std::vector<MapDriveHistoryRow> rows;
     enum_registry_outbound_history(rows);
-    // Inbound history: Security event log 4624 (network) / 4634 via wevtutil.
-    // Bounded read; constant query (no interpolation). Empty on access denial.
+    // Inbound history: Security event log 4624 (successful logon), filtered to
+    // logon_type=3 (network) by the parser. Query 4624 ONLY — 4634 (logoff) is
+    // not parsed, so including it would waste up to half the newest-first /c:5000
+    // budget on events we discard, halving the effective backfill depth. Bounded
+    // read; constant query (no interpolation). Empty on access denial.
     const std::string cmd =
         "wevtutil qe Security "
-        "/q:\"*[System[(EventID=4624 or EventID=4634)]]\" /c:5000 /f:text /rd:true 2>nul";
+        "/q:\"*[System[(EventID=4624)]]\" /c:5000 /f:text /rd:true 2>nul";
     auto inbound = parse_win_security_logons(run_command(cmd));
     rows.insert(rows.end(), inbound.begin(), inbound.end());
     return dedup_history(std::move(rows));
@@ -836,9 +901,14 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
     std::vector<MapDriveHistoryRow> rows = parse_fstab(read_file("/etc/fstab"));
     // Inbound history: Samba connect events. Prefer the on-disk log; fall back to
     // journald. Best-effort (log verbosity varies) — empty where neither exists.
-    std::string logs = read_file("/var/log/samba/log.smbd");
+    // Bounded: read only the last 4 MiB (the recent tail — a busy server's
+    // log.smbd is unbounded with `max log size = 0`) and cap the journalctl
+    // fallback with a timeout so a hung journald can't stall the init backfill.
+    constexpr std::size_t kSambaLogTailBytes = 4u * 1024 * 1024;
+    std::string logs = read_file_tail("/var/log/samba/log.smbd", kSambaLogTailBytes);
     if (logs.empty())
-        logs = run_command("journalctl -u smbd --no-pager -o short-iso -n 5000 2>/dev/null");
+        logs = run_command(
+            "timeout 15 journalctl -u smbd --no-pager -o short-iso -n 5000 2>/dev/null");
     auto inbound = parse_samba_logs(logs);
     rows.insert(rows.end(), inbound.begin(), inbound.end());
     return dedup_history(std::move(rows));

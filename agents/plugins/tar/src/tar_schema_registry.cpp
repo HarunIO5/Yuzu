@@ -779,18 +779,17 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "Outbound live: WNetOpenEnumW/WNetEnumResourceW + WNetGetUserW "
                  "(unprivileged). Outbound history: HKCU\\Network + Map Network "
                  "Drive MRU + MountPoints2 across offline profiles, ts = subkey "
-                 "last-write. Inbound live: NetSessionEnum L502→L10 (+ "
-                 "NetConnectionEnum for the share) — needs local-admin / "
-                 "Server-Operator, degrades to empty on ERROR_ACCESS_DENIED. "
-                 "Inbound history: Security event log 4624 (logon_type=3) / 4634 "
-                 "via wevtutil, ts = event time."},
+                 "last-write. Inbound live: NetSessionEnum L502→L10 — needs "
+                 "local-admin / Server-Operator, degrades to empty on "
+                 "ERROR_ACCESS_DENIED. Inbound history: Security event log 4624 "
+                 "(logon_type=3 network) via wevtutil, ts = event time."},
                 {"linux",   OsSupportStatus::kSupportedConstrained, "procfs",
                  "Outbound live: /proc/mounts fstype∈{cifs,smb3,nfs,nfs4,"
                  "fuse.sshfs} (username unavailable). Outbound history: /etc/fstab "
-                 "cifs/nfs entries (ts=0) + current mounts. Inbound live: smbstatus "
-                 "-b/-S — needs Samba installed + read access, degrades to empty "
-                 "otherwise. Inbound history: /var/log/samba connect events, "
-                 "journalctl -u smbd fallback."},
+                 "cifs/nfs entries (ts=0). Inbound live: smbstatus -b — needs Samba "
+                 "installed + read access, degrades to empty otherwise. Inbound "
+                 "history: /var/log/samba connect events (bounded tail), journalctl "
+                 "-u smbd fallback."},
                 {"macos",   OsSupportStatus::kPlanned,              "getfsstat",
                  "Outbound via getfsstat / `mount` NFS/SMB entries; inbound via "
                  "smbutil. Wired in the macOS follow-up (returns empty today)."},

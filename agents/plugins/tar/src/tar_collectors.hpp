@@ -191,12 +191,20 @@ std::vector<MapDriveEntry> enumerate_mapdrive();
  * Enumerate PREVIOUS (historical) mapped drives for the one-time init backfill
  * (capability-map §3.8). Windows: outbound from HKCU\Network + Map Network Drive
  * MRU + MountPoints2 across offline profiles (ts = subkey last-write), inbound
- * from Security event log 4624/4634 network logons (ts = event time). Linux:
- * outbound from /etc/fstab (ts=0), inbound from Samba logs (ts = log time).
+ * from Security event log 4624 (logon_type=3 network) logons (ts = event time).
+ * Linux: outbound from /etc/fstab (ts=0), inbound from Samba logs (ts = log time).
  * Returns `{}` on macOS. Deduplicated by mapping identity, capped at
  * kMapDriveHistoryCap.
  */
 std::vector<MapDriveHistoryRow> enumerate_mapdrive_history();
+
+/**
+ * Collapse duplicate historical rows by mapping identity (direction, local_mount,
+ * remote_path, remote_host, username), keeping the smallest non-zero timestamp
+ * (earliest known sighting), and apply kMapDriveHistoryCap. Declared here so it is
+ * unit-testable (the enumerate_* callers are I/O-gated).
+ */
+std::vector<MapDriveHistoryRow> dedup_history(std::vector<MapDriveHistoryRow> rows);
 
 // ── Pure text parsers for the mapdrive collector (no I/O — unit-tested) ────────
 // The platform shell does the I/O (subprocess / registry / file read) and hands
@@ -214,7 +222,8 @@ std::vector<MapDriveHistoryRow> parse_fstab(const std::string& text);
 std::vector<MapDriveEntry> parse_smbstatus(const std::string& text);
 
 /** Parse `wevtutil qe Security … /f:text` output into historical inbound rows:
- *  4624 logon_type=3 (network) and 4634 logoff events, ts = event time. */
+ *  4624 events with logon_type=3 (network), ts = event time. 4634 (logoff) blocks
+ *  are ignored — the collector queries 4624 only. */
 std::vector<MapDriveHistoryRow> parse_win_security_logons(const std::string& text);
 
 /** Parse Samba `log.smbd` / `journalctl -u smbd` text into historical inbound
@@ -226,10 +235,14 @@ std::vector<MapDriveHistoryRow> parse_samba_logs(const std::string& text);
 /// unbounded.
 inline constexpr std::size_t kArpEntryCap = 2048;
 inline constexpr std::size_t kDnsEntryCap = 4096;
-/// Live mapped-drive snapshot cap (inbound sessions on a file server can be many)
-/// and backfill cap (event-log / Samba history can be large).
+/// Live mapped-drive snapshot cap (inbound sessions on a file server can be many).
 inline constexpr std::size_t kMapDriveEntryCap = 4096;
-inline constexpr std::size_t kMapDriveHistoryCap = 8192;
+/// Historical-backfill cap. Kept below mapdrive_live's row-count retention
+/// (retention_default = 5000) so a one-shot backfill cannot alone overflow the
+/// live tier and evict its own rows on the first retention pass; historical rows
+/// share the live row budget with subsequent live diff rows (mapped drives are
+/// low-cardinality, so this is a safety backstop, not an expected limit).
+inline constexpr std::size_t kMapDriveHistoryCap = 4096;
 /// Per-cycle cap on installed-software entries (machine + all per-user hives in
 /// one tick). Sized to hold a bloated many-profile RDS/Citrix host's full
 /// inventory while bounding memory + tick duration on a corrupt/huge registry
