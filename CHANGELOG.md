@@ -149,9 +149,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently inherit their roles). The stable principal is now `"oidc:" + iss + "#" + sub`
   (`sub` is only guaranteed unique per-issuer per RFC 7519, hence the `iss` scoping); the
   mutable display name moves to a new `Session::display_name` field, used for UI/audit-detail
-  rendering only. A new `AuthManager::resolve_sso_identity(principal_id)` resolution map
-  (upserted on every OIDC login) lets UI/audit render a human name for the opaque stable
-  principal without a live session. Every nav-bar "who am I" render site (`/api/me`,
+  rendering only; every SSO audit row also carries the sanitized human name in its `detail`
+  string, so a principal's name is recoverable from the audit log without a live session
+  (there is no persistent principal→name directory — that is tracked as a fast-follow, #1852).
+  Every nav-bar "who am I" render site (`/api/me`,
   `/api/v1/me`, and the ten dashboard-page `nav-user`/`context-user` JS blocks) now shows
   `display_name`, falling back to the stable id. SAML session-keying is unchanged this slice
   (still the raw NameID) — SAML doesn't sync to `rbac_store` yet, so its principal risk is
@@ -160,19 +161,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **OIDC group→RBAC role assignments must be re-pointed at the namespaced group name.** #1832
+  changed how IdP-asserted groups are stored — an asserted Entra group `8f3c...` is now the RBAC
+  group `entra:8f3c...`, not the raw id. Any role you previously delegated directly to the raw-gid
+  group does **not** automatically move to the namespaced one; re-assign it to `entra:<group-id>`
+  (the old raw-id row is left in place, harmless but unreachable by future logins). See
+  `docs/user-manual/authentication.md` "RBAC Group Provisioning".
 - **SSO operators re-login to regain group roles (#1837).** OIDC sessions now key on
   `oidc:<iss>#<sub>` instead of the display name (see the Security entry above). `RbacStore`
   migration v3 purges every IdP-sourced `group_members` row on upgrade (old display-name-keyed
   memberships are unreachable and would otherwise be a resurrected confused-deputy risk if a
   local user later took that display name) — they re-populate under the new stable key on each
-  SSO user's next login.
-  **OIDC JIT admin elevation is temporarily unavailable for SSO operators**, pending durable SSO
-  identity provisioning (**issue #1852**). `AuthDB::set_elevation_eligible`/`is_elevation_eligible`
-  key on `users.username` and are gated through `is_valid_username` (alphanumerics + `. _ -`
-  only); the stable `oidc:<iss>#<sub>` principal fails that check unconditionally. More
-  fundamentally, an OIDC login provisions **no `users` row at all** — there is no local record to
-  set the flag on, widened validator or not. An admin **cannot** restore this today by
-  "re-providing eligibility against the stable id"; that path does not exist until #1852 lands.
+  SSO user's next login. **Release note:** between the v3 migration and a user's first re-login,
+  an operator whose admin role comes *only* from SSO group membership is roleless — recover via
+  a fresh SSO login (repopulates the membership), `--oidc-admin-group` (grants admin directly on
+  next login without needing the group reconcile), or a local admin / the break-glass account.
+- **OIDC JIT admin elevation is temporarily unavailable for SSO operators (#1837).** Pending
+  durable SSO identity provisioning (**issue #1852**). `AuthDB::set_elevation_eligible`/
+  `is_elevation_eligible` key on `users.username` and are gated through `is_valid_username`
+  (alphanumerics + `. _ -` only); the stable `oidc:<iss>#<sub>` principal fails that check
+  unconditionally. More fundamentally, an OIDC login provisions **no `users` row at all** — there
+  is no local record to set the flag on, widened validator or not. An admin **cannot** restore
+  this today by "re-providing eligibility against the stable id"; that path does not exist until
+  #1852 lands.
   **This is not a regression of a previously-supported flow.** Before #1837, SSO elevation only
   ever appeared to work by accident: it required the IdP-asserted display name to *coincidentally
   equal* an existing local username, at which point the SSO session's (then-unstable, display-name-
@@ -198,12 +209,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for an SSO target) was **already** a no-op for OIDC before #1837 too, because
   `AuthDB::create_session` has never been called for an OIDC login (SSO sessions have always been
   in-memory-only, never written to `auth.db`'s `sessions` table).
-- **OIDC group→RBAC role assignments must be re-pointed at the namespaced group name.** #1832
-  changed how IdP-asserted groups are stored — an asserted Entra group `8f3c...` is now the RBAC
-  group `entra:8f3c...`, not the raw id. Any role you previously delegated directly to the raw-gid
-  group does **not** automatically move to the namespaced one; re-assign it to `entra:<group-id>`
-  (the old raw-id row is left in place, harmless but unreachable by future logins). See
-  `docs/user-manual/authentication.md` "RBAC Group Provisioning".
 
 ## [0.13.0] - 2026-07-01
 

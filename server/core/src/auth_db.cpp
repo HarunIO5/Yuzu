@@ -50,6 +50,25 @@ bool is_valid_username(const std::string& username) {
     return true;
 }
 
+bool is_reserved_identity_prefix(const std::string& username) {
+    static constexpr std::string_view kReservedPrefixes[] = {"oidc:", "saml:", "ad:"};
+    for (auto prefix : kReservedPrefixes) {
+        if (username.size() < prefix.size())
+            continue;
+        bool matches = true;
+        for (std::size_t i = 0; i < prefix.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(username[i])) !=
+                std::tolower(static_cast<unsigned char>(prefix[i]))) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches)
+            return true;
+    }
+    return false;
+}
+
 // ── SQLite column-text accessor (null-safe) ──────────────────────────────────
 //
 // sqlite3_column_text returns nullptr when the column value is SQL NULL.

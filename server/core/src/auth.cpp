@@ -942,22 +942,9 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     s.mfa_verified_at = mfa_verified_at;
     sessions_[token] = std::move(s);
 
-    // Resolution map (mu_-guarded, same as sessions_): lets UI/audit render
-    // a human name for the opaque `stable_username` without weakening the
-    // key used for authorization.
-    sso_identities_[stable_username] = SsoIdentity{resolved_display, email};
-
     spdlog::info("OIDC session created for '{}' (display={}, email={}, sub={}, role={})",
                  stable_username, resolved_display, email, oidc_sub, role_to_string(role));
     return token;
-}
-
-std::optional<SsoIdentity> AuthManager::resolve_sso_identity(const std::string& principal_id) const {
-    std::shared_lock lock(mu_);
-    auto it = sso_identities_.find(principal_id);
-    if (it == sso_identities_.end())
-        return std::nullopt;
-    return it->second;
 }
 
 // ── SAML session creation ───────────────────────────────────────────────────

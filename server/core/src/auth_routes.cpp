@@ -223,7 +223,8 @@ auth::Session AuthRoutes::synthesize_token_session(const ApiToken& api_token) {
     // #1837: no separate display label is stored for a token; fall back to
     // the principal id itself (matches the pre-#1837 behavior for local
     // principals, and is the best available label for a stable SSO id with
-    // no live session to resolve against — see resolve_sso_identity).
+    // no live session to render a human name from — there is no persistent
+    // principal→display-name directory; see #1852).
     synth.display_name = api_token.principal_id;
     synth.auth_source = api_token.mcp_tier.empty() ? "api_token" : "mcp_token";
     synth.token_scope_service = api_token.scope_service;
@@ -1834,6 +1835,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         auto result = oidc_provider_->handle_callback(code, state);
         if (!result) {
+            // No display=/email= detail here — handle_callback failed before
+            // claims were extracted (token exchange, signature, or
+            // validate_claims rejection incl. the #1837 governance sub/iss
+            // checks), so there is no human name to carry. Every OTHER
+            // auth.oidc_login_failed / auth.sso_group_provision emission
+            // below this point (claims successfully parsed) DOES carry it.
             spdlog::warn("OIDC callback failed: {}", result.error());
             audit_log(req, "auth.oidc_login_failed", "failure");
             emit_event("auth.oidc_login_failed", req,
@@ -1889,8 +1896,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     claims.groups_overage ? "groups_overage" : "groups_absent";
                 spdlog::info("OIDC group provisioning skipped for '{}': reason={}", username,
                             reason);
-                audit_log_for_principal(req, "auth.sso_group_provision", "skipped", username,
-                                        "user", "", "", "reason=" + reason + ";source=entra");
+                audit_log_for_principal(
+                    req, "auth.sso_group_provision", "skipped", username, "user", "", "",
+                    "reason=" + reason + ";source=entra" +
+                        ";display=" + detail::sanitize_detail_value(display) +
+                        ";email=" + detail::sanitize_detail_value(email));
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_sso_group_provision_total",
                               {{"source", "entra"}, {"result", "skipped"}})
@@ -1903,14 +1913,19 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 audit_log_for_principal(
                     req, "auth.sso_group_provision", "error", username, "user", "", "",
                     "reason=group_count_exceeded;count=" +
-                        std::to_string(claims.groups.size()) + ";source=entra");
+                        std::to_string(claims.groups.size()) + ";source=entra" +
+                        ";display=" + detail::sanitize_detail_value(display) +
+                        ";email=" + detail::sanitize_detail_value(email));
                 // cons-S2 — also emit the same failed-OIDC-login signal the
                 // sibling token-exchange-failure branch emits above, so a
                 // SIEM query counting failed OIDC logins by
                 // `auth.oidc_login_failed` doesn't miss a provisioning-denied
                 // login (this branch denies the login just as surely).
-                audit_log_for_principal(req, "auth.oidc_login_failed", "error", username, "user",
-                                        "", "", "reason=group_count_exceeded");
+                audit_log_for_principal(
+                    req, "auth.oidc_login_failed", "error", username, "user", "", "",
+                    std::string("reason=group_count_exceeded") +
+                        ";display=" + detail::sanitize_detail_value(display) +
+                        ";email=" + detail::sanitize_detail_value(email));
                 emit_event("auth.oidc_login_failed", req,
                           {{"source_ip", req.remote_addr},
                            {"username", username},
@@ -1934,12 +1949,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 if (!reconciled) {
                     spdlog::warn("OIDC group provisioning failed for '{}': {}", username,
                                 reconciled.error());
-                    audit_log_for_principal(req, "auth.sso_group_provision", "error", username,
-                                            "user", "", "",
-                                            "reason=" + reconciled.error() + ";source=entra");
+                    audit_log_for_principal(
+                        req, "auth.sso_group_provision", "error", username, "user", "", "",
+                        "reason=" + reconciled.error() + ";source=entra" +
+                            ";display=" + detail::sanitize_detail_value(display) +
+                            ";email=" + detail::sanitize_detail_value(email));
                     // cons-S2 — see the over-cap branch above.
-                    audit_log_for_principal(req, "auth.oidc_login_failed", "error", username,
-                                            "user", "", "", "reason=" + reconciled.error());
+                    audit_log_for_principal(
+                        req, "auth.oidc_login_failed", "error", username, "user", "", "",
+                        "reason=" + reconciled.error() +
+                            ";display=" + detail::sanitize_detail_value(display) +
+                            ";email=" + detail::sanitize_detail_value(email));
                     emit_event("auth.oidc_login_failed", req,
                               {{"source_ip", req.remote_addr},
                                {"username", username},
@@ -1963,7 +1983,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     audit_log_for_principal(
                         req, "auth.sso_group_provision", "ok", username, "user", "", "",
                         "source=entra;added=" + std::to_string(reconciled->added) +
-                            ";removed=" + std::to_string(reconciled->removed));
+                            ";removed=" + std::to_string(reconciled->removed) +
+                            ";display=" + detail::sanitize_detail_value(display) +
+                            ";email=" + detail::sanitize_detail_value(email));
                 }
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_sso_group_provision_total",

@@ -443,15 +443,37 @@ name. `display_name` is set to `claims.name` (falling back to
 free to change on every login without touching the stable principal or
 the RBAC memberships/roles bound to it.
 
-**Resolution map.** `AuthManager::resolve_sso_identity(principal_id)`
-returns the `SsoIdentity{display_name, email}` last seen for a stable
-principal, upserted on every `create_oidc_session` call
-(`AuthManager::sso_identities_`, guarded by the same `mu_` as
-`sessions_`). This lets a render site show a human name for a principal
-that has no live session right now (e.g. an admin-facing list keyed on
-`username` strings) without weakening what `check_permission` keys on.
-In-memory only — a display name is cosmetic, so it is lost on restart
-until the principal's next login re-upserts it.
+`sub` is now authorization-load-bearing (it is half of the RBAC
+principal), so `OidcProvider::validate_claims` — the same chokepoint that
+already rejects `iss`/`aud`/`exp`/`nonce` mismatches — also rejects a
+token whose `sub` is empty, contains a control character (byte `< 0x20`
+or `== 0x7F`, including CR/LF/tab), or exceeds 255 bytes, and rejects an
+empty `iss` defensively. Without this, an IdP token that omits `sub`
+would collapse every such login onto the single principal `oidc:<iss>#`
+(destructive under the #1832 reconcile), and a control/newline byte in
+`sub` would corrupt the audit `principal` column. Rejection is
+fail-closed — the login is denied (`auth.oidc_login_failed`), no session
+minted.
+
+**Recovering a human name without a live session.** There is no
+persistent principal→display-name directory. The audit `principal`
+column is the authoritative stable id (`oidc:<iss>#<sub>`) for every SSO
+audit row; the human name for that same login is carried alongside it in
+that row's `detail` field (`display=<sanitized name>;email=<sanitized
+email>` — see `/auth/callback`'s `audit_log_for_principal` calls, which
+attach this to every SSO audit action: `auth.oidc_login`,
+`auth.oidc_login_failed`, `auth.sso_group_provision`). A live session's
+`Session::display_name` is the other source, for the currently-signed-in
+user only. Rendering a principal for which no session is live and no
+audit row is being inspected (e.g. an admin-facing user list keyed on raw
+`username` strings) has no name to show today — a durable
+principal→display-name directory (persistent, survives restart, joinable
+outside an audit row) is tracked as a fast-follow in **issue #1852**. An
+earlier revision of this section documented an in-memory
+`AuthManager::sso_identities_` resolution map upserted on every
+`create_oidc_session` call; it had zero production callers (every render
+site used a live session or an audit-row detail instead) and was removed
+as dead code in the #1837 governance hardening round.
 
 **Render sites.** `GET /api/me` (the legacy dashboard nav-bar
 "who am I", consumed by every page's `nav-user`/`context-user` JS) and
@@ -465,6 +487,26 @@ purely for render-site parity) — SAML does not sync to `rbac_store` yet
 (dropped in #1827), so the collision this fix closes is dormant there.
 Keying SAML on `entity_id#NameID` is a tracked fast-follow, to land
 alongside SAML group sync.
+
+**Audit-detail-field injection defense (`sanitize_detail_value`).** Every
+IdP-supplied value that reaches an audit `detail` string or an
+`emit_event` JSON attribute — `name`/`email`/`sub` (and the derived
+`display`) — is untrusted: a hostile or misconfigured IdP, or a
+user-editable IdP profile field, controls it. `detail` is a flat
+`"k=v;k=v"` string parsed by SIEM tooling, so an unsanitised value could
+inject `;`/`=` to forge additional fields or `\r`/`\n`/other control
+bytes to inject fake log lines. `detail::sanitize_detail_value`
+(`auth_routes.hpp`/`.cpp`) is the single chokepoint that neutralises
+this: it replaces `;`, `=`, `\r`, `\n`, and any control byte (incl. DEL)
+with `_`, then truncates to 128 bytes on a UTF-8 code-point boundary.
+Every `display=`/`email=`/`oidc_sub`/`name` value attached in
+`/auth/callback` is run through it before concatenation. **It is
+audit-detail-field-injection defense only — it does NOT strip HTML
+markup and is not a stored-XSS defense by itself.** A value with no
+control bytes (e.g. a display name containing `<script>`) passes through
+unchanged; if that value is later rendered into HTML, the render layer's
+own escaping (`html_escape`) is what neutralises it. See the docstring on
+`detail::sanitize_detail_value` in `auth_routes.hpp` for the full contract.
 
 **Migration.** `RbacStore` schema v3 deletes every `group_members` row
 belonging to an IdP-sourced group (`groups.source != 'local'`) on
@@ -536,10 +578,10 @@ login — SSO sessions have always been in-memory-only and were never
 written to `auth.db`'s `sessions` table in the first place.
 
 Implementation: `Session::username`/`display_name`
-(`auth.hpp`), `AuthManager::create_oidc_session`/`resolve_sso_identity`/
-`sso_identities_` (`auth.cpp`), the stable-id construction in
-`auth_routes.cpp` `/auth/callback`, `RbacStore` migration v3
-(`rbac_store.cpp`). Tests: `tests/unit/server/test_oidc_principal_key.cpp`.
+(`auth.hpp`), `AuthManager::create_oidc_session` (`auth.cpp`), the
+stable-id construction and per-audit-row `display=`/`email=` detail
+attachment in `auth_routes.cpp` `/auth/callback`, `RbacStore` migration
+v3 (`rbac_store.cpp`). Tests: `tests/unit/server/test_oidc_principal_key.cpp`.
 
 ## SAML 2.0 SP
 

@@ -3,8 +3,8 @@
  * keyed on stable `iss`+`sub`, not the mutable display name.
  *
  * Covers: AuthManager::create_oidc_session stable-username construction,
- * AuthManager::resolve_sso_identity, RbacStore::reconcile_idp_memberships
- * keyed on the stable principal shape (`oidc:<iss>#<sub>`), and the
+ * RbacStore::reconcile_idp_memberships keyed on the stable principal shape
+ * (`oidc:<iss>#<sub>`), and the
  * RbacStore v2 -> v3 migration that purges orphaned display-name-keyed IdP
  * memberships. Also covers the #1837 hardening-round sanitisation of
  * IdP-supplied `display`/`email` values before they reach an audit `detail`
@@ -78,7 +78,7 @@ TEST_CASE("AuthManager: two OIDC logins with same display name but different "
 }
 
 TEST_CASE("AuthManager: OIDC rename (same sub, changed name) keeps the stable "
-         "username stable and updates the resolution map",
+         "username stable and updates the minted session's display_name",
          "[auth][oidc][1837]") {
     AuthManager mgr;
     RbacStore rbac(":memory:");
@@ -114,11 +114,13 @@ TEST_CASE("AuthManager: OIDC rename (same sub, changed name) keeps the stable "
     CHECK(reconciled2->removed == 0);
     CHECK(rbac.get_group_members("entra:eng-gid") == std::vector<std::string>{stable_username});
 
-    // resolve_sso_identity reflects the LATEST login's display/email.
-    auto resolved = mgr.resolve_sso_identity(stable_username);
-    REQUIRE(resolved.has_value());
-    CHECK(resolved->display_name == "Pat Renamed");
-    CHECK(resolved->email == "pat.renamed@corp.example");
+    // The freshly-minted session's display_name reflects the LATEST login's
+    // display/email (already asserted above via sess2), never the map that
+    // used to exist for this purpose — there is no persistent principal→name
+    // directory (see #1852); a human name for a principal with no live
+    // session is recovered from that login's SSO audit row `display=`/
+    // `email=` detail instead (auth_routes.cpp /auth/callback).
+    CHECK(sess2->display_name == "Pat Renamed");
 }
 
 TEST_CASE("AuthManager: reconcile add/remove/deprovision fires correctly "
@@ -149,30 +151,6 @@ TEST_CASE("AuthManager: reconcile add/remove/deprovision fires correctly "
     REQUIRE(deprovisioned.has_value());
     CHECK(deprovisioned->removed == 1);
     CHECK(rbac.get_group_members("entra:g1").empty());
-}
-
-// ── AuthManager::resolve_sso_identity ────────────────────────────────────────
-
-TEST_CASE("AuthManager::resolve_sso_identity returns the display name for a "
-         "known principal, nullopt otherwise",
-         "[auth][oidc][1837]") {
-    AuthManager mgr;
-    const std::string iss = "https://idp.example.com/";
-
-    CHECK_FALSE(mgr.resolve_sso_identity("oidc:" + iss + "#unknown-sub").has_value());
-
-    auto token = mgr.create_oidc_session("Jordan Lee", "jordan@corp.example", "sub-JL", iss);
-    auto sess = mgr.validate_session(token);
-    REQUIRE(sess.has_value());
-
-    auto resolved = mgr.resolve_sso_identity(sess->username);
-    REQUIRE(resolved.has_value());
-    CHECK(resolved->display_name == "Jordan Lee");
-    CHECK(resolved->email == "jordan@corp.example");
-
-    // A local-style username (never inserted into sso_identities_) resolves
-    // to nullopt — the map only ever contains SSO-derived stable ids.
-    CHECK_FALSE(mgr.resolve_sso_identity("alice").has_value());
 }
 
 // ── RbacStore v2 -> v3 migration ─────────────────────────────────────────────

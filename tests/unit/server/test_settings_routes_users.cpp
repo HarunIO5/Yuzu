@@ -39,6 +39,7 @@
 #include "update_registry.hpp"
 #include "../test_helpers.hpp"
 #include <yuzu/server/auth.hpp>
+#include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
 
@@ -387,6 +388,58 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: duplicate username rejected"
     // The original password must still authenticate — the rejection must
     // not have run upsert_user under the hood.
     CHECK(h.auth_mgr.authenticate("bob", "bobpassword12").has_value());
+}
+
+// ── Reserved SSO-principal prefix guard (#1837 governance follow-up) ───────
+//
+// A local user literally named `oidc:<iss>#<sub>` would re-open the severed
+// elevation-borrow (that local `users` row would supply the eligibility/TOTP
+// the SSO principal lacks). `is_valid_username`'s pre-existing ':' rejection
+// already makes the exact stable-principal string unconstructable as a local
+// username — this test exercises that outcome end-to-end through the create
+// route (colon survives URL-decoding intact, exercising the same branch as
+// the "$bogus" invalid-username test above).
+
+TEST_CASE("SettingsRoutes POST /api/settings/users: oidc-namespaced username rejected",
+          "[settings][users][reserved-prefix]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    // "oidc:x#y" percent-encoded so url_decode reconstructs the literal
+    // colon/hash bytes in the handler.
+    auto res = h.Post("/api/settings/users",
+                        "username=oidc%3Ax%23y&password=newuserpassword&role=user",
+                        "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK_FALSE(h.has_user("oidc:x#y"));
+}
+
+// Direct unit coverage of the new reserved-prefix helper itself: the route-
+// level test above is preempted by is_valid_username's ':' rejection before
+// ever reaching is_reserved_identity_prefix, so it does not exercise the new
+// logic. These pin the helper's contract directly (case-insensitivity,
+// prefix-only matching, and that it does not false-positive on ordinary
+// usernames that merely start with the same letters).
+TEST_CASE("is_reserved_identity_prefix: rejects oidc:/saml:/ad: case-insensitively",
+          "[settings][users][reserved-prefix]") {
+    CHECK(is_reserved_identity_prefix("oidc:whatever"));
+    CHECK(is_reserved_identity_prefix("OIDC:Whatever"));
+    CHECK(is_reserved_identity_prefix("saml:whatever"));
+    CHECK(is_reserved_identity_prefix("SaMl:whatever"));
+    CHECK(is_reserved_identity_prefix("ad:whatever"));
+    CHECK(is_reserved_identity_prefix("AD:whatever"));
+}
+
+TEST_CASE("is_reserved_identity_prefix: does not false-positive on ordinary usernames",
+          "[settings][users][reserved-prefix]") {
+    CHECK_FALSE(is_reserved_identity_prefix("bob"));
+    CHECK_FALSE(is_reserved_identity_prefix("admin"));
+    // Starts with the same letters but no colon — not a namespaced principal.
+    CHECK_FALSE(is_reserved_identity_prefix("adam"));
+    CHECK_FALSE(is_reserved_identity_prefix("oidcuser"));
+    CHECK_FALSE(is_reserved_identity_prefix(""));
 }
 
 // ── Weak-password guard — UAT-reported silent fail ─────────────────────────

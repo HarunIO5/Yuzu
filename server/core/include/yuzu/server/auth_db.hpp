@@ -434,6 +434,21 @@ private:
 /// Rules: 1-64 chars, alphanumeric + . _ - only, no ':' (config injection).
 bool is_valid_username(const std::string& username);
 
+/// True iff `username` begins with a reserved SSO-principal namespace prefix
+/// (`oidc:`, `saml:`, `ad:`; case-insensitive). Defense-in-depth for the
+/// LOCAL-user CREATE path only — `is_valid_username`'s existing ':' rejection
+/// already makes the exact stable-principal string `oidc:<iss>#<sub>`
+/// unconstructable as a local username, but an explicit reservation
+/// documents the intent and survives a future loosening of that charset.
+/// Without it, an admin could otherwise create a local user that collides
+/// with (or is later made to collide with) an SSO-derived principal — that
+/// local user's row would supply the eligibility/TOTP an SSO principal
+/// deliberately lacks (#1837), re-opening the elevation-borrow hazard.
+/// Deliberately NOT folded into `is_valid_username` (used at ~20 sites; its
+/// contract must stay charset-only). Callers apply this ONLY at user-creation
+/// chokepoints, never at target-lookup/validation sites for existing users.
+bool is_reserved_identity_prefix(const std::string& username);
+
 /// Validate that `username` is usable as the hardened-mode break-glass account:
 /// a syntactically valid username naming an existing ACTIVE user that has MFA
 /// enrolled. Returns std::nullopt when usable, otherwise an operator-facing
