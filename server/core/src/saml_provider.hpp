@@ -64,6 +64,19 @@ struct SamlAssertion {
     /// Read from the SAME XSW-verified assertion node as name_id — never a
     /// second document-wide search (see validate_response N2 discussion).
     std::vector<std::string> groups;
+
+    /// #1828.3: true when the assertion carried at least one more non-empty
+    /// group value beyond the kMaxGroupValues cap (i.e. `groups` is a
+    /// truncated view of the assertion's actual group membership). The
+    /// verifier (this class) has no metrics handle, so it surfaces the
+    /// signal as a flag here rather than incrementing a counter directly —
+    /// the ACS route (auth_routes.cpp) bumps
+    /// `yuzu_saml_group_cap_truncated_total` when this is true. Deliberately
+    /// NOT a per-login audit/log line (would spam on a chatty IdP); a
+    /// counter is the anti-flood-safe signal, same rationale as the sibling
+    /// `_blocked_total`/`_local_disabled_total` metric-only signals
+    /// documented in docs/observability-conventions.md.
+    bool group_cap_truncated{false};
 };
 
 /// SAML 2.0 SP verifier — pure library, no HTTP routes, no session minting.

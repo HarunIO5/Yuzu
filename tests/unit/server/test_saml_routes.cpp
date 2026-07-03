@@ -32,6 +32,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <memory>
@@ -729,7 +730,8 @@ TEST_CASE("SAML ACS — returns 404 when provider is null", "[saml][auth_routes]
 
     // Prometheus counter (review finding LOW): every ACS outcome, including
     // the not-configured 404 early-return, increments yuzu_auth_saml_login_total.
-    CHECK(fix.counter("yuzu_auth_saml_login_total", {{"result", "error"}}) == 1.0);
+    CHECK(fix.counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}) ==
+          1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,7 +1049,9 @@ TEST_CASE("SAML ACS — valid signed SAMLResponse creates session with auth_sour
     CHECK(events.front().principal_role == "user");
 
     // ── Step 9: Verify the Prometheus counter (review finding LOW) ───────────
-    CHECK(fix.counter("yuzu_auth_saml_login_total", {{"result", "ok"}}) == 1.0);
+    // #1828.1: role label sourced from the resolved role (user, thin-slice
+    // default — no --saml-admin-group configured).
+    CHECK(fix.counter("yuzu_auth_saml_login_total", {{"result", "ok"}, {"role", "user"}}) == 1.0);
 #endif
 }
 
@@ -1137,6 +1141,11 @@ TEST_CASE("SAML ACS — assertion groups containing --saml-admin-group mint an a
     CHECK(events.front().action == "auth.saml_login");
     CHECK(events.front().result == "ok");
     CHECK(events.front().principal_role == "admin");
+
+    // #1828.1: role label on the login counter reflects the resolved admin
+    // role, distinguishing it from a "user" login without a store query.
+    CHECK(fix.counter("yuzu_auth_saml_login_total", {{"result", "ok"}, {"role", "admin"}}) ==
+          1.0);
 #endif
 }
 
@@ -1306,6 +1315,40 @@ TEST_CASE("SAML ACS — an admin-group match beyond the 64-value cap does not mi
     auto session = fix.auth_mgr.validate_session(token);
     REQUIRE(session.has_value());
     CHECK(session->role == auth::Role::user);
+
+    // #1828.3: this assertion carries 70 group values against a 64-value
+    // cap — the truncation counter must fire exactly once (not once per
+    // dropped value; a per-login counter, not a per-value one).
+    CHECK(fix.counter("yuzu_saml_group_cap_truncated_total") == 1.0);
+#endif
+}
+
+TEST_CASE("SAML ACS — exactly kMaxGroupValues values does not trip the cap-truncation counter "
+          "(#1828.3 boundary)",
+          "[saml][auth_routes]") {
+#if defined(_WIN32)
+    SKIP("SamlProvider always disabled on Windows (N4)");
+#else
+    const auto& f = saml_test_fixture();
+    auto saml_cfg = f.make_config();
+    saml_cfg.group_attribute = "groups";
+    SamlProvider provider(std::move(saml_cfg));
+    REQUIRE(provider.is_enabled());
+
+    SamlRoutesFixture fix(&provider);
+
+    // Exactly 64 values — none dropped, so the counter must stay at 0. This
+    // is the "false positive" guard: the truncation signal must not fire
+    // merely because the cap was reached, only when a value was ACTUALLY
+    // dropped past it.
+    std::vector<std::string> groups;
+    for (int i = 0; i < 64; ++i) groups.push_back("group" + std::to_string(i));
+    REQUIRE(groups.size() == yuzu::server::saml::kMaxGroupValues);
+
+    const auto token = run_saml_acs_flow(fix, f, "exact_cap_user@example.test", groups);
+    REQUIRE_FALSE(token.empty());
+
+    CHECK(fix.counter("yuzu_saml_group_cap_truncated_total") == 0.0);
 #endif
 }
 

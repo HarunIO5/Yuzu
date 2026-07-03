@@ -929,6 +929,15 @@ public:
 
         // Initialize OIDC provider if configured
         if (!cfg_.oidc_issuer.empty() && !cfg_.oidc_client_id.empty()) {
+            // #1830.1: trim leading/trailing ASCII whitespace from the
+            // admin-group config value — same trailing-space silent-lockout
+            // bug fixed for --saml-admin-group (UP-4, see below). Mutate
+            // cfg_ itself (not just the local oidc_cfg copy) so every other
+            // reader of cfg_.oidc_admin_group (the /auth/callback route's
+            // admin_gid lookup, the startup config-audit line) sees the
+            // trimmed value too.
+            cfg_.oidc_admin_group = trim_ascii_whitespace(cfg_.oidc_admin_group);
+
             oidc::OidcConfig oidc_cfg;
             oidc_cfg.issuer = cfg_.oidc_issuer;
             oidc_cfg.client_id = cfg_.oidc_client_id;
@@ -991,8 +1000,8 @@ public:
             // no error surfaced. group_attribute (the Name to match, not a
             // value) is deliberately NOT trimmed here — IdP attribute names are
             // exact-match XML identifiers, not free-text values susceptible to
-            // this class of operator typo. OIDC's admin_group is intentionally
-            // left untrimmed (separate follow-up).
+            // this class of operator typo. OIDC's admin_group is trimmed the
+            // same way, above at OIDC provider init (#1830.1).
             cfg_.saml_admin_group = trim_ascii_whitespace(cfg_.saml_admin_group);
 
             // sre-S3 / UP-1 / UP-9: half-configured group→role mapping grants
@@ -1589,6 +1598,44 @@ public:
                 ev.detail = "instruction-definition signature enforcement disabled at startup "
                             "(--allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS) "
                             "— unsigned definitions will be accepted at import";
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+
+            // #1829 — same startup-posture audit pattern as the two rows
+            // above: an SSO admin-group mapping (--oidc-admin-group /
+            // --saml-admin-group) is a standing, security-relevant posture
+            // that a cold deployment with no logins yet would otherwise
+            // leave with zero audit evidence. Emit one row per configured
+            // flag so an auditor asking "was group X wired to admin during
+            // window Y?" can answer from the audit store. Values here are
+            // already trimmed (SAML: UP-4 above; OIDC: #1830.1 at OIDC
+            // provider init) and low-sensitivity (a group identifier, not a
+            // secret — matches the SAML admin audit-detail precedent,
+            // comp-S1/UP-5).
+            if (!cfg_.oidc_admin_group.empty() && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "config.admin_group_set";
+                ev.target_type = "AuthConfig";
+                ev.target_id = "oidc";
+                ev.detail = "provider=oidc;admin_group=" + cfg_.oidc_admin_group;
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+            if (!cfg_.saml_admin_group.empty() && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "config.admin_group_set";
+                ev.target_type = "AuthConfig";
+                ev.target_id = "saml";
+                ev.detail = "provider=saml;admin_group=" + cfg_.saml_admin_group;
                 ev.result = "success";
                 (void)audit_store_->log(ev);
             }
