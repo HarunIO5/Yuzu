@@ -119,6 +119,12 @@ inline std::string map_rpm_none(std::string_view v) {
 // same rpm and must agree on this security-posture-relevant field, or an
 // operator/matcher sees a different signed/unsigned answer depending on
 // which collector happened to report the device.
+//
+// Assumes rpm's default formatting of an RPM_BIN_TYPE tag (SIGPGP/RSAHEADER,
+// absent an explicit :base64/:pgpsig format extension) is a tab/newline-free
+// hex string -- undocumented empirically (no rpm host was reachable to
+// verify against a live package), but consistent with rpm's documented
+// BIN-tag default and with PR #1804 shipping the identical assumption.
 inline bool rpm_sig_present(std::string_view raw) {
     const std::string v = map_rpm_none(raw);
     return !v.empty() && v.rfind("%{", 0) != 0;
@@ -230,6 +236,20 @@ inline std::optional<InvRecord> parse_dpkg_inv_line(std::string_view line) {
 // RHEL/Fedora packages are frequently header-signed only -- SIGPGP alone
 // would mislabel a validly-signed package as unsigned. Signature is read
 // from these STORED rpmdb tags only, never a live `rpm -K` verification.
+//
+// Two deliberate behavior shifts vs. this file's prior (pre-PR-#1804-parity)
+// scheme, both adopted for cross-collector agreement with vuln_identity.hpp:
+//   1. signature_status is now ALWAYS "signed" or "unsigned" -- never empty.
+//      The prior scheme left it honest-empty when the queryformat produced
+//      an unrecognized token (e.g. an rpm too old to expand the conditional
+//      syntax at all). That "indeterminate" case is now folded into an
+//      AFFIRMATIVE "unsigned" (rpm_sig_present's %{...}-literal-echo guard).
+//      This is a stronger negative claim on a security-posture-relevant
+//      field than "unrecorded" -- deliberate, not an oversight.
+//   2. The tag set checked narrows from four (DSAHEADER/RSAHEADER/SIGGPG/
+//      SIGPGP) to two (SIGPGP/RSAHEADER). A DSA-header-only- or GPG-payload-
+//      only-signed package -- legacy, uncommon on a modern RHEL/Fedora/SUSE
+//      fleet -- now reads "unsigned" where the old scheme read "signed".
 inline std::optional<InvRecord> parse_rpm_inv_line(std::string_view line) {
     const auto tok = detail::split_tabs(line);
     if (tok.size() != 9)
@@ -242,7 +262,8 @@ inline std::optional<InvRecord> parse_rpm_inv_line(std::string_view line) {
     r.arch = map_rpm_none(tok[4]); // gpg-pubkey pseudo-packages have (none) arch
     r.publisher = map_rpm_none(tok[5]); // PACKAGER (the v2 spec; `list` keeps VENDOR)
     r.install_date = map_rpm_none(tok[6]);
-    r.signature_status = (rpm_sig_present(tok[7]) || rpm_sig_present(tok[8])) ? "signed" : "unsigned";
+    r.signature_status =
+        (rpm_sig_present(tok[7]) || rpm_sig_present(tok[8])) ? "signed" : "unsigned";
     r.kind = "package";
     r.ecosystem = "rpm";
     return r;
