@@ -1181,46 +1181,58 @@ bash scripts/start-stack.sh status   # show running processes and ports
 
 ## Windows Service Installation
 
-On Windows, Yuzu server and agent can be installed as Windows services for automatic startup and recovery. A native Windows service wrapper is planned for a future release; until then, use `sc.exe` or NSSM (Non-Sucking Service Manager).
+On Windows, the Yuzu **agent** has a native Windows service wrapper (`yuzu-agent.exe --install-service`); this is what the shipped installer uses, and is the recommended path — see [Agent: --install-service](#agent-install-service) below. A native wrapper for the Yuzu **server** is still planned for a future release; until then, use `sc.exe` or NSSM (Non-Sucking Service Manager) for the server, as described below.
 
-### Using sc.exe
+### Agent: `--install-service` (native, recommended)
+
+```cmd
+REM Register the service (binPath is written for you, including the internal
+REM --service marker the agent needs to run under the SCM control protocol)
+yuzu-agent.exe --install-service
+
+REM Point it at your server / data dir / log file via sc config, same as the installer does
+sc.exe config YuzuAgent binPath= "C:\Yuzu\bin\yuzu-agent.exe --service --server yuzu.example.com:50051 --data-dir C:\ProgramData\Yuzu --log-file C:\Yuzu\logs\yuzu-agent.log"
+
+sc.exe start YuzuAgent
+sc.exe stop YuzuAgent
+
+REM Remove it
+yuzu-agent.exe --remove-service
+```
+
+Re-running `--install-service` is idempotent — it updates an existing registration's binPath in place rather than failing with "service already exists", so it's safe to re-run after an upgrade. Recovery actions (3 restarts, 60s apart, resetting after 24h) are configured automatically and fire on both crashes and clean-exit-with-error.
+
+> **Important:** the `--service` flag tells the binary to speak the SCM control protocol (`ServiceMain`/`SetServiceStatus`) instead of running as a console program — it is added automatically by `--install-service` and must be present in any `sc.exe`/manually-crafted binPath for the agent. Omitting it reproduces the pre-fix behavior: `sc start` fails with error 1053. Do **not** add `--service` when wrapping the agent with NSSM (below) — NSSM launches the agent as an ordinary child process, not via the SCM itself, so the agent would try (and fail) to connect to a dispatcher that isn't there.
+
+### Server: sc.exe (native wrapper not yet available)
 
 ```cmd
 REM Create the Yuzu server service
 sc.exe create YuzuServer binPath= "C:\Yuzu\yuzu-server.exe --https-cert C:\Yuzu\certs\server.crt --https-key C:\Yuzu\certs\server.key" start= auto DisplayName= "Yuzu Server"
 
-REM Create the Yuzu agent service
-sc.exe create YuzuAgent binPath= "C:\Yuzu\yuzu-agent.exe --server-address yuzu.example.com:50051" start= auto DisplayName= "Yuzu Agent"
-
 REM Set startup type to automatic (delayed start, recommended)
 sc.exe config YuzuServer start= delayed-auto
-sc.exe config YuzuAgent start= delayed-auto
 
 REM Configure recovery: restart on first, second, and subsequent failures
 sc.exe failure YuzuServer reset= 86400 actions= restart/5000/restart/10000/restart/30000
-sc.exe failure YuzuAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000
 
-REM Start the services
+REM Start / stop the service
 sc.exe start YuzuServer
-sc.exe start YuzuAgent
-
-REM Stop the services
 sc.exe stop YuzuServer
-sc.exe stop YuzuAgent
 ```
 
 > **Note:** With `sc.exe`, spaces after `=` are required (e.g., `start= auto`, not `start=auto`). This is a quirk of the `sc.exe` command parser.
 
 ### Using NSSM
 
-[NSSM](https://nssm.cc/) provides a more user-friendly wrapper with a GUI configuration dialog.
+[NSSM](https://nssm.cc/) provides a more user-friendly wrapper with a GUI configuration dialog. It remains a valid option for the **server** (no native wrapper yet) and for the **agent** if you prefer NSSM's process-monitoring/log-rotation over the native `--install-service` path — just don't pass `--service` to an NSSM-wrapped agent (see the note above).
 
 ```cmd
 REM Install services
 nssm install YuzuServer "C:\Yuzu\yuzu-server.exe"
 nssm install YuzuAgent "C:\Yuzu\yuzu-agent.exe"
 
-REM Set arguments
+REM Set arguments (no --service for the NSSM-wrapped agent)
 nssm set YuzuServer AppParameters "--https-cert C:\Yuzu\certs\server.crt --https-key C:\Yuzu\certs\server.key"
 nssm set YuzuAgent AppParameters "--server-address yuzu.example.com:50051"
 

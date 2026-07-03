@@ -128,7 +128,7 @@ Name: "{commonappdata}\Yuzu"; Permissions: admins-full system-full
 [Run]
 ; Register and start the service after install
 Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--install-service"; StatusMsg: "Registering Yuzu Agent service..."; Flags: runhidden waituntilterminated
-Filename: "sc.exe"; Parameters: "config YuzuAgent binPath= ""{app}\bin\yuzu-agent.exe"" --server {code:GetServerAddress} --data-dir ""{commonappdata}\Yuzu"" --plugin-dir ""{app}\plugins"" --log-file ""{app}\logs\yuzu-agent.log"" {code:GetExtraArgs}"; StatusMsg: "Configuring service..."; Flags: runhidden waituntilterminated shellexec
+Filename: "sc.exe"; Parameters: "config YuzuAgent binPath= ""{app}\bin\yuzu-agent.exe"" --service --server {code:GetServerAddress} --data-dir ""{commonappdata}\Yuzu"" --plugin-dir ""{app}\plugins"" --log-file ""{app}\logs\yuzu-agent.log"" {code:GetExtraArgs}"; StatusMsg: "Configuring service..."; Flags: runhidden waituntilterminated shellexec
 Filename: "sc.exe"; Parameters: "start YuzuAgent"; StatusMsg: "Starting Yuzu Agent service..."; Flags: runhidden waituntilterminated shellexec; Check: ShouldStartService
 ; Configure the boot-window ETW AutoLogger so the kernel captures process
 ; start/stop from early boot to <data-dir>\procboot.etl; the TAR plugin drains it
@@ -287,12 +287,23 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): string;
 var
   ResultCode: Integer;
+  i: Integer;
 begin
   Result := '';
-  { Stop existing service before upgrade }
+  { Stop existing service before upgrade. #1822: sc stop now actually completes
+    (the agent reports SERVICE_STOP_PENDING then SERVICE_STOPPED instead of
+    never responding), so poll for STOPPED instead of a blind delay -- bounded
+    so a slow/loaded machine still gets there without holding up install
+    indefinitely if something else goes wrong. }
   Exec('sc.exe', 'stop YuzuAgent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  { Give it a moment to stop }
-  Sleep(2000);
+  for i := 1 to 15 do
+  begin
+    Exec('cmd.exe', '/c sc query YuzuAgent | find "STOPPED" >nul', '', SW_HIDE,
+         ewWaitUntilTerminated, ResultCode);
+    if ResultCode = 0 then
+      Break;
+    Sleep(1000);
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

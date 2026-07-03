@@ -67,6 +67,8 @@ The chosen model also lets `script_exec.exec` / `script_exec.bash` / `script_exe
 
 The production virtual-service-account path is preferred wherever it can be used. The local-user path exists for dev environments where the service hasn't been registered yet (typically during `/test` runs that exercise the agent binary directly).
 
+**Correction (2026-07-03, #1822):** the table above describes the intended target, not what's registered today. `CreateServiceW`'s `lpServiceStartName` (`agents/core/src/main.cpp`, the `--install-service` handler) is `nullptr`, and the installer's `sc config` only ever sets `binPath=` — neither ever passes `obj= "NT SERVICE\YuzuAgent"`. The service therefore registers and runs as **LocalSystem**, not the virtual service account, on every build to date. #1822 fixed the separate (and more urgent) bug that the service couldn't start *at all* (error 1053, missing `ServiceMain`/SCM control protocol) without touching the account — LocalSystem was left as-is deliberately, so the account fix could land as its own reviewable change against a service that actually starts and stops. Wiring the virtual account is tracked as a follow-up (also needs `NT SERVICE\YuzuAgent` ACLs on the data/log directories, which the installer doesn't set today either).
+
 ---
 
 ## Privilege matrix (all 217 instructions)
