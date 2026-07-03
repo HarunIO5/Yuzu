@@ -329,11 +329,17 @@ TEST_CASE("blob contract v2: a v1 4-field blob still ingests — fields 5-12 emp
 TEST_CASE("migration v5 backfills '' into v2 columns for pre-existing rows and re-runs "
           "idempotently",
           "[pg][software_inventory][v2]") {
-    // Upgrade semantics on a live table: rows written before v5 (simulated by a
-    // 4-column INSERT — exactly the shape a v4-era server left behind) must read
-    // back with '' in every v2 column (the ADD COLUMN ... DEFAULT '' guarantee),
-    // and re-running v5 over an already-migrated table (schema_meta rewind, the
+    // Upgrade semantics on a live table: rows written before v5 must read back
+    // with '' in every v2 column (the ADD COLUMN ... DEFAULT '' guarantee), and
+    // re-running v5 over an already-migrated table (schema_meta rewind, the
     // partial-migration retry case) must succeed (IF NOT EXISTS, v4 precedent).
+    //
+    // To genuinely reproduce a v4-era table (not just an omitted-column INSERT
+    // into an already-v5 table, which would pass for the wrong reason — ordinary
+    // SQL column-default semantics, not migration backfill), this DROPs the 8
+    // v2 columns after the first construction, seeds the row into that
+    // genuinely-4-column table, then rewinds schema_meta and reconstructs so v5
+    // re-adds the columns over live pre-existing data.
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -341,9 +347,18 @@ TEST_CASE("migration v5 backfills '' into v2 columns for pre-existing rows and r
         SoftwareInventoryStore s1{pool};
         REQUIRE(s1.is_open());
     }
-    { // seed a legacy-shaped row + rewind the recorded version to 4
+    { // revert to a genuine v4 shape: drop the 8 v2 columns, seed a legacy row,
+      // rewind the recorded version to 4
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(
+            lease.get(),
+            "ALTER TABLE software_inventory_store.installed_software "
+            "DROP COLUMN kind, DROP COLUMN ecosystem, DROP COLUMN epoch, "
+            "DROP COLUMN release, DROP COLUMN arch, DROP COLUMN signature_status, "
+            "DROP COLUMN distro_id, DROP COLUMN distro_version",
+            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
         pg::PgResult ins = pg::exec_params(
             lease.get(),
             "INSERT INTO software_inventory_store.installed_software "
@@ -357,7 +372,7 @@ TEST_CASE("migration v5 backfills '' into v2 columns for pre-existing rows and r
             std::vector<std::string>{});
         REQUIRE(back.status() == PGRES_COMMAND_OK);
     }
-    SoftwareInventoryStore store{pool}; // re-runs v5 over the live table
+    SoftwareInventoryStore store{pool}; // re-runs v5, ADD COLUMN over the live row
     REQUIRE(store.is_open());
 
     auto got = store.get_agent_software("agent-legacy");

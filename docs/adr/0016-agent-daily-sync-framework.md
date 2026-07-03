@@ -409,3 +409,18 @@ Mechanics:
   hash / 1-byte format-version prefix remain the framework-wide follow-up.
 - The v1→v2 parse compatibility (a 4-field record reads with fields 5–12 empty)
   is pinned by tests on both sides, as is the identical 12-field cross-pin hash.
+- **Deploy order: server before agents.** The server accepts both v1 and v2
+  wire blobs from the moment it's deployed, so a new agent against an old
+  server is possible but not the intended path — it degrades gracefully (the
+  old server's 4-field parser drops fields 5-12, same bounded loop as any
+  other mixed-version window). Deploying the server first means every agent
+  upgrade lands against a server that already understands v2.
+- **PII scope note.** §8's "no end-user PII, no works-council trigger" finding
+  is about the *monitored device's* end user — it is unaffected by v2. It does
+  NOT extend to third-party package-maintainer metadata: the deb `Maintainer`
+  tag (unchanged from v1) and the rpm `PACKAGER`/`VENDOR` tags can, per upstream
+  packaging convention, carry an individual maintainer's real name + email
+  (common on community/COPR-built packages) — that is third-party data-subject
+  data, not the monitored end-user's, and is out of scope for the
+  co-determination analysis above. `distro_id`/`distro_version` add no new
+  exposure (already derivable from the existing `os_info` source).

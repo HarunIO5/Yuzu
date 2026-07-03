@@ -35,7 +35,7 @@
 
 namespace yuzu::agent {
 
-class LocalDispatcher {
+class YUZU_EXPORT LocalDispatcher {
 public:
     struct Result {
         int rc{0};             ///< plugin's return code; 0 == success

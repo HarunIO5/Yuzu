@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Installed-software inventory gains package-manager fields (blob contract v2, ADR-0016).**
+  Every row in `GET /api/v1/inventory/software` and the `query_installed_software` MCP tool
+  now carries `kind` (package|app), `ecosystem` (rpm|deb|apk|pacman|windows|macos|homebrew),
+  `epoch`, `release`, `arch`, `signature_status` (rpm only, from stored rpm header tags —
+  never a live `rpm -K` verification), `distro_id`, and `distro_version`, alongside the
+  original name/version/publisher/install_date. A field the ecosystem does not store is
+  `""`, never synthesised — see `docs/user-manual/inventory.md` for the full per-ecosystem
+  matrix. Collection is a new `installed_apps` plugin action, `list_inventory`; the
+  operator-facing `list`/`query`/`list_per_user` actions are unchanged. New `apk`
+  (Alpine) package enumeration on the sync path. **Breaking — data shift on Linux
+  rpm fleets:** `publisher` now reflects the rpm PACKAGER tag (was VENDOR), and `version`
+  is upstream-only with the release moved to its own column (was fused
+  `VERSION-RELEASE`). A saved query/dashboard filter against the old `publisher` or
+  fused `version` shape on rpm hosts will silently stop matching post-upgrade — see
+  `docs/user-manual/inventory.md` before relying on either field in existing
+  automation. No wire-protocol or gateway change (the fields ride inside the
+  existing opaque sync blob). **Upgrade note:** deploy the server before agents; each
+  agent's first post-upgrade sync triggers one expected full resend (`need_full`),
+  phase-spread across the daily sync window, self-healing.
 - **`/inventory` Devices tab shows real device-CI data.** The Serial/Model/CPU-RAM
   columns (previously greyed placeholders) now read from `DeviceInventoryStore`, and
   the per-device drill grows a full CI-record panel (manufacturer, model, serial,

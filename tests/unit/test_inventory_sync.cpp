@@ -4,8 +4,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "local_dispatcher.hpp"
 #include "sync_scheduler.hpp"
 #include "sync_source_installed_software.hpp"
+
+#include <yuzu/plugin.h>
 
 #include <chrono>
 #include <cstdint>
@@ -343,6 +346,61 @@ TEST_CASE("empty inventory parses to no entries and a stable empty hash",
     CHECK(installed_software_canonical_blob({}) == "");
     CHECK(sha256_hex("") ==
           "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+}
+
+// --- LocalDispatcher capture_cap plumbing (regression: the parameter must
+//     actually reach CommandContextImpl's enforcement point, not just widen
+//     the call signature) ---
+
+namespace {
+// A minimal, statically-allocated plugin descriptor whose "bulk" action
+// writes ~3 MiB of output via the real yuzu_ctx_write_output C ABI path —
+// enough to exceed LocalDispatcher::kCaptureMaxBytes (2 MiB) but stay under
+// the 3.5 MiB cap the installed_software sync source passes for its own
+// dispatch (sync_source_installed_software.cpp).
+int bulk_execute(YuzuCommandContext* ctx, const char* /*action*/, const YuzuParam* /*params*/,
+                 std::size_t /*param_count*/) {
+    const std::string chunk(65536, 'x'); // 64 KiB
+    for (int i = 0; i < 48; ++i)         // 48 * 64 KiB = 3 MiB
+        yuzu_ctx_write_output(ctx, chunk.c_str());
+    return 0;
+}
+
+const char* const kBulkActions[] = {"bulk", nullptr};
+
+const YuzuPluginDescriptor kBulkDescriptor = {
+    /*abi_version=*/YUZU_PLUGIN_ABI_VERSION,
+    /*name=*/"bulk_test_fixture",
+    /*version=*/"1.0.0",
+    /*description=*/"test-only bulk-output fixture",
+    /*actions=*/kBulkActions,
+    /*init=*/nullptr,
+    /*shutdown=*/nullptr,
+    /*execute=*/bulk_execute,
+    /*sdk_version=*/nullptr,
+};
+} // namespace
+
+TEST_CASE("LocalDispatcher::run's capture_cap parameter actually bounds capture "
+          "(regression: dispatch_with_capture must not discard it)",
+          "[sync][local_dispatcher]") {
+    using yuzu::agent::LocalDispatcher;
+
+    SECTION("default cap (2 MiB) truncates a ~3 MiB payload") {
+        LocalDispatcher dispatcher;
+        LocalDispatcher::Result r = dispatcher.run(&kBulkDescriptor, "bulk");
+        CHECK(r.rc == 0);
+        CHECK(r.truncated);
+    }
+
+    SECTION("an explicit larger cap (3.5 MiB) accepts the same ~3 MiB payload untruncated") {
+        LocalDispatcher dispatcher;
+        constexpr std::size_t kInventoryCaptureCap = 3'670'016; // matches the sync source's cap
+        LocalDispatcher::Result r = dispatcher.run(&kBulkDescriptor, "bulk", {}, kInventoryCaptureCap);
+        CHECK(r.rc == 0);
+        CHECK_FALSE(r.truncated);
+        CHECK(r.captured.size() > 2u * 1024 * 1024); // genuinely exceeds the default cap
+    }
 }
 
 // --- Scheduler edge cases (phase spread, full-floor, collect-nothing) ---

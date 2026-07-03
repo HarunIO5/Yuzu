@@ -3628,12 +3628,23 @@ TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's group
     using yuzu::server::InventoryIngestOutcome;
     using yuzu::server::SoftwareEntry;
     using yuzu::server::SoftwareInventoryStore;
-    // Two devices both run Chrome.
-    std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", "2026-01-01"}};
-    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
-    REQUIRE(store.apply_installed_software("agent-in", h, rows, 1000) ==
+    // agent-in gets a fully-populated v2 rpm row (proves the builder emits real
+    // values, not just present-but-always-empty keys); agent-out gets a
+    // v1-shaped row (never visible — only exercises the scope filter).
+    SoftwareEntry v2_row;
+    v2_row.name = "Chrome";
+    v2_row.version = "119";
+    v2_row.publisher = "Google";
+    v2_row.install_date = "2026-01-01";
+    v2_row.kind = "app";
+    v2_row.ecosystem = "windows";
+    std::vector<SoftwareEntry> in_rows = {v2_row};
+    std::vector<SoftwareEntry> out_rows = {{"Chrome", "119", "Google", "2026-01-01"}};
+    REQUIRE(store.apply_installed_software(
+                "agent-in", SoftwareInventoryStore::canonical_hash(in_rows), in_rows, 1000) ==
             InventoryIngestOutcome::kStored);
-    REQUIRE(store.apply_installed_software("agent-out", h, rows, 1000) ==
+    REQUIRE(store.apply_installed_software(
+                "agent-out", SoftwareInventoryStore::canonical_hash(out_rows), out_rows, 1000) ==
             InventoryIngestOutcome::kStored);
 
     McpTestServer ts;
@@ -3650,11 +3661,27 @@ TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's group
     // In-scope device present; out-of-scope device filtered OUT (cross-operator isolation).
     CHECK(res->body.find("agent-in") != std::string::npos);
     CHECK(res->body.find("agent-out") == std::string::npos);
-    // Blob-v2 fields ride on every row — present even for a v1-shaped entry
-    // (empty strings, honest-empty contract).
-    CHECK(res->body.find("\\\"ecosystem\\\"") != std::string::npos);
-    CHECK(res->body.find("\\\"signature_status\\\"") != std::string::npos);
-    CHECK(res->body.find("\\\"distro_version\\\"") != std::string::npos);
+
+    // Structural parse: MCP's row builder wraps its JSON array as an escaped
+    // string inside content[0].text, a code path distinct from REST's
+    // serializer — assert exact per-field values on the actual visible row,
+    // not just that a key name appears somewhere in the raw body.
+    auto envelope = nlohmann::json::parse(res->body);
+    auto rows_json = nlohmann::json::parse(
+        envelope.at("result").at("content").at(0).at("text").get<std::string>());
+    REQUIRE(rows_json.is_array());
+    REQUIRE(rows_json.size() == 1);
+    const auto& row = rows_json.at(0);
+    CHECK(row.at("agent_id").get<std::string>() == "agent-in");
+    CHECK(row.at("kind").get<std::string>() == "app");
+    CHECK(row.at("ecosystem").get<std::string>() == "windows");
+    CHECK(row.at("epoch").get<std::string>().empty());
+    CHECK(row.at("release").get<std::string>().empty());
+    CHECK(row.at("arch").get<std::string>().empty());
+    CHECK(row.at("signature_status").get<std::string>().empty());
+    CHECK(row.at("distro_id").get<std::string>().empty());
+    CHECK(row.at("distro_version").get<std::string>().empty());
+
     // The drop is audited distinctly as a denied event, alongside the success row.
     bool saw_denied = false, saw_success = false;
     for (const auto& a : ts.audit_log) {
