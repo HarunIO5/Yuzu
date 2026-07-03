@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <string>
+#include <utility>
+#include <vector>
 
 using namespace yuzu::server;
 
@@ -417,6 +419,130 @@ TEST_CASE("RbacStore: deleting group cascades members", "[rbac_store]") {
 
     auto members = store.get_group_members("temp");
     CHECK(members.empty());
+}
+
+// ── IdP membership reconciliation (#1832) ───────────────────────────────────
+
+TEST_CASE("RbacStore: namespaced_group_name", "[rbac_store]") {
+    CHECK(namespaced_group_name("entra", "abc-123") == "entra:abc-123");
+    CHECK(namespaced_group_name("saml", "g1") == "saml:g1");
+    // 'local' is NOT namespaced.
+    CHECK(namespaced_group_name("local", "raw-name") == "raw-name");
+}
+
+TEST_CASE("RbacStore: reconcile_idp_memberships namespacing prevents confused deputy",
+         "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    // A LOCAL group named "admins" already carries a role.
+    store.create_group({"admins", "Local admins", "local", "", 0});
+    REQUIRE(store.assign_role({"group", "admins", "Operator"}).has_value());
+
+    // The IdP asserts a group with the SAME raw id "admins" for carol.
+    auto reconciled = store.reconcile_idp_memberships("carol", "entra", {{"admins", "Admins"}});
+    REQUIRE(reconciled.has_value());
+
+    // carol must NOT inherit the local group's role via the same-named IdP
+    // group — she landed in "entra:admins", a distinct row with no role
+    // assignment of its own yet.
+    CHECK_FALSE(store.check_permission("carol", "Execution", "Execute"));
+
+    // The local group's membership is never touched by reconcile.
+    auto local_members = store.get_group_members("admins");
+    CHECK(local_members.empty());
+
+    // Assigning the role to the NAMESPACED group (the correct, explicit
+    // grant an operator would make) is what it takes for carol to get it —
+    // proving namespacing, not raw-name collision, decides the outcome.
+    REQUIRE(store.assign_role({"group", "entra:admins", "Operator"}).has_value());
+    CHECK(store.check_permission("carol", "Execution", "Execute"));
+}
+
+TEST_CASE("RbacStore: reconcile_idp_memberships add/remove diff", "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    REQUIRE(store.reconcile_idp_memberships("dave", "entra", {{"A", "A"}, {"B", "B"}})
+                .has_value());
+    CHECK(store.get_group_members("entra:A") == std::vector<std::string>{"dave"});
+    CHECK(store.get_group_members("entra:B") == std::vector<std::string>{"dave"});
+
+    // A separately-added LOCAL membership must survive every reconcile.
+    store.create_group({"crew", "", "local", "", 0});
+    store.add_group_member("crew", "dave");
+
+    // Re-login only asserts A now — B must be dropped.
+    REQUIRE(store.reconcile_idp_memberships("dave", "entra", {{"A", "A"}}).has_value());
+    CHECK(store.get_group_members("entra:A") == std::vector<std::string>{"dave"});
+    CHECK(store.get_group_members("entra:B").empty());
+    CHECK(store.get_group_members("crew") == std::vector<std::string>{"dave"});
+}
+
+TEST_CASE("RbacStore: reconcile_idp_memberships empty asserted removes only that source",
+         "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    REQUIRE(store.reconcile_idp_memberships("erin", "entra", {{"A", "A"}}).has_value());
+    REQUIRE(store.reconcile_idp_memberships("erin", "saml", {{"S1", "S1"}}).has_value());
+    store.create_group({"local-crew", "", "local", "", 0});
+    store.add_group_member("local-crew", "erin");
+
+    // Next SSO login asserts NO groups at all — full deprovisioning.
+    REQUIRE(store.reconcile_idp_memberships("erin", "entra", {}).has_value());
+
+    CHECK(store.get_group_members("entra:A").empty());
+    // Untouched: a different source, and a local group.
+    CHECK(store.get_group_members("saml:S1") == std::vector<std::string>{"erin"});
+    CHECK(store.get_group_members("local-crew") == std::vector<std::string>{"erin"});
+}
+
+TEST_CASE("RbacStore: reconcile_idp_memberships enforces the group-count cap", "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    std::vector<std::pair<std::string, std::string>> asserted;
+    asserted.reserve(RbacStore::kMaxIdpGroupsPerLogin + 1);
+    for (size_t i = 0; i <= RbacStore::kMaxIdpGroupsPerLogin; ++i)
+        asserted.emplace_back("g" + std::to_string(i), "g" + std::to_string(i));
+
+    auto result = store.reconcile_idp_memberships("frank", "entra", asserted);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == "group_count_exceeded");
+
+    // No mutation on rejection.
+    CHECK(store.list_groups().empty());
+    CHECK(store.get_group_members("entra:g0").empty());
+}
+
+TEST_CASE("RbacStore: reconcile_idp_memberships is idempotent", "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    std::vector<std::pair<std::string, std::string>> asserted = {{"A", "A"}, {"B", "B"}};
+    REQUIRE(store.reconcile_idp_memberships("gina", "entra", asserted).has_value());
+    REQUIRE(store.reconcile_idp_memberships("gina", "entra", asserted).has_value());
+
+    CHECK(store.get_group_members("entra:A") == std::vector<std::string>{"gina"});
+    CHECK(store.get_group_members("entra:B") == std::vector<std::string>{"gina"});
+    CHECK(store.list_groups().size() == 2);
+}
+
+TEST_CASE("RbacStore: create_group rejects a local group with a reserved IdP prefix",
+         "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    auto local_collision = store.create_group({"entra:x", "", "local", "", 0});
+    REQUIRE_FALSE(local_collision.has_value());
+
+    // Every reserved prefix is covered.
+    CHECK_FALSE(store.create_group({"saml:x", "", "local", "", 0}).has_value());
+    CHECK_FALSE(store.create_group({"ad:x", "", "local", "", 0}).has_value());
+    CHECK_FALSE(store.create_group({"local:x", "", "local", "", 0}).has_value());
+
+    // An IdP-sourced create of the SAME name is exempt from the guard.
+    auto idp_create = store.create_group({"entra:x", "", "entra", "x", 0});
+    CHECK(idp_create.has_value());
+
+    // A local group whose name merely CONTAINS (not starts with) a reserved
+    // token is fine — only the leading `prefix:` is reserved.
+    CHECK(store.create_group({"my-entra:team", "", "local", "", 0}).has_value());
 }
 
 // ── ITServiceOwner role ──────────────────────────────────────────────────────

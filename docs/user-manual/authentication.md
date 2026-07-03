@@ -297,6 +297,12 @@ Admin via OIDC is granted **only** through explicit membership in the configured
 
 > **Note:** Only a single admin group mapping is currently supported via the `--oidc-admin-group` CLI flag. Multi-role group mapping (e.g., mapping different groups to ITServiceOwner or Operator) is planned for a future release and will use the RBAC store's group-scoped role assignments.
 
+### RBAC Group Provisioning (#1832)
+
+Independently of the `--oidc-admin-group` admin mapping above, every OIDC login reconciles the IdP's `groups` claim into the RBAC store so that group-scoped role assignments (Settings → RBAC → assign a role to a group) take effect for SSO users. Each asserted group is written as `entra:<group-id>` — **namespaced** by identity source, never the raw IdP group id — so a locally-created RBAC group can never collide with (or be impersonated by) a same-named IdP group. The reconcile also removes any of the user's `entra:`-owned memberships that the IdP no longer asserts, so a group removal on the IdP side takes effect on the user's **next SSO login** (memberships are not revoked mid-session). A malformed or oversized (`>200` groups) assertion denies the login outright rather than granting a session with stale roles; see the `auth.sso_group_provision` audit action.
+
+> **Upgrade note:** Before this fix, OIDC groups were synced under their raw (un-namespaced) id, so an operator may have assigned an RBAC role directly to a group named e.g. `8f3c...` (the raw Entra group id). Those role assignments do **not** automatically move to the new namespaced group. **Re-assign any such role to `entra:<group-id>`** (Settings → RBAC → Groups) — the old raw-id group row is left in place (harmless, but no longer reachable by future logins) and can be deleted once you've confirmed the namespaced group has the role.
+
 ### Entra ID Setup Checklist
 
 1. Register an application in Entra ID (Azure Portal > App registrations).

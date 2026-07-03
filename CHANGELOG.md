@@ -99,6 +99,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent returns `error|unknown action: purge_source` (it does not crash), but because dispatch is
   fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome with a fresh Scan.
 
+### Security
+
+- **SSO IdP-group→RBAC provisioning is now source-aware and reconciled (#1832, HIGH).** Fixes two
+  bugs in the OIDC `/auth/callback` group sync: a **confused-deputy** (a locally-created RBAC group
+  and a same-named IdP group were the same `groups` row, so an operator-created local group named
+  e.g. `admins` silently inherited any role granted to an IdP group also asserting `admins`, and vice
+  versa) and a **deprovisioning bypass** (group memberships were only ever added, never removed, so
+  a user dropped from an IdP group kept every role that group granted indefinitely). Fix: IdP
+  memberships are now written under a **namespaced** group name (`entra:<group-id>`, via
+  `RbacStore::namespaced_group_name`) through a new transactional `RbacStore::reconcile_idp_memberships`
+  that both upserts the asserted set and deletes any of the user's `entra:`-owned memberships not
+  re-asserted this login — so IdP-side removal takes effect on the next SSO login. A
+  `source='local'` group create is rejected if its name collides with a reserved IdP prefix
+  (`local:`/`entra:`/`saml:`/`ad:`). The callback is **fail-closed**: an over-cap assertion
+  (`>200` groups) or a reconcile-store failure denies the login outright (no session minted) rather
+  than falling through to a session with stale/unreconciled roles. New audit action
+  `auth.sso_group_provision` (result=ok/failed) and metric
+  `yuzu_auth_sso_group_provision_total{source,result}`. **Upgrade note:** operators who assigned an
+  RBAC role to the old raw-gid OIDC group must re-assign it to the namespaced `entra:<group-id>`
+  group — see `docs/user-manual/authentication.md` "RBAC Group Provisioning". SAML group sync is
+  out of scope here (dropped in #1827; will ride this same reconcile path once #1826 merges).
+
 ## [0.13.0] - 2026-07-01
 
 ### Added

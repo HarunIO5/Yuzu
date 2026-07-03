@@ -85,6 +85,14 @@ public:
 
     // ── Groups CRUD (minimal — for future AD/Entra) ──────────────────────
     std::vector<RbacGroup> list_groups() const;
+
+    /// Rejects a `source=="local"` create whose `name` collides with a reserved
+    /// IdP namespace prefix (`local:`/`entra:`/`saml:`/`ad:`) — see
+    /// `namespaced_group_name` below. An IdP-sourced create (any other
+    /// `source`) is exempt: `reconcile_idp_memberships` writes IdP groups
+    /// directly (not via this method) and always passes a namespaced name, but
+    /// the exemption also covers any future caller that legitimately creates
+    /// an IdP-sourced group through this API. #1832.
     std::expected<void, std::string> create_group(const RbacGroup& group);
     std::expected<void, std::string> delete_group(const std::string& name);
     std::vector<std::string> get_group_members(const std::string& group_name) const;
@@ -92,6 +100,36 @@ public:
                                                       const std::string& username);
     std::expected<void, std::string> remove_group_member(const std::string& group_name,
                                                          const std::string& username);
+
+    /// Upper bound on the number of IdP-asserted groups reconciled for a single
+    /// login. Defends `reconcile_idp_memberships` against a malicious/compromised
+    /// IdP response (or claims-inflation bug) turning one login into an
+    /// unbounded write storm. #1832.
+    static constexpr size_t kMaxIdpGroupsPerLogin = 200;
+
+    /// Reconcile the IdP-asserted group memberships for `username` under
+    /// `source` ("entra"/"saml"/"ad" — never "local") against what
+    /// `group_members` currently records for that (user, source) pair.
+    ///
+    /// In one transaction:
+    ///   1. Upserts a namespaced group (`namespaced_group_name(source, id)`)
+    ///      and membership row for every asserted `{external_id, display}`.
+    ///   2. Deletes any of the user's memberships in a `source`-owned group
+    ///      that was NOT in the asserted set — this is what makes IdP-group
+    ///      removal (deprovisioning) take effect on next login instead of
+    ///      accumulating stale grants forever.
+    /// Local memberships (`groups.source == 'local'`) are never touched: the
+    /// stale-membership DELETE is scoped to `groups.source = ?` (the caller's
+    /// `source`), so a user's local group memberships survive every IdP login.
+    ///
+    /// Returns `unexpected("group_count_exceeded")` WITHOUT mutating anything
+    /// if `asserted.size() > kMaxIdpGroupsPerLogin`. Callers (the OIDC/SAML
+    /// callback handlers) MUST treat any `unexpected` result as fail-closed:
+    /// deny the login rather than mint a session with unreconciled/stale
+    /// roles. #1832.
+    std::expected<void, std::string>
+    reconcile_idp_memberships(const std::string& username, const std::string& source,
+                              const std::vector<std::pair<std::string, std::string>>& asserted);
 
     // ── Authorization check ──────────────────────────────────────────────
     bool check_permission(const std::string& username, const std::string& securable_type,
@@ -153,5 +191,18 @@ private:
 /// returns true and so fails CLOSED. A corrupt rbac.db can never widen
 /// fleet-scan visibility to the whole fleet.
 [[nodiscard]] bool rbac_enforcement_in_effect(const RbacStore* store) noexcept;
+
+/// Build the `groups.name` used for an IdP-sourced group: `source:external_id`
+/// (e.g. `entra:8f3c...`). `source == "local"` groups are NOT namespaced —
+/// this returns `external_id` unchanged in that case (matches how local
+/// groups are created directly by name, with no `external_id` concept).
+///
+/// This is the confused-deputy fix for #1832: an operator-created local group
+/// named e.g. "admins" and an IdP group asserting the same raw id "admins" are
+/// two DIFFERENT rows (`admins` vs `entra:admins`) once every IdP membership
+/// write goes through this helper, so a same-named IdP group can never assume
+/// a local group's already-granted roles (or vice versa).
+[[nodiscard]] std::string namespaced_group_name(const std::string& source,
+                                                const std::string& external_id);
 
 } // namespace yuzu::server

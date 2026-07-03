@@ -1803,7 +1803,69 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto& claims = result.value();
         auto email = claims.email.empty() ? claims.preferred_username : claims.email;
         auto display = claims.name.empty() ? email : claims.name;
+        auto username = display.empty() ? email : display;
         auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
+
+        // #1832 — reconcile IdP group memberships into the RBAC store BEFORE
+        // minting a session, so a provisioning failure denies the login
+        // outright (fail-closed) instead of granting a session under
+        // stale/unreconciled roles. `reconcile_idp_memberships` writes
+        // NAMESPACED group names (`entra:<gid>`, via
+        // `RbacStore::namespaced_group_name`) — the confused-deputy fix: a
+        // locally-created group can never collide with (or be impersonated
+        // by) a same-named IdP group. It also DELETEs any of this user's
+        // 'entra'-sourced memberships that were NOT re-asserted this login,
+        // which is the deprovisioning-bypass fix — IdP-side group removal
+        // now takes effect on the user's next SSO login instead of
+        // accumulating forever. Local memberships are never touched. See
+        // `docs/user-manual/authentication.md` "OIDC group provisioning".
+        if (rbac_store_) {
+            if (claims.groups.size() > RbacStore::kMaxIdpGroupsPerLogin) {
+                spdlog::warn(
+                    "OIDC group provisioning denied for '{}': {} asserted groups exceeds cap {}",
+                    username, claims.groups.size(), RbacStore::kMaxIdpGroupsPerLogin);
+                audit_log_for_principal(
+                    req, "auth.sso_group_provision", "failed", username, "user", "", "",
+                    "reason=group_count_exceeded;count=" +
+                        std::to_string(claims.groups.size()) + ";source=entra");
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_sso_group_provision_total",
+                              {{"source", "entra"}, {"result", "error"}})
+                        .increment();
+                }
+                res.set_redirect("/login?error=sso_failed");
+                return;
+            }
+
+            std::vector<std::pair<std::string, std::string>> asserted;
+            asserted.reserve(claims.groups.size());
+            for (const auto& gid : claims.groups)
+                asserted.emplace_back(gid, gid);
+
+            auto reconciled = rbac_store_->reconcile_idp_memberships(username, "entra", asserted);
+            if (!reconciled) {
+                spdlog::warn("OIDC group provisioning failed for '{}': {}", username,
+                            reconciled.error());
+                audit_log_for_principal(req, "auth.sso_group_provision", "failed", username,
+                                        "user", "", "",
+                                        "reason=" + reconciled.error() + ";source=entra");
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_sso_group_provision_total",
+                              {{"source", "entra"}, {"result", "error"}})
+                        .increment();
+                }
+                res.set_redirect("/login?error=sso_failed");
+                return;
+            }
+
+            audit_log_for_principal(req, "auth.sso_group_provision", "ok", username, "user", "",
+                                    "", "source=entra;asserted=" + std::to_string(asserted.size()));
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_sso_group_provision_total",
+                          {{"source", "entra"}, {"result", "ok"}})
+                    .increment();
+            }
+        }
 
         // PR3 / SOC 2 CC6.6 — seed the session's MFA-verified timestamp
         // when the IdP `amr` claim attests a multi-factor login. The
@@ -1844,19 +1906,6 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub,
                                                            claims.groups, admin_gid, mfa_at);
-
-        // Sync Entra groups into the RBAC store so that group-scoped role
-        // assignments (e.g. ApiTokenManager on an Entra group) take effect.
-        if (rbac_store_ && !claims.groups.empty()) {
-            auto username = display.empty() ? email : display;
-            for (const auto& gid : claims.groups) {
-                (void)rbac_store_->create_group({.name = gid,
-                                                 .description = "Entra ID group (auto-synced)",
-                                                 .source = "entra",
-                                                 .external_id = gid});
-                (void)rbac_store_->add_group_member(gid, username);
-            }
-        }
 
         res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
 
