@@ -754,6 +754,81 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 },
             },
         },
+
+        // ── Mapped drives (capability-map §3.8) ───────────────────────────
+        // Network-share mappings in BOTH directions, distinguished by the
+        // `direction` column: `outbound` = drives THIS host maps to remote
+        // shares; `inbound` = remote hosts mapping THIS host's shares (the
+        // lateral-movement signal §3.8 calls out). Live snapshot-diff emits
+        // appeared/removed keyed on (direction, local_mount, remote_path,
+        // remote_host, username); `provider` is a value-only field (not keyed).
+        // A one-time init backfill seeds PAST mappings from persistent OS
+        // artifacts (Windows registry Network/MRU/MountPoints2 + Security
+        // event log; Linux fstab + Samba logs) as `origin='historical'` rows
+        // — the `origin` column separates historically-inferred from
+        // live-observed, and `historical` rows bypass the live diff entirely.
+        // Opt-in (default_enabled=false): rows expose usernames + share paths
+        // (identity/usage-class PII), shipped disabled per the standing
+        // capture-source posture (like arp/dns).
+        {
+            .name = "mapdrive",
+            .dollar_name = "MapDrive",
+            .default_enabled = false,
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported,            "wnet",
+                 "Outbound live: WNetOpenEnumW/WNetEnumResourceW + WNetGetUserW "
+                 "(unprivileged). Outbound history: HKCU\\Network + Map Network "
+                 "Drive MRU + MountPoints2 across offline profiles, ts = subkey "
+                 "last-write. Inbound live: NetSessionEnum L502→L10 (+ "
+                 "NetConnectionEnum for the share) — needs local-admin / "
+                 "Server-Operator, degrades to empty on ERROR_ACCESS_DENIED. "
+                 "Inbound history: Security event log 4624 (logon_type=3) / 4634 "
+                 "via wevtutil, ts = event time."},
+                {"linux",   OsSupportStatus::kSupportedConstrained, "procfs",
+                 "Outbound live: /proc/mounts fstype∈{cifs,smb3,nfs,nfs4,"
+                 "fuse.sshfs} (username unavailable). Outbound history: /etc/fstab "
+                 "cifs/nfs entries (ts=0) + current mounts. Inbound live: smbstatus "
+                 "-b/-S — needs Samba installed + read access, degrades to empty "
+                 "otherwise. Inbound history: /var/log/samba connect events, "
+                 "journalctl -u smbd fallback."},
+                {"macos",   OsSupportStatus::kPlanned,              "getfsstat",
+                 "Outbound via getfsstat / `mount` NFS/SMB entries; inbound via "
+                 "smbutil. Wired in the macOS follow-up (returns empty today)."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    .retention_default = 5000,
+                    .columns = {
+                        {"ts",          "INTEGER"},
+                        {"snapshot_id", "INTEGER"},
+                        {"action",      "TEXT"}, // appeared, removed, historical
+                        {"direction",   "TEXT"}, // outbound, inbound
+                        {"local_mount", "TEXT"},
+                        {"remote_path", "TEXT"},
+                        {"remote_host", "TEXT"},
+                        {"username",    "TEXT"},
+                        {"provider",    "TEXT"},
+                        {"origin",      "TEXT"}, // live, historical
+                    },
+                },
+                {
+                    .suffix = "hourly",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 86400, // 24 hours
+                    .columns = {
+                        {"hour_ts",      "INTEGER"},
+                        {"direction",    "TEXT"},
+                        {"local_mount",  "TEXT"},
+                        {"remote_path",  "TEXT"},
+                        {"remote_host",  "TEXT"},
+                        {"appear_count", "INTEGER"},
+                        {"remove_count", "INTEGER"},
+                    },
+                },
+            },
+        },
     };
     return sources;
 }
@@ -1194,6 +1269,22 @@ SELECT (ts / 3600) * 3600, name, record_type,
 FROM dns_live
 WHERE ts >= ? AND ts < ?
 GROUP BY (ts / 3600) * 3600, name, record_type)";
+        }
+    }
+
+    // ── Mapped-drive rollups (capability-map §3.8) — per (direction, mount, remote) ──
+    // Only live appeared/removed transitions roll up. `historical` backfill rows
+    // carry the artifact time (or 0), which falls outside every hourly window, so
+    // they never contribute to a count — no special-casing needed.
+    if (source_name == "mapdrive") {
+        if (target_suffix == "hourly") {
+            return R"(INSERT INTO mapdrive_hourly (hour_ts, direction, local_mount, remote_path, remote_host, appear_count, remove_count)
+SELECT (ts / 3600) * 3600, direction, local_mount, remote_path, remote_host,
+       SUM(CASE WHEN action = 'appeared' THEN 1 ELSE 0 END),
+       SUM(CASE WHEN action = 'removed' THEN 1 ELSE 0 END)
+FROM mapdrive_live
+WHERE ts >= ? AND ts < ?
+GROUP BY (ts / 3600) * 3600, direction, local_mount, remote_path, remote_host)";
         }
     }
 

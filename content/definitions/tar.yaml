@@ -113,13 +113,15 @@ spec:
         displayName: Event Type Filter
         description: >
           Filter results by event type. Valid values: process, network,
-          service, user, software, arp, dns. software joins the default feed once
-          enabled (its collection is off by default — see software_enabled); arp/dns
-          are opt-in device-state sources (ADR-0015) reached only by an explicit
-          filter — they are excluded from the default (empty-filter) feed. Leave
+          service, user, software, arp, dns, mapdrive. software joins the default
+          feed once enabled (its collection is off by default — see
+          software_enabled); arp/dns/mapdrive are opt-in device-state / PII sources
+          reached only by an explicit filter — they are excluded from the default
+          (empty-filter) feed. mapdrive (§3.8) returns network-share mappings in
+          both directions, including historical (action='historical') rows. Leave
           empty to return the core process/network/service/user/software types.
         validation:
-          enum: [process, network, service, user, software, arp, dns, ""]
+          enum: [process, network, service, user, software, arp, dns, mapdrive, ""]
       limit:
         type: string
         displayName: Result Limit
@@ -477,6 +479,26 @@ spec:
           (usage-class telemetry under the works-council posture; enabling is
           audited). Windows-only collector today (Linux/macOS planned). Requires
           agent v0.12.0+; older agents silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      mapdrive_enabled:
+        type: string
+        displayName: Mapped-Drive Collector Enabled
+        description: >
+          Enable or disable the mapped-drive capture source (capability-map §3.8,
+          mapdrive → $MapDrive_*). Records network-share mappings in BOTH
+          directions — outbound (drives this host maps to remote shares) and
+          inbound (remote hosts mapping this host's shares, the lateral-movement
+          signal). Opt-in: "false" by default — rows expose usernames and remote
+          share paths (identity/usage-class telemetry under the works-council
+          posture; enabling is audited). Windows + Linux (macOS planned); inbound
+          needs local-admin / Server-Operator on Windows and Samba on Linux and
+          degrades to empty otherwise. NOTE: the one-time HISTORICAL backfill (all
+          PREVIOUSLY mapped drives, from the registry / fstab / event logs) is
+          seeded at agent init, so it materializes on the first agent restart
+          AFTER you enable this. See process_enabled for disable semantics.
+          Requires agent v0.12.0+; older agents silently ignore. Valid:
+          "true" | "false".
         validation:
           pattern: "^(true|false)$"
       network_capture_method:
