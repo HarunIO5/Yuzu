@@ -867,6 +867,16 @@ constexpr std::size_t kNetQualEnableCapPerTick = 128;
 /// Bound on tracked connections (the per-tick emit cap is kNetQualTopN=50; this
 /// is headroom so a degraded connection is found even on connection-heavy hosts).
 constexpr std::size_t kNetQualMaxTracked = 2048;
+/// If more than this many wall-clock seconds elapsed since the last sweep, every
+/// surviving baseline is re-anchored (emits nothing this tick) instead of
+/// differenced: a delta spanning a long gap — netqual disabled for hours, or the
+/// host slept with connections surviving resume — would otherwise report the
+/// whole gap's cumulative retransmits as ONE tick's `lost` (the current-loss
+/// gauge) and sort those falsified rows to the top-N. Comfortably above the 60s
+/// fast cadence, so a multi-minute gap means disable/sleep, not a slow tick.
+/// Mirrors the #538 clean-baseline-on-re-enable contract Linux netqual gets for
+/// free (it holds no cross-tick state).
+constexpr std::int64_t kNetQualStaleSweepSeconds = 300;
 
 /// Baseline + liveness state for one tracked connection.
 struct NqTracked {
@@ -875,9 +885,10 @@ struct NqTracked {
     uint64_t seen_tick{0};
 };
 
-std::mutex g_nq_mtx; // guards the two statics below (collect_fast vs snapshot)
+std::mutex g_nq_mtx; // guards the statics below (collect_fast vs snapshot)
 std::unordered_map<std::string, NqTracked> g_nq_tracked;
 uint64_t g_nq_tick = 0;
+std::int64_t g_nq_last_sweep_unix = 0; // wall-clock of the previous sweep (stale guard)
 
 // Elevation gate: 0=unknown, 1=active, 2=denied. Token elevation is fixed for
 // the process lifetime, so kDenied never re-arms (unlike the module ETW latch).
@@ -1035,6 +1046,36 @@ bool nq_visit(Row& row, std::string key, const std::string& proto, std::string r
     return true;
 }
 
+/// Fetch an OWNER_PID TCP table for `family`, retrying the documented
+/// size-probe/fetch TOCTOU up to 3× on ERROR_INSUFFICIENT_BUFFER (the table can
+/// grow between the size call and the fetch on a connection-churn host — the
+/// same race the sibling collect_tcp4/6 loops guard). Returns true (buf filled,
+/// possibly empty when the host has no connections of this family — a valid
+/// result safe to prune against) or false (the family could NOT be read this
+/// tick — the caller must skip pruning it, or a transient failure would erase
+/// every still-live baseline and blank netqual for that family for many ticks).
+bool nq_fetch_tcp_table(ULONG family, std::vector<BYTE>& buf) {
+    buf.clear();
+    DWORD size = 0;
+    GetExtendedTcpTable(nullptr, &size, FALSE, family, TCP_TABLE_OWNER_PID_ALL, 0);
+    if (size == 0)
+        return true; // no connections of this family — genuine empty, prune-safe
+    buf.resize(size);
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const DWORD ret =
+            GetExtendedTcpTable(buf.data(), &size, FALSE, family, TCP_TABLE_OWNER_PID_ALL, 0);
+        if (ret == NO_ERROR)
+            return true;
+        if (ret == ERROR_INSUFFICIENT_BUFFER) {
+            buf.resize(size); // grew between probe and fetch — retry at the new size
+            continue;
+        }
+        break; // hard failure — leave buf cleared, report unread
+    }
+    buf.clear();
+    return false;
+}
+
 } // namespace
 
 std::vector<NetConnection> enumerate_connections() {
@@ -1054,24 +1095,32 @@ std::vector<TcpQualitySample> collect_tcp_quality() {
         return out; // non-elevated: latched for the process lifetime
 
     // Raw ESTABLISHED tables (OWNER_PID variants — the pid feeds process_name).
-    // Fetched before the state lock; only the tracked-map work is serialized.
-    DWORD size4 = 0;
-    GetExtendedTcpTable(nullptr, &size4, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-    std::vector<BYTE> buf4(size4 ? size4 : 1);
-    if (size4 == 0 ||
-        GetExtendedTcpTable(buf4.data(), &size4, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) !=
-            NO_ERROR)
-        buf4.clear();
-    DWORD size6 = 0;
-    GetExtendedTcpTable(nullptr, &size6, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
-    std::vector<BYTE> buf6(size6 ? size6 : 1);
-    if (size6 == 0 ||
-        GetExtendedTcpTable(buf6.data(), &size6, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) !=
-            NO_ERROR)
-        buf6.clear();
+    // Fetched before the state lock (retry the size race, like the sibling
+    // collectors); only the tracked-map work is serialized. v4_ok/v6_ok gate
+    // the per-family prune below so a transient read failure does not wipe live
+    // baselines.
+    std::vector<BYTE> buf4, buf6;
+    const bool v4_ok = nq_fetch_tcp_table(AF_INET, buf4);
+    const bool v6_ok = nq_fetch_tcp_table(AF_INET6, buf6);
 
     std::lock_guard lock(g_nq_mtx);
     ++g_nq_tick;
+
+    // Stale-gap guard: if too long elapsed since the last sweep (netqual was
+    // disabled, or the host slept), re-anchor every surviving baseline so this
+    // tick emits nothing rather than reporting the whole gap's retransmits as
+    // one tick's current loss. Connections still established get re-baselined in
+    // the visit loops; ones that vanished are pruned as usual.
+    const std::int64_t now_unix = std::chrono::duration_cast<std::chrono::seconds>(
+                                      std::chrono::system_clock::now().time_since_epoch())
+                                      .count();
+    if (g_nq_last_sweep_unix != 0 &&
+        now_unix - g_nq_last_sweep_unix > kNetQualStaleSweepSeconds) {
+        for (auto& [k, t] : g_nq_tracked)
+            t.baselined = false;
+    }
+    g_nq_last_sweep_unix = now_unix;
+
     std::size_t enables = 0;
     std::unordered_map<uint32_t, std::string> name_cache;
     bool denied = false;
@@ -1131,9 +1180,15 @@ std::vector<TcpQualitySample> collect_tcp_quality() {
     g_nq_gate.store(kNqGateActive, std::memory_order_relaxed);
 
     // Prune connections that left the ESTABLISHED table (stats die with the TCB;
-    // nothing to disable — see the never-disable note above).
-    std::erase_if(g_nq_tracked,
-                  [](const auto& kv) { return kv.second.seen_tick != g_nq_tick; });
+    // nothing to disable — see the never-disable note above) — but ONLY for a
+    // family whose table we actually read this tick. A family whose fetch failed
+    // (v4_ok/v6_ok == false) is skipped: its entries keep their baselines and are
+    // revisited next tick, instead of being wiped and re-enabled 128-at-a-time.
+    std::erase_if(g_nq_tracked, [&](const auto& kv) {
+        if (kv.second.seen_tick == g_nq_tick)
+            return false; // observed this tick — keep
+        return kv.first.starts_with("tcp6|") ? v6_ok : v4_ok;
+    });
     return out;
 }
 

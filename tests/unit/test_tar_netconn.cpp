@@ -16,14 +16,18 @@ using yuzu::tar::parse_netconn_event_xml;
 
 namespace {
 
-// Real NetworkProfile 10000 (network connected), captured 2026-07-03. The
-// free-text fields (Name/Description/Guid) are exactly what must NEVER reach
-// a row.
-const std::string kNetProfileConnected = R"(<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-NetworkProfile' Guid='{fbcfac3f-8459-419f-8e48-1f0b49cdb85e}'/><EventID>10000</EventID><Version>0</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x4000200000000020</Keywords><TimeCreated SystemTime='2026-07-03T13:35:23.8124269Z'/><EventRecordID>2408</EventRecordID><Correlation ActivityID='{c7cc53d1-0a32-0005-4254-ccc7320add01}'/><Execution ProcessID='2680' ThreadID='16684'/><Channel>Microsoft-Windows-NetworkProfile/Operational</Channel><Computer>DESKTOP-04DNSIG</Computer><Security UserID='S-1-5-20'/></System><EventData><Data Name='Name'>CorpHQ Secret Net</Data><Data Name='Description'>CorpHQ Secret Net</Data><Data Name='Guid'>{d4b44eeb-91e1-43f3-aa43-3871b88a3849}</Data><Data Name='Type'>0</Data><Data Name='State'>9</Data><Data Name='Category'>1</Data></EventData></Event>)";
+// NetworkProfile 10000 (network connected). The event SHAPE (field names/order,
+// Category enum) was captured from a live event on 2026-07-03; every machine
+// identifier — Computer, network Guid, Correlation ActivityID, IfLuid, PID/TID —
+// is SYNTHETIC (data-minimization: fixtures must not carry the capture box's
+// real identifiers). The free-text fields (Name/Description/Guid) are exactly
+// what must NEVER reach a row, so they double as privacy sentinels.
+const std::string kNetProfileConnected = R"(<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-NetworkProfile' Guid='{fbcfac3f-8459-419f-8e48-1f0b49cdb85e}'/><EventID>10000</EventID><Version>0</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x4000200000000020</Keywords><TimeCreated SystemTime='2026-07-03T13:35:23.8124269Z'/><EventRecordID>2408</EventRecordID><Correlation ActivityID='{aaaaaaaa-1111-2222-3333-444444444444}'/><Execution ProcessID='4242' ThreadID='4243'/><Channel>Microsoft-Windows-NetworkProfile/Operational</Channel><Computer>HOST-NETQUAL-UT</Computer><Security UserID='S-1-5-20'/></System><EventData><Data Name='Name'>CorpHQ Secret Net</Data><Data Name='Description'>CorpHQ Secret Net</Data><Data Name='Guid'>{bbbbbbbb-5555-6666-7777-888888888888}</Data><Data Name='Type'>0</Data><Data Name='State'>9</Data><Data Name='Category'>1</Data></EventData></Event>)";
 
-// Real NCSI 4042 (capability change), captured 2026-07-03 on an
-// internet-connected box: Capability=2 IS the internet state.
-const std::string kNcsiCapability = R"(<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-NCSI' Guid='{314de49f-ce63-4779-ba2b-d616f6963a88}'/><EventID>4042</EventID><Version>0</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x4000000000000020</Keywords><TimeCreated SystemTime='2026-07-03T13:35:22.8666561Z'/><EventRecordID>333</EventRecordID><Correlation ActivityID='{c7cc53d1-0a32-0005-4254-ccc7320add01}'/><Execution ProcessID='2680' ThreadID='13720'/><Channel>Microsoft-Windows-NCSI/Operational</Channel><Computer>DESKTOP-04DNSIG</Computer><Security UserID='S-1-5-20'/></System><EventData><Data Name='InterfaceGuid'>{67f26f36-a70c-43bc-8bd4-bd5caaacab24}</Data><Data Name='IfLuid'>1689399716741120</Data><Data Name='Family'>0</Data><Data Name='Capability'>2</Data><Data Name='CapabilityChangeReason'>4</Data><Data Name='PreviousCapability'>0</Data></EventData></Event>)";
+// NCSI 4042 (capability change) on an internet-connected box: Capability=2 IS
+// the internet state. Shape captured 2026-07-03; identifiers SYNTHETIC (see
+// kNetProfileConnected).
+const std::string kNcsiCapability = R"(<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-NCSI' Guid='{314de49f-ce63-4779-ba2b-d616f6963a88}'/><EventID>4042</EventID><Version>0</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x4000000000000020</Keywords><TimeCreated SystemTime='2026-07-03T13:35:22.8666561Z'/><EventRecordID>333</EventRecordID><Correlation ActivityID='{aaaaaaaa-1111-2222-3333-444444444444}'/><Execution ProcessID='4242' ThreadID='4244'/><Channel>Microsoft-Windows-NCSI/Operational</Channel><Computer>HOST-NETQUAL-UT</Computer><Security UserID='S-1-5-20'/></System><EventData><Data Name='InterfaceGuid'>{cccccccc-9999-0000-1111-222222222222}</Data><Data Name='IfLuid'>1234567890123456</Data><Data Name='Family'>0</Data><Data Name='Capability'>2</Data><Data Name='CapabilityChangeReason'>4</Data><Data Name='PreviousCapability'>0</Data></EventData></Event>)";
 
 // WLAN-AutoConfig 8001 (Wi-Fi connect success), built from the shipped v0
 // template's field list (this box is wired — no live sample): InterfaceGuid,
@@ -118,10 +122,11 @@ TEST_CASE("netconn: PRIVACY — no free-text event field ever reaches a row",
         "Secret",          // SSID "CorpHQ Secret WiFi" / Name "CorpHQ Secret Net"
         "CorpHQ",          // profile name / SSID / network name fragments
         "Intel",           // InterfaceDescription
-        "67f26f36",        // NCSI InterfaceGuid fragment
-        "11111111",        // WLAN InterfaceGuid fragment
-        "d4b44eeb",        // NetworkProfile network Guid fragment
-        "DESKTOP-04DNSIG", // Computer
+        "cccccccc",        // NCSI InterfaceGuid fragment (synthetic)
+        "11111111",        // WLAN InterfaceGuid fragment (synthetic)
+        "bbbbbbbb",        // NetworkProfile network Guid fragment (synthetic)
+        "aaaaaaaa",        // Correlation ActivityID fragment (synthetic)
+        "HOST-NETQUAL-UT", // Computer (synthetic)
         "LAPTOP-XYZ",
     };
     const struct {

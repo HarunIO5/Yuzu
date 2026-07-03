@@ -89,8 +89,15 @@ void read_channel(const ChannelSpec& ch, std::int64_t from_ts, std::int64_t befo
                                L"' and @SystemTime<'" +
                                yuzu::win::to_wide(format_event_systemtime(before_ts)) + L"']]]";
 
+    // NEWEST-first: when a window holds more than `cap` events (a Wi-Fi flap
+    // storm on a GPO-enlarged channel, or a large first-run window), the ones we
+    // keep must be the most RECENT — the storm the operator is trying to
+    // diagnose — not the oldest quiet period. The high-water mark still advances
+    // to the window's upper bound, so the dropped OLDEST tail is not re-read;
+    // that is the documented "upper bound on intent, not a promise of depth"
+    // (tar_netconn.hpp) and matches ADR-0020's newest-first recovery.
     EvtGuard q{::EvtQuery(nullptr, ch.path, query.c_str(),
-                          EvtQueryChannelPath | EvtQueryForwardDirection)};
+                          EvtQueryChannelPath | EvtQueryReverseDirection)};
     if (!q) {
         const DWORD err = ::GetLastError();
         // Missing channel (no WLAN service / Server SKU) is expected topology,
@@ -123,9 +130,9 @@ void read_channel(const ChannelSpec& ch, std::int64_t from_ts, std::int64_t befo
         }
     }
     if (taken >= cap)
-        spdlog::warn("TAR netconn: {} backfill hit the per-channel cap ({}) — "
-                     "older events in the window were skipped",
-                     ch.tag, cap);
+        spdlog::warn("TAR netconn: {} backfill hit the per-channel cap ({}) — kept the "
+                     "newest {} events; older events in the window were skipped",
+                     ch.tag, cap, cap);
 }
 
 } // namespace
