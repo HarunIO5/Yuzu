@@ -2681,15 +2681,23 @@ Omit both `name` and `agent_id` for a fleet-wide scan.
 {
   "data": {
     "software": [
-      {"agent_id": "agent-001", "name": "Google Chrome", "version": "124.0", "publisher": "Google LLC", "install_date": "2024-01-15"}
+      {"agent_id": "agent-001", "name": "bash", "version": "5.2.21", "publisher": "Fedora Project",
+       "install_date": "2026-01-15", "kind": "package", "ecosystem": "rpm", "epoch": "0",
+       "release": "3.fc40", "arch": "x86_64", "signature_status": "signed",
+       "distro_id": "fedora", "distro_version": "40"},
+      {"agent_id": "agent-002", "name": "Google Chrome", "version": "124.0", "publisher": "Google LLC",
+       "install_date": "2026-01-15", "kind": "app", "ecosystem": "windows", "epoch": "",
+       "release": "", "arch": "", "signature_status": "", "distro_id": "", "distro_version": ""}
     ],
-    "count": 1,
+    "count": 2,
     "devices_omitted": 0,
     "result_truncated_by_cap": true
   },
   "meta": { "api_version": "v1" }
 }
 ```
+
+Every row carries the **blob-v2 package fields** (`kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`) alongside the original four. A field the source ecosystem does not store is `""` — **never synthesised** (a Windows/macOS app row is honestly empty on every NEVRA/signature/distro field, as in the second example above). These 8 keys are **always present in every row** (never absent) — integration code should test for an empty-string value, not key absence. See `docs/user-manual/inventory.md` for the full per-ecosystem availability matrix.
 
 `devices_omitted` is always present (0 when no scope filtering occurred). `result_truncated_by_cap` is present only when `count == limit` and more rows may exist past the cap (keyset pagination is a follow-up, #1634). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
 
