@@ -32,6 +32,29 @@ namespace {
 // this before it reaches the audit detail.
 constexpr std::size_t kMaxJustificationLength = 1024;
 
+// system_clock time_point → ISO-8601 UTC ("YYYY-MM-DDTHH:MM:SSZ"). Mirrors
+// guardian_ingest.cpp's ts_to_iso8601 / rest_api_v1.cpp's iso_now pattern —
+// the established per-file idiom for this codebase (no shared formatter
+// header exists yet). Used for JIT elevation's `expires_at` (follow-up B,
+// security review 2026-06-30): the wall-clock projection of an internally
+// steady_clock-tracked window.
+std::string iso8601_utc(std::chrono::system_clock::time_point tp) {
+    std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm{};
+#if defined(_WIN32)
+    // gmtime_s returns nonzero on failure — don't silently format a
+    // zero-inited tm as 1970-01-01 (L1, adversarial review).
+    if (gmtime_s(&tm, &t) != 0)
+        return "invalid-time";
+#else
+    if (gmtime_r(&t, &tm) == nullptr)
+        return "invalid-time";
+#endif
+    char buf[32] = {};
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return std::string(buf);
+}
+
 // A4 denial envelope for the scoped-permission gate (#1549 review MEDIUM). The
 // shared require_scoped_permission gate is the denial chokepoint for the agentic
 // per-device routes, so its 401/403 bodies must carry the A4 fields — a
@@ -202,8 +225,23 @@ std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request&
     if (token.size() > auth::kMaxSessionTokenLength)
         return std::nullopt;
     auto session = auth_mgr_.validate_session(token);
-    if (session)
+    if (session) {
+        // Lazily reap a passively-lapsed JIT elevation on the cookie chokepoint
+        // (residual-risk follow-up A, security review 2026-06-30): there is no
+        // background reaper, so the next authenticated request after a window
+        // lapses is where the `role.elevation.expired` audit row is minted.
+        // Uses audit_log_for_principal (not audit_log) because audit_log's
+        // make_audit_event() itself calls resolve_session(req) — calling that
+        // from inside resolve_session would re-enter this function. `session`
+        // already carries the base role (Session::role is never the elevated
+        // view), matching the `role.elevation.revoked` audit's principal_role.
+        if (auto expired_user = auth_mgr_.reap_expired_elevation(token)) {
+            audit_log_for_principal(req, "role.elevation.expired", "expired", *expired_user,
+                                    auth::role_to_string(session->role), "User", *expired_user,
+                                    "JIT admin elevation window lapsed");
+        }
         return session;
+    }
 
     // 2. Try Authorization: Bearer <token> (API token auth)
     auto auth_header = req.get_header_value("Authorization");
@@ -2422,15 +2460,38 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
             return;
         }
+        // `until` may be CLAMPED to the session's own absolute expiry
+        // (follow-up B, security review 2026-06-30) — report the TRUE
+        // remaining time, not the requested/capped `duration`. A live window
+        // is CEIL'd (never floor/truncated) — duration_cast truncates toward
+        // zero, so a genuinely-live sub-second remainder (e.g. duration_secs:1
+        // re-sampled a moment later) would falsely report 0 across all three
+        // channels (HIGH, adversarial review). Only a non-live/edge window
+        // (until <= now) floors to 0.
+        const auto elevate_now = std::chrono::steady_clock::now();
+        auto remaining = (*until > elevate_now)
+                              ? std::chrono::ceil<std::chrono::seconds>(*until - elevate_now)
+                              : std::chrono::seconds(0);
+        // steady_clock has no wall-clock meaning across a restart/off-process,
+        // so the absolute `expires_at` is a system_clock projection of the
+        // steady remaining duration, taken at essentially the same instant.
+        const std::string expires_at_str =
+            iso8601_utc(std::chrono::system_clock::now() + remaining);
         // FAIL-CLOSED on the mandatory grant audit (review UP-3): a privileged
         // activation must never stand without a durable record. If the audit row
         // can't persist, ROLL BACK the elevation (compensating revoke, mirrors
         // the break-glass arm) and 500 with Sec-Audit-Failed — rather than leave
         // a silent admin window.
+        // duration_secs is the TRUE post-clamp window (remaining.count()), NOT the
+        // requested/capped `duration` — so the audit row, the analytics event, and
+        // the JSON response all agree on the enforced window even when the window
+        // was clamped to the session's own absolute expiry (evidence integrity,
+        // docs/auth-architecture.md:238-240).
         if (!audit_log_for_principal(req, "role.elevation.granted", "ok", session->username, "admin",
                                      "User", session->username,
-                                     "duration_secs=" + std::to_string(duration) +
-                                         " justification=" + justification)) {
+                                     "duration_secs=" + std::to_string(remaining.count()) +
+                                         " justification=" + justification +
+                                         " expires_at=" + expires_at_str)) {
             auth_mgr_.revoke_elevation(token); // un-elevate — no record, no grant
             spdlog::error("role.elevation.granted audit FAILED for '{}' — elevation rolled back",
                           session->username);
@@ -2441,10 +2502,20 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                             "application/json");
             return;
         }
+        // duration_secs here is remaining.count() (the true post-clamp value),
+        // not the requested/capped `duration` — matches the audit row and the
+        // JSON response so all three channels agree (governance hardening
+        // round, consistency). With the ceil above, a live window is always
+        // >= 1 (never truncated to 0); only the dead-window edge case is 0.
+        // expires_at is carried too (L2, adversarial review) so this channel
+        // matches the audit row and the JSON response (docs/auth-architecture.md:238-240).
         emit_event("role.elevation.granted", req,
-                   {{"username", session->username}, {"duration_secs", std::to_string(duration)}}, {},
-                   Severity::kWarn);
-        nlohmann::json out = {{"status", "ok"}, {"expires_in", duration}};
+                   {{"username", session->username},
+                    {"duration_secs", std::to_string(remaining.count())},
+                    {"expires_at", expires_at_str}},
+                   {}, Severity::kWarn);
+        nlohmann::json out = {
+            {"status", "ok"}, {"expires_in", remaining.count()}, {"expires_at", expires_at_str}};
         res.set_content(out.dump(), "application/json");
     });
 
