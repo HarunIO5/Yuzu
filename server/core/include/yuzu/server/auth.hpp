@@ -35,8 +35,33 @@ struct UserEntry {
     std::string hash_hex;
 };
 
+/// Human-readable resolution record for a stable SSO principal id
+/// (`"oidc:" + iss + "#" + sub`, #1837). Upserted on every OIDC login so
+/// UI/audit rendering can show a name for an opaque principal WITHOUT
+/// weakening the stable key used for authorization. See
+/// `AuthManager::resolve_sso_identity`.
+struct SsoIdentity {
+    std::string display_name;
+    std::string email;
+};
+
 struct Session {
+    /// STABLE authorization principal. For local/API-token auth this is the
+    /// login username; for OIDC/SSO auth (#1837) this is `"oidc:" + iss +
+    /// "#" + sub` — the IdP-issuer-scoped, immutable subject claim — NEVER a
+    /// human-readable label. `check_permission`, `reconcile_idp_memberships`,
+    /// elevation eligibility, and every audit `principal` field key on THIS
+    /// field. Two SSO users who happen to share a display name (or a display
+    /// name that later changes, e.g. after a legal name change) must never
+    /// collide or resolve to the same principal — see
+    /// docs/auth-architecture.md "Stable principal vs. display name".
     std::string username;
+    /// Human-readable label for UI/audit-DETAIL rendering only — NEVER used
+    /// for authorization or as a map/store key. For local auth this mirrors
+    /// `username`; for OIDC/SSO auth this is the IdP `name` claim (falling
+    /// back to `email`) at the time of the most recent login, so it tracks
+    /// display-name changes without perturbing the stable `username` above.
+    std::string display_name;
     Role role;
     std::chrono::steady_clock::time_point expires_at;
     std::string auth_source{"local"}; // "local", "oidc", "saml", "api_token", or "mcp_token"
@@ -359,11 +384,28 @@ public:
     /// high-risk action. Must be `steady_clock` (not the wall-clock `iat`)
     /// so an NTP step cannot extend the step-up window — see
     /// docs/auth-mfa-design.md hard invariant #5.
+    ///
+    /// #1837 — the session's STABLE `username` (authorization principal) is
+    /// derived from `"oidc:" + iss + "#" + oidc_sub`, NOT `display_name`: a
+    /// display name is a mutable, IdP-side, human-editable label (two users
+    /// can share one, and a rename must not sever an existing user's group
+    /// memberships/roles). `iss` is the token issuer that scopes `sub` to a
+    /// specific IdP (RFC 7519 — `sub` is only unique per-issuer). `display_name`
+    /// is retained on the `Session` purely for human-readable rendering; see
+    /// `resolve_sso_identity` for looking it up without a live session.
     std::string create_oidc_session(const std::string& display_name, const std::string& email,
-                                    const std::string& oidc_sub,
+                                    const std::string& oidc_sub, const std::string& iss,
                                     const std::vector<std::string>& groups = {},
                                     const std::string& admin_group_id = {},
                                     std::chrono::steady_clock::time_point mfa_verified_at = {});
+
+    /// Resolve a stable principal id (as minted by `create_oidc_session`,
+    /// e.g. `"oidc:iss#sub"`) to the human-readable display name/email last
+    /// seen for it, for UI/audit rendering of a principal that has no live
+    /// session right now. Returns `nullopt` if the principal has never
+    /// logged in (or the process has restarted — the map is in-memory only,
+    /// same lifetime as `sessions_`). NEVER use the result for authorization.
+    std::optional<SsoIdentity> resolve_sso_identity(const std::string& principal_id) const;
 
     /// Create an ephemeral session for a verified SAML assertion's NameID.
     /// Thin slice: role defaults to `user` — no group→role mapping (deferred).
@@ -526,6 +568,13 @@ private:
     std::filesystem::path data_dir_;
     std::unordered_map<std::string, UserEntry> users_;
     mutable std::unordered_map<std::string, Session> sessions_;
+
+    /// #1837 — stable-principal-id → last-seen display name/email, upserted
+    /// on every `create_oidc_session` call. Guarded by `mu_` (same lock as
+    /// `sessions_`). In-memory only; a display name is cosmetic, so losing
+    /// it on restart (until the user's next login re-upserts it) is fine —
+    /// unlike `sessions_`/`users_` there is no durability requirement.
+    std::unordered_map<std::string, SsoIdentity> sso_identities_;
 
     // Non-owning pointer to AuthDB; if set, persistence goes through DB.
     yuzu::server::AuthDB* auth_db_ = nullptr;

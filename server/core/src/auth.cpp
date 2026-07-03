@@ -448,6 +448,7 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     auto token = generate_session_token();
     Session s;
     s.username = username;
+    s.display_name = username; // local auth: username IS the human label
     s.role = it->second.role;
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "local";
@@ -526,6 +527,7 @@ std::string AuthManager::create_local_session(const std::string& username, Role 
     auto token = generate_session_token();
     Session s;
     s.username = username;
+    s.display_name = username; // local auth: username IS the human label
     s.role = role;
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "local";
@@ -899,6 +901,7 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
 
 std::string AuthManager::create_oidc_session(const std::string& display_name,
                                              const std::string& email, const std::string& oidc_sub,
+                                             const std::string& iss,
                                              const std::vector<std::string>& groups,
                                              const std::string& admin_group_id,
                                              std::chrono::steady_clock::time_point mfa_verified_at) {
@@ -917,9 +920,19 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
         }
     }
 
+    // #1837 — the STABLE authorization principal is `iss` + `sub`, never a
+    // display name. `sub` is only guaranteed unique per-issuer (RFC 7519),
+    // and a display name is a mutable, IdP-editable label two users can
+    // share — keying on it let two same-named users collide onto one
+    // principal, which #1832's RBAC reconcile then makes destructive
+    // (one user's login can delete the other's group memberships).
+    const std::string stable_username = "oidc:" + iss + "#" + oidc_sub;
+    const std::string resolved_display = display_name.empty() ? email : display_name;
+
     auto token = generate_session_token();
     Session s;
-    s.username = display_name.empty() ? email : display_name;
+    s.username = stable_username;
+    s.display_name = resolved_display;
     s.role = role;
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "oidc";
@@ -929,10 +942,22 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     s.mfa_verified_at = mfa_verified_at;
     sessions_[token] = std::move(s);
 
-    spdlog::info("OIDC session created for '{}' (email={}, sub={}, role={})",
-                 display_name.empty() ? email : display_name, email, oidc_sub,
-                 role_to_string(role));
+    // Resolution map (mu_-guarded, same as sessions_): lets UI/audit render
+    // a human name for the opaque `stable_username` without weakening the
+    // key used for authorization.
+    sso_identities_[stable_username] = SsoIdentity{resolved_display, email};
+
+    spdlog::info("OIDC session created for '{}' (display={}, email={}, sub={}, role={})",
+                 stable_username, resolved_display, email, oidc_sub, role_to_string(role));
     return token;
+}
+
+std::optional<SsoIdentity> AuthManager::resolve_sso_identity(const std::string& principal_id) const {
+    std::shared_lock lock(mu_);
+    auto it = sso_identities_.find(principal_id);
+    if (it == sso_identities_.end())
+        return std::nullopt;
+    return it->second;
 }
 
 // ── SAML session creation ───────────────────────────────────────────────────
@@ -945,9 +970,14 @@ std::string AuthManager::create_saml_session(const std::string& name_id) {
     // mapping (analogous to the OIDC admin_group_id guard — see C3 fix comment
     // in create_oidc_session). Do not change this default without adding group
     // mapping that is reviewed by security-guardian.
+    // #1837 fast-follow: key SAML on entity_id#NameID (SAML doesn't sync to
+    // rbac_store yet, so its display-name-collision principal risk is
+    // dormant — see docs/auth-architecture.md "Stable principal vs. display
+    // name"). `username` stays the raw NameID; only `display_name` changes.
     auto token = generate_session_token();
     Session s;
     s.username                   = name_id;
+    s.display_name               = name_id;
     s.role                       = Role::user;
     s.expires_at                 = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source                = "saml";

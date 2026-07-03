@@ -140,9 +140,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   denied login (over-cap or store failure) also emits the shared `auth.oidc_login_failed` audit +
   analytics event so SIEM queries on that action don't miss a provisioning denial. See
   `docs/auth-architecture.md` "RBAC group provisioning (#1832)".
+- **OIDC session principal is now keyed on the stable `iss`+`sub`, not the mutable display
+  name (#1837, HIGH).** `create_oidc_session`'s authorization principal (`Session::username`,
+  the value `check_permission`/`reconcile_idp_memberships`/audit rows key on) was previously
+  `claims.name` (falling back to `claims.email`) — an IdP-editable, non-unique label. Two SSO
+  users with the same display name collided onto one principal, and #1832's reconcile made
+  that collision destructive (one user's login could delete the other's group memberships and
+  silently inherit their roles). The stable principal is now `"oidc:" + iss + "#" + sub`
+  (`sub` is only guaranteed unique per-issuer per RFC 7519, hence the `iss` scoping); the
+  mutable display name moves to a new `Session::display_name` field, used for UI/audit-detail
+  rendering only. A new `AuthManager::resolve_sso_identity(principal_id)` resolution map
+  (upserted on every OIDC login) lets UI/audit render a human name for the opaque stable
+  principal without a live session. Every nav-bar "who am I" render site (`/api/me`,
+  `/api/v1/me`, and the ten dashboard-page `nav-user`/`context-user` JS blocks) now shows
+  `display_name`, falling back to the stable id. SAML session-keying is unchanged this slice
+  (still the raw NameID) — SAML doesn't sync to `rbac_store` yet, so its principal risk is
+  dormant; tracked as a fast-follow. See `docs/auth-architecture.md` "Stable principal vs.
+  display name".
 
 ### Breaking Changes
 
+- **SSO operators re-login to regain group roles (#1837).** OIDC sessions now key on
+  `oidc:<iss>#<sub>` instead of the display name (see the Security entry above). `RbacStore`
+  migration v3 purges every IdP-sourced `group_members` row on upgrade (old display-name-keyed
+  memberships are unreachable and would otherwise be a resurrected confused-deputy risk if a
+  local user later took that display name) — they re-populate under the new stable key on each
+  SSO user's next login.
+  **OIDC JIT admin elevation is temporarily unavailable for SSO operators**, pending durable SSO
+  identity provisioning (**issue #1852**). `AuthDB::set_elevation_eligible`/`is_elevation_eligible`
+  key on `users.username` and are gated through `is_valid_username` (alphanumerics + `. _ -`
+  only); the stable `oidc:<iss>#<sub>` principal fails that check unconditionally. More
+  fundamentally, an OIDC login provisions **no `users` row at all** — there is no local record to
+  set the flag on, widened validator or not. An admin **cannot** restore this today by
+  "re-providing eligibility against the stable id"; that path does not exist until #1852 lands.
+  **This is not a regression of a previously-supported flow.** Before #1837, SSO elevation only
+  ever appeared to work by accident: it required the IdP-asserted display name to *coincidentally
+  equal* an existing local username, at which point the SSO session's (then-unstable, display-name-
+  keyed) principal silently **borrowed that local principal's `elevation_eligible` flag and TOTP
+  enrollment** — a latent cross-principal grant with no cryptographic binding between the SSO
+  identity and the local account it happened to name-collide with; a namesake local user's admin
+  elevation was reachable by anyone the IdP would authenticate under that same name. #1837 severs
+  that borrowing as a direct consequence of closing the collision it rode on. #1852 (a durable,
+  first-class identity record for SSO principals) is the real restoration path; this release does
+  not include it.
+  Session-revocation-by-username for an SSO operator is **not** structurally blocked the way
+  elevation is: the operationally-critical kill step
+  (`AuthManager::invalidate_user_sessions`'s in-memory sweep, keyed by plain string equality)
+  carries no `is_valid_username` gate and revokes any principal string, `oidc:<iss>#<sub>`
+  included — there is no missing-`users`-row problem here. `DELETE /api/v1/sessions?username=`'s
+  own query-param check does still run `is_valid_username` at the REST layer, so an admin typing
+  the literal `oidc:<iss>#<sub>` string into that endpoint still gets a 400 today — but that
+  charset-only validator predates #1837 and would already have rejected most OIDC
+  display-name-keyed usernames (spaces, `@`) before this change too, so it is a narrow,
+  pre-existing, easily-widened validator gap, not a new #1837 regression and not gated on #1852.
+  Separately, the `auth.db`-persisted half of revocation
+  (`AuthDB::invalidate_all_sessions`'s `DELETE FROM sessions`, which reports `db_persisted=false`
+  for an SSO target) was **already** a no-op for OIDC before #1837 too, because
+  `AuthDB::create_session` has never been called for an OIDC login (SSO sessions have always been
+  in-memory-only, never written to `auth.db`'s `sessions` table).
 - **OIDC group→RBAC role assignments must be re-pointed at the namespaced group name.** #1832
   changed how IdP-asserted groups are stored — an asserted Entra group `8f3c...` is now the RBAC
   group `entra:8f3c...`, not the raw id. Any role you previously delegated directly to the raw-gid

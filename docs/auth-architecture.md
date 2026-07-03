@@ -404,6 +404,143 @@ Implementation: `RbacStore::reconcile_idp_memberships` /
 sync is out of scope here (dropped in #1827; will ride this same reconcile
 path once #1826 merges).
 
+## Stable principal vs. display name (#1837)
+
+`Session` carries two separate identity fields with different jobs:
+
+- **`username`** — the STABLE authorization principal. `check_permission`,
+  `reconcile_idp_memberships`, elevation eligibility, and every audit
+  `principal` field key on this value. It must be immutable for the
+  lifetime of the identity it represents.
+- **`display_name`** — a human-readable label for UI/audit-DETAIL
+  rendering ONLY. Never consulted for authorization; safe to change on
+  every login.
+
+**Why this split exists.** Before #1837, `create_oidc_session` keyed
+`username` on `claims.name` (falling back to `claims.email`) — an
+IdP-editable, non-unique display label. Two different SSO users who
+happened to share a display name (a common collision in orgs with
+duplicate names, or after a legal name change re-used an old name)
+collided onto ONE authorization principal. Once #1832 shipped
+`reconcile_idp_memberships` — which deletes a principal's un-reasserted
+IdP-sourced group memberships on every login — that collision became
+destructive: user B's login could silently delete user A's group
+memberships (and, in the group-membership window between the two
+logins, inherit A's roles).
+
+**The fix.** OIDC sessions now key `username` on:
+
+```
+"oidc:" + iss + "#" + sub
+```
+
+`sub` (the OIDC subject claim) is only guaranteed unique **per issuer**
+(RFC 7519) — a bare `sub` from two different IdPs (or two tenants of the
+same IdP product) could theoretically collide, so `iss` (the token
+issuer) scopes it. This is an OPAQUE id — never render it as a human
+name. `display_name` is set to `claims.name` (falling back to
+`claims.email`), exactly as `username` used to be computed, and is
+free to change on every login without touching the stable principal or
+the RBAC memberships/roles bound to it.
+
+**Resolution map.** `AuthManager::resolve_sso_identity(principal_id)`
+returns the `SsoIdentity{display_name, email}` last seen for a stable
+principal, upserted on every `create_oidc_session` call
+(`AuthManager::sso_identities_`, guarded by the same `mu_` as
+`sessions_`). This lets a render site show a human name for a principal
+that has no live session right now (e.g. an admin-facing list keyed on
+`username` strings) without weakening what `check_permission` keys on.
+In-memory only — a display name is cosmetic, so it is lost on restart
+until the principal's next login re-upserts it.
+
+**Render sites.** `GET /api/me` (the legacy dashboard nav-bar
+"who am I", consumed by every page's `nav-user`/`context-user` JS) and
+`GET /api/v1/me` both now return `display_name` alongside the stable
+`username`; the dashboard JS shows `display_name`, falling back to
+`username` for a legacy/local session predating this field.
+
+**SAML is unaffected this slice.** `create_saml_session` still keys
+`username` on the raw NameID (`display_name` is set to the same value,
+purely for render-site parity) — SAML does not sync to `rbac_store` yet
+(dropped in #1827), so the collision this fix closes is dormant there.
+Keying SAML on `entity_id#NameID` is a tracked fast-follow, to land
+alongside SAML group sync.
+
+**Migration.** `RbacStore` schema v3 deletes every `group_members` row
+belonging to an IdP-sourced group (`groups.source != 'local'`) on
+upgrade — those rows were keyed on the OLD display-name principal and
+would otherwise be BOTH orphaned (never re-referenced by the new
+stable-keyed principal) AND a resurrected confused-deputy hazard: a
+LOCAL user who later takes the old display name as their username would
+silently inherit whatever roles the stale row's group grants. The purge
+is additive/safe — only `group_members` rows for non-local groups are
+removed; `groups`/`roles`/`role_permissions`/local memberships are
+untouched, and IdP membership re-populates under the new stable key on
+each affected user's next SSO login via `reconcile_idp_memberships`.
+
+**Known gap — OIDC JIT admin elevation is temporarily unavailable for SSO
+operators, pending durable SSO identity provisioning (issue #1852).**
+`AuthDB::set_elevation_eligible`/`is_elevation_eligible` key on
+`users.username` and are gated through `is_valid_username`, which allows
+only alphanumerics plus `. _ -` and explicitly rejects `:` (comment:
+"prevent config file format injection"). The stable OIDC principal shape
+(`oidc:<iss>#<sub>`) contains both `:` and `#`, so it fails that check
+unconditionally — `POST /api/v1/users/{name}/elevation-eligibility` 400s
+before reaching the store, and `is_elevation_eligible(session->username)`
+for a live OIDC session returns `InvalidUsername`, which the caller treats
+as fail-closed/denied. But widening `is_valid_username`'s charset would not
+be sufficient to fix this: an OIDC login provisions **no `users` row at
+all** — `elevation_eligible`/`mfa_totp_secret` are columns on `users`, and
+there is no row for an SSO principal to set them on. **An admin cannot
+restore this today by "re-providing eligibility against the stable id" —
+that operation does not exist until #1852 (a durable, first-class identity
+record for SSO principals) lands.**
+
+**This is not a regression of a previously-supported flow.** Before #1837,
+`Session::username` for an OIDC session was the mutable display name
+(`claims.name`, falling back to `claims.email`), and `is_elevation_eligible`
+looked that string up directly in `users.username`. Elevation for an SSO
+operator therefore only ever "worked" by accident, and only when **both**
+of two coincidences held: the IdP-asserted display name had to consist
+solely of `is_valid_username`'s narrow charset (no space, no `@` — so most
+real display names/emails already failed this silently), **and** it had to
+exactly match an existing *local* `users.username`. When both held, the SSO
+login's principal silently **borrowed that local principal's
+`elevation_eligible` flag and `mfa_totp_secret` enrollment** — a latent
+cross-principal grant with zero cryptographic binding between the SSO
+identity and the local account it happened to name-collide with: anyone
+the IdP would authenticate under that same display name inherited that
+local account's admin-elevation path. #1837 severs this borrowing as a
+direct, correct consequence of closing the display-name collision it rode
+on (see above) — it is closing an unsafe accident, not breaking a supported
+capability. #1852 is the deliberate, durable restoration.
+
+**Session-revocation-by-username is a narrower, structurally different
+gap.** The operationally-critical kill step
+(`AuthManager::invalidate_user_sessions`'s in-memory sweep, keyed by plain
+string equality over `sessions_`) carries no `is_valid_username` gate and
+revokes any principal string, `oidc:<iss>#<sub>` included — there is no
+missing-row problem here, unlike elevation. `DELETE
+/api/v1/sessions?username=`'s own query-parameter check does still run
+`is_valid_username` at the REST layer, so an admin typing the literal
+`oidc:<iss>#<sub>` string still gets a 400 today from that endpoint — but
+that charset-only validator predates #1837 and would already have rejected
+most OIDC display-name-keyed usernames (spaces, `@`) before this change
+too, so this is a narrow, pre-existing, easily-widened validator gap, not a
+new #1837 regression and not gated on #1852. Separately, the
+`auth.db`-persisted half of revocation
+(`AuthDB::invalidate_all_sessions`'s `DELETE FROM sessions`, surfaced as
+`db_persisted=false` for an SSO target) was **already** a no-op for OIDC
+before #1837 too: `AuthDB::create_session` is never called for an OIDC
+login — SSO sessions have always been in-memory-only and were never
+written to `auth.db`'s `sessions` table in the first place.
+
+Implementation: `Session::username`/`display_name`
+(`auth.hpp`), `AuthManager::create_oidc_session`/`resolve_sso_identity`/
+`sso_identities_` (`auth.cpp`), the stable-id construction in
+`auth_routes.cpp` `/auth/callback`, `RbacStore` migration v3
+(`rbac_store.cpp`). Tests: `tests/unit/server/test_oidc_principal_key.cpp`.
+
 ## SAML 2.0 SP
 
 `/auth-and-authz` skill gap matrix P1 #6. Thin first slice: SP-initiated login
