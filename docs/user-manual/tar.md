@@ -6,8 +6,7 @@ The TAR plugin continuously captures system state snapshots and records changes 
 
 ## What TAR captures
 
-TAR monitors these categories of system activity. Processes, network connections, services, user sessions, and device performance are **always-on**; **software**, **ARP**, and **DNS** are opt-in (off by default), Windows-only today (software is machine scope only — ADR-0015 covers ARP/DNS). Further opt-in and planned sources — per-app performance, module loads, per-connection network quality (`netqual`), and connectivity-transition history (`netconn` — network/Wi-Fi connect/disconnect + internet-capability changes, including a retrospective backfill of OS-retained history from before TAR was enabled; ADR-0020) — are covered under Configuration and the OS compatibility matrix below.
-TAR monitors these categories of system activity. Processes, network connections, services, user sessions, and device performance are **always-on**; **software**, **ARP**, **DNS**, and **mapped drives** are opt-in (off by default) — software/ARP/DNS are Windows-only today (software is machine scope only — ADR-0015 covers ARP/DNS), while **mapdrive** (network-share mappings in both directions, §3.8) also runs on Linux. Further opt-in and planned sources — per-app performance, module loads, per-connection network quality — are covered under Configuration and the OS compatibility matrix below.
+TAR monitors these categories of system activity. Processes, network connections, services, user sessions, and device performance are **always-on**; **software**, **ARP**, **DNS**, and **mapped drives** are opt-in (off by default) — software/ARP/DNS are Windows-only today (software is machine scope only — ADR-0015 covers ARP/DNS), while **mapdrive** (network-share mappings in both directions, §3.8) also runs on Linux. Further opt-in and planned sources — per-app performance, module loads, per-connection network quality (`netqual`), and connectivity-transition history (`netconn` — network/Wi-Fi connect/disconnect + internet-capability changes, including a retrospective backfill of OS-retained history from before TAR was enabled; ADR-0020) — are covered under Configuration and the OS compatibility matrix below.
 
 | Category | Collection interval | Events detected |
 |----------|-------------------|-----------------|
@@ -261,18 +260,15 @@ config|software_last_run_ts|1711050000
 
 A block is emitted for every capture source. The opt-in sources report
 `<source>_enabled|false` on a fresh agent — `module`, `software` (both shown
-above), `procperf`, `netqual`, `netconn`, `arp`, and `dns` are off by default and
-must be enabled explicitly via `configure` (see the configuration table above).
-`netqual_capture_method` reports the per-connection quality mechanism actually
-in effect — `inetdiag` (Linux), `estats` (Windows once the elevation gate has
-latched active), `estats_pending` (Windows, netqual enabled but the first
-collect tick has not yet tested elevation — or netqual is off), or `none`
-(Windows non-elevated after the access-denied latch, macOS) — so "opted in but
-the agent can't collect" is distinguishable from "off", and a non-elevated agent
-never briefly advertises `estats` before flipping to `none`. The
-above), `procperf`, `netqual`, `arp`, `dns`, and `mapdrive` are off by default
-and must be enabled explicitly via `configure` (see the configuration table
-above). The
+above), `procperf`, `netqual`, `netconn`, `arp`, `dns`, and `mapdrive` are off by
+default and must be enabled explicitly via `configure` (see the configuration
+table above). `netqual_capture_method` reports the per-connection quality
+mechanism actually in effect — `inetdiag` (Linux), `estats` (Windows once the
+elevation gate has latched active), `estats_pending` (Windows, netqual enabled
+but the first collect tick has not yet tested elevation — or netqual is off), or
+`none` (Windows non-elevated after the access-denied latch, macOS) — so "opted in
+but the agent can't collect" is distinguishable from "off", and a non-elevated
+agent never briefly advertises `estats` before flipping to `none`. The
 default-ON sources — `process`, `tcp`, `service`, `user`, and `perf` — report
 `<source>_enabled|true`. `module_live_rows` stays `0` until a collector for the
 host's OS ships; likewise `arp`/`dns` are **Windows-only today** (planned on
@@ -579,6 +575,9 @@ ORDER BY ts DESC
 SELECT ts, action, channel, capability, reason_code
 FROM $NetConn_Live
 WHERE action IN ('disconnected','wifi_disconnected','wifi_connect_failed','capability_changed')
+ORDER BY ts DESC
+```
+
 **MapDrive tables** *(opt-in — capability-map §3.8):* `$MapDrive_Live` carries `ts`, `snapshot_id`, `action` (`appeared`/`removed` for live snapshot-diff, `historical` for the init backfill), `direction` (`outbound`/`inbound`), `local_mount`, `remote_path`, `remote_host`, `username`, `provider`, and `origin` (`live`/`historical`). The `origin` column separates historically-inferred mappings (seeded once from the registry / fstab / event logs, carrying the artifact's timestamp or `0`) from live-observed ones; a currently-mapped persistent drive legitimately appears as **both** a `historical` and a live `appeared` row. `$MapDrive_Hourly` carries `hour_ts`, `direction`, `local_mount`, `remote_path`, `remote_host`, `appear_count`, `remove_count`. Example — every previously and currently mapped drive, both directions:
 
 ```sql

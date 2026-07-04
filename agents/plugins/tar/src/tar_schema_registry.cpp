@@ -826,6 +826,28 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "from the journal."},
                 {"macos",   OsSupportStatus::kPlanned,   "oslog",
                  "configd/Wi-Fi subsystem transitions via OSLog."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    .retention_default = 20000,
+                    .columns = {
+                        {"ts",          "INTEGER"},
+                        {"snapshot_id", "INTEGER"},
+                        {"action",      "TEXT"}, // connected/disconnected/wifi_connected/
+                                                 // wifi_connect_failed/wifi_disconnected/
+                                                 // capability_changed
+                        {"channel",     "TEXT"}, // networkprofile/ncsi/wlan
+                        {"category",    "TEXT"}, // public/private/domain ("" when n/a)
+                        {"capability",  "TEXT"}, // none/local/internet ("" when n/a)
+                        {"iface_kind",  "TEXT"}, // wifi ("" when unknown)
+                        {"reason_code", "INTEGER"}, // WLAN reason / NCSI change reason
+                    },
+                },
+            },
+        },
+
         // ── Mapped drives (capability-map §3.8) ───────────────────────────
         // Network-share mappings in BOTH directions, distinguished by the
         // `direction` column: `outbound` = drives THIS host maps to remote
@@ -869,18 +891,6 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {
                     .suffix = "live",
                     .retention_type = RetentionType::kRowCount,
-                    .retention_default = 20000,
-                    .columns = {
-                        {"ts",          "INTEGER"},
-                        {"snapshot_id", "INTEGER"},
-                        {"action",      "TEXT"}, // connected/disconnected/wifi_connected/
-                                                 // wifi_connect_failed/wifi_disconnected/
-                                                 // capability_changed
-                        {"channel",     "TEXT"}, // networkprofile/ncsi/wlan
-                        {"category",    "TEXT"}, // public/private/domain ("" when n/a)
-                        {"capability",  "TEXT"}, // none/local/internet ("" when n/a)
-                        {"iface_kind",  "TEXT"}, // wifi ("" when unknown)
-                        {"reason_code", "INTEGER"}, // WLAN reason / NCSI change reason
                     .retention_default = 5000,
                     .columns = {
                         {"ts",          "INTEGER"},

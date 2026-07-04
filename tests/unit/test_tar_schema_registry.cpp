@@ -237,9 +237,8 @@ TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
     // disabled on a fresh agent; software is opt-in too (off by default — the
     // cautious posture for a new capture source, #1620); everything else is
     // always-on.
-    for (const auto* name :
-         {"module", "procperf", "netqual", "arp", "dns", "software", "netconn"}) {
-    for (const auto* name : {"module", "procperf", "netqual", "arp", "dns", "software", "mapdrive"}) {
+    for (const auto* name : {"module", "procperf", "netqual", "arp", "dns", "software", "netconn",
+                             "mapdrive"}) {
         INFO("opt-in source=" << name);
         CHECK_FALSE(source_default_enabled(name));
     }

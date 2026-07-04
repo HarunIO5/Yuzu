@@ -582,6 +582,7 @@ public:
         // module/software above — the source is default-off in the registry).
         if (db_->get_config("netconn_enabled", "").empty()) {
             db_->set_config("netconn_enabled", "false");
+        }
         // §3.8: seed the opt-in mapdrive_enabled key (default-off, like module /
         // software) so source_enabled / retention / configure all agree the source
         // starts disabled.
@@ -657,6 +658,10 @@ public:
                 } else {
                     spdlog::warn(
                         "TAR: netconn history backfill insert failed (slow tick retries)");
+                }
+            }
+        }
+
         // §3.8: one-time historical mapped-drive backfill. Seeds PAST mappings from
         // persistent OS artifacts (Windows registry Network/MRU/MountPoints2 +
         // Security event log; Linux fstab + Samba logs) as origin='historical' rows
@@ -1489,6 +1494,8 @@ private:
                     spdlog::error("TAR: netconn insert failed this tick (skipped)");
                 }
             }
+        }
+
         // §3.8 — mapped-drive diff (both directions). Opt-in (default_enabled=false),
         // so source_enabled returns false until an operator turns it on. NON-FATAL on
         // insert failure — the always-on service/user legs above may have already
@@ -1725,6 +1732,7 @@ private:
         // agent can't collect" apart from "netqual is off".
         ctx.write_output(std::format("config|netqual_capture_method|{}",
                                      yuzu::tar::netqual_effective_capture_method()));
+
         // §3.8 mapdrive — the capture mechanism is fixed per-OS (no runtime/health-
         // dependent path like process/module), so this reports the platform method
         // for parity with the other *_capture_method keys; the full per-OS matrix is
