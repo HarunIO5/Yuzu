@@ -205,9 +205,10 @@ NvdFetchResult NvdClient::fetch_paginated(const std::string& date_params) {
     return combined;
 }
 
-NvdFetchResult NvdClient::fetch_modified_since(const std::string& iso_timestamp) {
-    return fetch_paginated("lastModStartDate=" + url_encode(iso_timestamp) +
-                           "&lastModEndDate=" + url_encode(current_iso_timestamp()));
+NvdFetchResult NvdClient::fetch_modified_between(const std::string& mod_start,
+                                                const std::string& mod_end) {
+    return fetch_paginated("lastModStartDate=" + url_encode(mod_start) + "&lastModEndDate=" +
+                           url_encode(mod_end));
 }
 
 NvdFetchResult NvdClient::fetch_by_published_window(const std::string& pub_start,
@@ -236,38 +237,6 @@ nvd_split_windows(std::chrono::system_clock::time_point start,
         ws = we;
     }
     return out;
-}
-
-NvdFetchResult NvdClient::fetch_by_keyword(const std::string& keyword, int start_index) {
-    rate_limit();
-
-    httplib::Client client(std::string("https://") + kNvdHost);
-    configure_client(client);
-
-    std::string query = std::string(kNvdPath) + "?" + "keywordSearch=" + url_encode(keyword) +
-                        "&resultsPerPage=" + std::to_string(kResultsPerPage) +
-                        "&startIndex=" + std::to_string(start_index);
-
-    httplib::Headers headers;
-    headers.emplace("Accept", "application/json");
-    if (!api_key_.empty()) {
-        headers.emplace("apiKey", api_key_);
-    }
-
-    spdlog::info("NVD keyword search: '{}' startIndex={}", keyword, start_index);
-    auto res = client.Get(query, headers);
-
-    if (!res) {
-        spdlog::error("NVD API keyword request failed: connection error");
-        return {};
-    }
-
-    if (res->status != 200) {
-        spdlog::error("NVD API returned HTTP {}: {}", res->status, res->body.substr(0, 200));
-        return {};
-    }
-
-    return parse_response(res->body);
 }
 
 NvdFetchResult NvdClient::parse_response(const std::string& json_body) {

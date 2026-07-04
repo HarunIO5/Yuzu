@@ -24,21 +24,28 @@ struct NvdFetchResult {
     bool ok = true;
 };
 
-class NvdClient {
+// Fetch seam so NvdSyncManager's backfill/freshness logic is unit-testable
+// against a mock, without network. NvdClient is the production implementation.
+class INvdFetcher {
+public:
+    virtual ~INvdFetcher() = default;
+    // CVEs PUBLISHED in [pub_start, pub_end] (newest-first backfill).
+    virtual NvdFetchResult fetch_by_published_window(const std::string& pub_start,
+                                                     const std::string& pub_end) = 0;
+    // CVEs last-MODIFIED in [mod_start, mod_end] (freshness re-check).
+    virtual NvdFetchResult fetch_modified_between(const std::string& mod_start,
+                                                  const std::string& mod_end) = 0;
+};
+
+class NvdClient : public INvdFetcher {
 public:
     explicit NvdClient(std::string api_key = {}, std::string proxy_url = {});
 
-    // Fetch CVEs modified in [iso_timestamp, now] (freshness re-check). The
-    // caller must keep the range within NVD's 120-day cap (see nvd_split_windows).
-    NvdFetchResult fetch_modified_since(const std::string& iso_timestamp);
-
-    // Fetch CVEs PUBLISHED in [pub_start, pub_end] (newest-first backfill). Both
-    // are ISO 8601; the window must be within NVD's 120-day cap.
+    // Both ISO 8601; the window must be within NVD's 120-day cap (nvd_split_windows).
     NvdFetchResult fetch_by_published_window(const std::string& pub_start,
-                                             const std::string& pub_end);
-
-    // Fetch CVEs matching a keyword search (for initial targeted sync).
-    NvdFetchResult fetch_by_keyword(const std::string& keyword, int start_index = 0);
+                                             const std::string& pub_end) override;
+    NvdFetchResult fetch_modified_between(const std::string& mod_start,
+                                          const std::string& mod_end) override;
 
     /// Parse a raw NVD API JSON response into CveRecords.
     NvdFetchResult parse_response(const std::string& json_body);

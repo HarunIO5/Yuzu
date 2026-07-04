@@ -2,31 +2,54 @@
 
 #include <spdlog/spdlog.h>
 
-#include <array>
 #include <chrono>
 #include <format>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <utility>
 
 namespace yuzu::server {
 
 namespace {
 
-std::string current_iso_timestamp() {
-    const auto now = std::chrono::system_clock::now();
-    return std::format("{:%FT%TZ}", std::chrono::floor<std::chrono::seconds>(now));
+// NVD 2.0 accepts ISO-8601 date/times with millisecond precision and implicit
+// UTC (no suffix), e.g. "2024-01-01T00:00:00.000".
+std::string iso_of(std::chrono::system_clock::time_point tp) {
+    return std::format("{:%Y-%m-%dT%H:%M:%S}.000", std::chrono::floor<std::chrono::seconds>(tp));
 }
 
-constexpr std::array kInitialSyncKeywords = {
-    "openssl", "curl",    "sudo",   "openssh", "apache", "nginx",   "postgresql",
-    "python",  "node.js", "chrome", "firefox", "dotnet", "openjdk", "log4j",
-    "git",     "php",     "putty",  "7-zip",   "winrar", "windows",
-};
+long long epoch_secs(std::chrono::system_clock::time_point tp) {
+    return std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch()).count();
+}
+
+// Cursors are stored in sync_meta as epoch-seconds strings (no ISO parsing —
+// avoids std::chrono::parse portability differences). Malformed/empty → nullopt.
+std::optional<std::chrono::system_clock::time_point> parse_cursor(const std::string& s) {
+    if (s.empty())
+        return std::nullopt;
+    try {
+        return std::chrono::system_clock::time_point{std::chrono::seconds{std::stoll(s)}};
+    } catch (...) {
+        return std::nullopt;
+    }
+}
 
 } // namespace
 
 NvdSyncManager::NvdSyncManager(std::shared_ptr<NvdDatabase> db, std::string api_key,
-                               std::string proxy_url, std::chrono::seconds sync_interval)
-    : db_{std::move(db)}, client_{std::move(api_key), std::move(proxy_url)},
-      interval_{sync_interval} {}
+                               std::string proxy_url, std::chrono::seconds sync_interval,
+                               int backfill_years)
+    : db_{std::move(db)}, fetcher_{std::make_unique<NvdClient>(std::move(api_key),
+                                                               std::move(proxy_url))},
+      interval_{sync_interval}, backfill_years_{backfill_years} {}
+
+NvdSyncManager::NvdSyncManager(std::shared_ptr<NvdDatabase> db,
+                               std::unique_ptr<INvdFetcher> fetcher,
+                               std::chrono::seconds sync_interval, int backfill_years)
+    : db_{std::move(db)}, fetcher_{std::move(fetcher)}, interval_{sync_interval},
+      backfill_years_{backfill_years} {}
 
 NvdSyncManager::~NvdSyncManager() {
     stop();
@@ -36,34 +59,32 @@ void NvdSyncManager::start() {
     if (sync_thread_.joinable()) {
         return; // already running
     }
+    stopping_.store(false);
 #ifdef __cpp_lib_jthread
     sync_thread_ = std::jthread([this](std::stop_token stop) { sync_loop(stop); });
 #else
     stop_requested_ = false;
     sync_thread_ = std::thread([this] { sync_loop(); });
 #endif
-    spdlog::info("NVD sync manager started (interval={}s)", interval_.count());
+    spdlog::info("NVD sync manager started (interval={}s, backfill={}y)", interval_.count(),
+                 backfill_years_);
 }
 
 void NvdSyncManager::stop() {
     if (!sync_thread_.joinable()) {
         return;
     }
+    stopping_.store(true); // abort a long backfill/freshness pass between windows
 #ifdef __cpp_lib_jthread
     sync_thread_.request_stop();
-    {
-        std::lock_guard<std::mutex> lock{mu_};
-        cv_.notify_all();
-    }
-    sync_thread_.join();
 #else
     stop_requested_ = true;
+#endif
     {
         std::lock_guard<std::mutex> lock{mu_};
         cv_.notify_all();
     }
     sync_thread_.join();
-#endif
     spdlog::info("NVD sync manager stopped");
 }
 
@@ -76,12 +97,16 @@ NvdSyncManager::SyncStatus NvdSyncManager::status() const {
     return status_;
 }
 
+bool NvdSyncManager::backfill_complete() const {
+    return db_->get_meta("backfill_complete") == "1";
+}
+
 #ifdef __cpp_lib_jthread
 void NvdSyncManager::sync_loop(std::stop_token stop) {
 #else
 void NvdSyncManager::sync_loop() {
 #endif
-    // Seed built-in rules on first run
+    // Seed built-in rules on first run (offline fallback).
     try {
         db_->seed_builtin_rules();
         spdlog::info("NVD built-in rules seeded");
@@ -89,20 +114,25 @@ void NvdSyncManager::sync_loop() {
         spdlog::error("Failed to seed built-in rules: {}", e.what());
     }
 
-    // Immediate first sync
+    // Immediate first sync (runs the backfill until the floor, or freshness).
     do_sync();
 
-    // Periodic sync loop
-#ifdef __cpp_lib_jthread
-    while (!stop.stop_requested()) {
+    while (true) {
+        // While the catalog is still backfilling, retry soon (a failed window
+        // shouldn't wait the full freshness interval); once complete, settle to
+        // the periodic freshness cadence.
+        std::chrono::seconds wait = interval_;
+        if (!backfill_complete() && interval_ > std::chrono::seconds{60}) {
+            wait = std::chrono::seconds{60};
+        }
+
         std::unique_lock<std::mutex> lock{mu_};
-        cv_.wait_for(lock, interval_, [&stop] { return stop.stop_requested(); });
+#ifdef __cpp_lib_jthread
+        cv_.wait_for(lock, wait, [&stop] { return stop.stop_requested(); });
         if (stop.stop_requested())
             break;
 #else
-    while (!stop_requested_.load()) {
-        std::unique_lock<std::mutex> lock{mu_};
-        cv_.wait_for(lock, interval_, [this] { return stop_requested_.load(); });
+        cv_.wait_for(lock, wait, [this] { return stop_requested_.load(); });
         if (stop_requested_.load())
             break;
 #endif
@@ -113,7 +143,8 @@ void NvdSyncManager::sync_loop() {
 
 void NvdSyncManager::do_sync() {
     // Reject a concurrent sync (periodic loop vs. detached "Sync now"): running
-    // two on the same client_ races last_request_time_ and doubles NVD load.
+    // two on the same fetcher races the client's rate-limit state and doubles
+    // NVD load (#1867 governance).
     bool expected = false;
     if (!sync_active_.compare_exchange_strong(expected, true)) {
         spdlog::info("NVD sync already in progress — skipping this trigger");
@@ -131,18 +162,13 @@ void NvdSyncManager::do_sync() {
     }
 
     try {
-        auto last_sync = db_->get_meta("last_sync_time");
-        if (last_sync.empty()) {
-            spdlog::info("No previous sync found — starting initial sync");
-            do_initial_sync();
+        if (backfill_complete()) {
+            do_freshness();
         } else {
-            spdlog::info("Last sync: {} — starting incremental sync", last_sync);
-            do_incremental_sync();
+            do_backfill();
         }
-
         std::lock_guard<std::mutex> lock{mu_};
         status_.total_cves = db_->total_cve_count();
-        status_.last_sync_time = db_->get_meta("last_sync_time");
         status_.syncing = false;
     } catch (const std::exception& e) {
         spdlog::error("NVD sync failed: {}", e.what());
@@ -152,60 +178,78 @@ void NvdSyncManager::do_sync() {
     }
 }
 
-void NvdSyncManager::do_initial_sync() {
-    std::size_t total_upserted = 0;
+void NvdSyncManager::do_backfill() {
+    const auto now = std::chrono::system_clock::now();
+    // backfill_years <= 0 means "full history"; 100y back covers NVD's start.
+    const int years = backfill_years_ <= 0 ? 100 : backfill_years_;
+    const auto floor = now - std::chrono::years(years);
+    const auto max_window = std::chrono::days(120); // NVD caps a pub/lastMod range at 120 days
 
-    for (const auto* keyword : kInitialSyncKeywords) {
-        spdlog::info("Initial sync: fetching CVEs for '{}'", keyword);
+    // Resume from the oldest published date reached so far (newest-first walk).
+    auto cursor = parse_cursor(db_->get_meta("backfill_oldest_published")).value_or(now);
+    std::size_t total = 0;
 
-        int start_index = 0;
-        int fetched_this_keyword = 0;
+    while (cursor > floor && !stopping_.load()) {
+        const auto window_start = (cursor - floor > max_window) ? cursor - max_window : floor;
+        spdlog::info("NVD backfill: published {} .. {}", iso_of(window_start), iso_of(cursor));
 
-        while (true) {
-            auto result = client_.fetch_by_keyword(keyword, start_index);
-
-            if (result.records.empty()) {
-                break;
-            }
-
-            db_->upsert_cves(result.records);
-            fetched_this_keyword += static_cast<int>(result.records.size());
-            total_upserted += result.records.size();
-
-            // If we got fewer than total_results, advance pagination
-            start_index += static_cast<int>(result.records.size());
-            if (start_index >= result.total_results) {
-                break;
-            }
+        auto result = fetcher_->fetch_by_published_window(iso_of(window_start), iso_of(cursor));
+        if (!result.ok) {
+            // Transient error — leave the cursor so the next tick retries this
+            // window rather than skipping unfetched CVEs (#1875).
+            spdlog::warn("NVD backfill window failed — will retry next tick (cursor unchanged)");
+            return;
         }
-
-        spdlog::info("Initial sync: '{}' — {} CVEs fetched", keyword, fetched_this_keyword);
+        if (!result.records.empty()) {
+            db_->upsert_cves(result.records);
+            total += result.records.size();
+        }
+        cursor = window_start;
+        db_->set_meta("backfill_oldest_published", std::to_string(epoch_secs(cursor)));
+        {
+            std::lock_guard<std::mutex> lock{mu_};
+            status_.total_cves = db_->total_cve_count();
+        }
     }
 
-    db_->set_meta("last_sync_time", current_iso_timestamp());
-    spdlog::info("Initial sync complete: {} total CVEs upserted", total_upserted);
+    if (cursor <= floor) {
+        db_->set_meta("backfill_complete", "1");
+        spdlog::info("NVD backfill complete — floor reached ({} CVEs upserted this pass)", total);
+    }
 }
 
-void NvdSyncManager::do_incremental_sync() {
-    auto last_sync = db_->get_meta("last_sync_time");
-    std::size_t total_upserted = 0;
-    std::string latest_modified;
+void NvdSyncManager::do_freshness() {
+    const auto now = std::chrono::system_clock::now();
+    const auto max_window = std::chrono::days(120);
 
-    auto result = client_.fetch_modified_since(last_sync);
+    // Re-check everything modified since the last freshness pass, split into
+    // <=120-day windows (fixes the >120-day incremental-range error).
+    const auto start =
+        parse_cursor(db_->get_meta("last_freshness_check")).value_or(now - std::chrono::days(2));
+    std::size_t total = 0;
 
-    if (!result.records.empty()) {
-        db_->upsert_cves(result.records);
-        total_upserted += result.records.size();
-        latest_modified = result.last_modified_timestamp;
+    for (const auto& [ws, we] : nvd_split_windows(start, now, max_window)) {
+        if (stopping_.load())
+            return;
+        auto result = fetcher_->fetch_modified_between(iso_of(ws), iso_of(we));
+        if (!result.ok) {
+            spdlog::warn("NVD freshness window failed — will retry (cursor unchanged)");
+            return;
+        }
+        if (!result.records.empty()) {
+            db_->upsert_cves(result.records);
+            total += result.records.size();
+        }
+        // Advance only after a successful window.
+        db_->set_meta("last_freshness_check", std::to_string(epoch_secs(we)));
     }
 
-    // Update sync timestamp to the latest lastModified from results,
-    // or current time if there were no results
-    auto new_sync_time = latest_modified.empty() ? current_iso_timestamp() : latest_modified;
-    db_->set_meta("last_sync_time", new_sync_time);
-
-    spdlog::info("Incremental sync complete: {} CVEs updated, new sync time: {}", total_upserted,
-                 new_sync_time);
+    {
+        std::lock_guard<std::mutex> lock{mu_};
+        status_.total_cves = db_->total_cve_count();
+        status_.last_sync_time = iso_of(now);
+    }
+    spdlog::info("NVD freshness re-check complete — {} CVEs updated", total);
 }
 
 } // namespace yuzu::server

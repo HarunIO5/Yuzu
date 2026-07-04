@@ -10,6 +10,7 @@
 #include "nvd_client.hpp"
 #include "nvd_db.hpp"
 #include "nvd_version.hpp"
+#include "nvd_sync.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -661,4 +662,103 @@ TEST_CASE("nvd_split_windows: partitions [start,end] into <=max windows, oldest-
     REQUIRE(nvd_split_windows(base + hours(1), base, max).empty()); // inverted
     REQUIRE(nvd_split_windows(base, base, max).empty());            // zero span
     REQUIRE(nvd_split_windows(base, base + max, hours(0)).empty()); // zero window
+}
+
+// ── PR2b: backfill / freshness state machine (mock fetcher) ──────────────────
+
+namespace {
+struct MockFetcher : INvdFetcher {
+    std::vector<std::pair<std::string, std::string>> published_calls;
+    std::vector<std::pair<std::string, std::string>> modified_calls;
+    bool fail = false;
+
+    static CveRecord one_cve(std::size_t n) {
+        CveRecord rec;
+        rec.cve_id = "CVE-MOCK-" + std::to_string(n);
+        rec.severity = "HIGH";
+        rec.description = "mock";
+        rec.source = "nvd";
+        CpeMatch cm;
+        cm.cpe_product = "product" + std::to_string(n);
+        cm.version_end_excluding = "9.9";
+        rec.matches.push_back(cm);
+        return rec;
+    }
+    NvdFetchResult fetch_by_published_window(const std::string& s, const std::string& e) override {
+        published_calls.emplace_back(s, e);
+        NvdFetchResult r;
+        r.ok = !fail;
+        if (r.ok)
+            r.records.push_back(one_cve(published_calls.size()));
+        return r;
+    }
+    NvdFetchResult fetch_modified_between(const std::string& s, const std::string& e) override {
+        modified_calls.emplace_back(s, e);
+        NvdFetchResult r;
+        r.ok = !fail;
+        return r;
+    }
+};
+
+long long secs_ago(int days) {
+    const auto tp = std::chrono::system_clock::now() - std::chrono::days(days);
+    return std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch()).count();
+}
+} // namespace
+
+TEST_CASE("NvdSyncManager: backfill walks newest-first, contiguous, to the floor", "[nvd][backfill]") {
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/1);
+
+    mgr.sync_now(); // runs the whole backfill synchronously
+
+    // ~1 year / 120 days → 3 full windows + a remainder = 4.
+    REQUIRE(m->published_calls.size() >= 3);
+    REQUIRE(m->published_calls.size() <= 4);
+    // Newest-first: the first window ends later (lexicographically greater ISO) than the last.
+    REQUIRE(m->published_calls.front().second > m->published_calls.back().second);
+    // Contiguous: window[i].start == window[i+1].end (walking backward).
+    for (std::size_t i = 0; i + 1 < m->published_calls.size(); ++i)
+        REQUIRE(m->published_calls[i].first == m->published_calls[i + 1].second);
+    // Completed + upserted; no freshness yet.
+    REQUIRE(db->get_meta("backfill_complete") == "1");
+    REQUIRE(db->total_cve_count() == m->published_calls.size());
+    REQUIRE(m->modified_calls.empty());
+
+    // Once complete, the next sync does freshness, not backfill.
+    const auto before = m->published_calls.size();
+    mgr.sync_now();
+    REQUIRE(m->published_calls.size() == before); // no more backfill windows
+    REQUIRE(m->modified_calls.size() >= 1);
+}
+
+TEST_CASE("NvdSyncManager: a failed backfill window leaves the cursor and doesn't complete",
+          "[nvd][backfill]") {
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->fail = true;
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1);
+
+    mgr.sync_now();
+
+    REQUIRE(m->published_calls.size() == 1);          // stopped after the first failure
+    REQUIRE(db->get_meta("backfill_complete") != "1"); // not complete
+    REQUIRE(db->get_meta("backfill_oldest_published").empty()); // cursor never advanced (#1875)
+}
+
+TEST_CASE("NvdSyncManager: freshness splits a >120-day gap into windows", "[nvd][backfill]") {
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_complete", "1");
+    db->set_meta("last_freshness_check", std::to_string(secs_ago(300)));
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 8);
+
+    mgr.sync_now();
+
+    REQUIRE(m->published_calls.empty());       // backfill already complete
+    REQUIRE(m->modified_calls.size() == 3);    // 300 days / 120 → 3 windows
 }
