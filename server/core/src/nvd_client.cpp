@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -176,9 +177,15 @@ NvdFetchResult NvdClient::fetch_paginated(const std::string& date_params) {
         }
 
         auto page = parse_response(res->body);
+        if (!page.ok) {
+            // 200 with a bad/unexpected body mid-pagination — do NOT hand back a
+            // truncated window as success (UP-1/UP-2). Fail the whole fetch so the
+            // caller keeps its cursor and retries.
+            combined.ok = false;
+            return combined;
+        }
         if (page.records.empty() && page.total_results == 0) {
-            // Genuinely no results for this window (or a parse error, which
-            // parse_response already logged). Either way, nothing more to page.
+            // Genuinely-empty window (NVD returned totalResults:0). Nothing to page.
             return combined;
         }
 
@@ -246,13 +253,21 @@ NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
     try {
         doc = nlohmann::json::parse(json_body);
     } catch (const nlohmann::json::parse_error& e) {
+        // A 200 with an unparseable body (proxy/error page, truncated response)
+        // is a FAILURE, not an empty result — flag it so the caller doesn't treat
+        // it as "window done" and advance its cursor past unfetched CVEs (UP-1/UP-2).
         spdlog::error("NVD JSON parse error: {}", e.what());
+        result.ok = false;
         return result;
     }
 
     result.total_results = doc.value("totalResults", 0);
 
+    // A well-formed NVD response always carries a "vulnerabilities" array (empty
+    // for a genuinely-empty window). Its absence means an unexpected body shape —
+    // treat as failure, not empty.
     if (!doc.contains("vulnerabilities") || !doc["vulnerabilities"].is_array()) {
+        result.ok = false;
         return result;
     }
 

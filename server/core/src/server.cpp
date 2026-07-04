@@ -293,6 +293,10 @@ public:
           api_rate_limiter_(cfg_.rate_limit), login_rate_limiter_(cfg_.login_rate_limit) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
+        metrics_.describe("yuzu_nvd_total_cves", "Distinct CVEs in the local NVD catalog", "gauge");
+        metrics_.describe("yuzu_nvd_backfill_complete",
+                          "1 when the newest-first NVD backfill has reached its floor, else 0",
+                          "gauge");
         metrics_.describe("yuzu_server_default_certs_active",
                           "1 when running with built-in per-install default certificates, else 0",
                           "gauge");
@@ -4776,6 +4780,16 @@ private:
                 metrics_.gauge("yuzu_server_group_members_total")
                     .set(static_cast<double>(mgmt_group_store_->count_all_members()));
             }
+            // Refresh NVD backfill gauges (multi-hour background job — needs to be
+            // observable; governance sre BLOCKING).
+            if (nvd_db_ && nvd_db_->is_open()) {
+                metrics_.gauge("yuzu_nvd_total_cves")
+                    .set(static_cast<double>(nvd_db_->total_cve_count()));
+                if (nvd_sync_) {
+                    auto st = nvd_sync_->status();
+                    metrics_.gauge("yuzu_nvd_backfill_complete").set(st.backfill_complete ? 1 : 0);
+                }
+            }
             res.set_content(metrics_.serialize(), "text/plain; version=0.0.4; charset=utf-8");
         });
 
@@ -5853,6 +5867,8 @@ private:
                                  j["syncing"] = st.syncing;
                                  j["last_sync_time"] = st.last_sync_time;
                                  j["last_error"] = st.last_error;
+                                 j["backfill_complete"] = st.backfill_complete;
+                                 j["backfill_oldest_published"] = st.backfill_oldest_published;
                              }
                              res.set_content(j.dump(), "application/json");
                          });
@@ -5868,8 +5884,10 @@ private:
                     "application/json");
                 return;
             }
-            // Run sync in a detached thread so we don't block the HTTP response
-            std::thread([this] { nvd_sync_->sync_now(); }).detach();
+            // Ask the background loop to sync at its next wake and return at once.
+            // (A detached thread here could outlive the manager and use-after-free
+            // db_/fetcher_ during the hours-long backfill — governance BLOCKING.)
+            nvd_sync_->request_sync();
             res.set_content(R"({"status":"sync_started"})", "application/json");
         });
 

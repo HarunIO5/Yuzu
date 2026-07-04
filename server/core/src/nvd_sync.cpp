@@ -2,7 +2,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <format>
 #include <memory>
 #include <mutex>
@@ -24,13 +26,23 @@ long long epoch_secs(std::chrono::system_clock::time_point tp) {
     return std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch()).count();
 }
 
+// NVD's first CVEs are from 1999; anything older than 2000 in a cursor is
+// corruption, not a legitimate position. Rejecting it prevents a garbage/negative
+// sync_meta value from parsing to ~1970 and either false-completing the backfill
+// (cursor <= floor) or livelocking it (governance UP-3/UP-4).
+constexpr long long kMinSaneEpochSecs = 946684800; // 2000-01-01T00:00:00Z
+
 // Cursors are stored in sync_meta as epoch-seconds strings (no ISO parsing —
-// avoids std::chrono::parse portability differences). Malformed/empty → nullopt.
+// avoids std::chrono::parse portability differences). Malformed/empty/insane →
+// nullopt (caller restarts from `now`, which is idempotent).
 std::optional<std::chrono::system_clock::time_point> parse_cursor(const std::string& s) {
     if (s.empty())
         return std::nullopt;
     try {
-        return std::chrono::system_clock::time_point{std::chrono::seconds{std::stoll(s)}};
+        const long long v = std::stoll(s);
+        if (v < kMinSaneEpochSecs)
+            return std::nullopt;
+        return std::chrono::system_clock::time_point{std::chrono::seconds{v}};
     } catch (...) {
         return std::nullopt;
     }
@@ -92,9 +104,26 @@ void NvdSyncManager::sync_now() {
     do_sync();
 }
 
+void NvdSyncManager::request_sync() {
+    {
+        std::lock_guard<std::mutex> lock{mu_};
+        sync_requested_ = true;
+    }
+    cv_.notify_all(); // wake the loop; it owns the sync so nothing outlives us
+}
+
 NvdSyncManager::SyncStatus NvdSyncManager::status() const {
     std::lock_guard<std::mutex> lock{mu_};
-    return status_;
+    SyncStatus st = status_;
+    // Surface backfill progress (cpp/consistency S1 + sre): the store is the
+    // source of truth for completion + the newest-first cursor.
+    st.backfill_complete = db_->get_meta("backfill_complete") == "1";
+    if (auto cur = parse_cursor(db_->get_meta("backfill_oldest_published")))
+        st.backfill_oldest_published = iso_of(*cur);
+    // Survive restart: last_sync_time lives in meta, not just memory (S1).
+    if (st.last_sync_time.empty())
+        st.last_sync_time = db_->get_meta("last_sync_time");
+    return st;
 }
 
 bool NvdSyncManager::backfill_complete() const {
@@ -128,14 +157,16 @@ void NvdSyncManager::sync_loop() {
 
         std::unique_lock<std::mutex> lock{mu_};
 #ifdef __cpp_lib_jthread
-        cv_.wait_for(lock, wait, [&stop] { return stop.stop_requested(); });
+        cv_.wait_for(lock, wait, [&] { return stop.stop_requested() || sync_requested_; });
         if (stop.stop_requested())
             break;
 #else
-        cv_.wait_for(lock, wait, [this] { return stop_requested_.load(); });
+        cv_.wait_for(lock, wait,
+                     [this] { return stop_requested_.load() || sync_requested_; });
         if (stop_requested_.load())
             break;
 #endif
+        sync_requested_ = false; // consume an on-demand request (request_sync)
         lock.unlock();
         do_sync();
     }
@@ -167,8 +198,9 @@ void NvdSyncManager::do_sync() {
         } else {
             do_backfill();
         }
+        const auto count = db_->total_cve_count(); // off the status lock (cpp-safety)
         std::lock_guard<std::mutex> lock{mu_};
-        status_.total_cves = db_->total_cve_count();
+        status_.total_cves = count;
         status_.syncing = false;
     } catch (const std::exception& e) {
         spdlog::error("NVD sync failed: {}", e.what());
@@ -186,7 +218,18 @@ void NvdSyncManager::do_backfill() {
     const auto max_window = std::chrono::days(120); // NVD caps a pub/lastMod range at 120 days
 
     // Resume from the oldest published date reached so far (newest-first walk).
-    auto cursor = parse_cursor(db_->get_meta("backfill_oldest_published")).value_or(now);
+    // Clamp to `now`: a future cursor (clock skew) would otherwise ask NVD for a
+    // future window forever (livelock, UP-4). A missing/insane cursor restarts
+    // from `now` — idempotent (re-fetch), so no corruption, just repeated work.
+    auto cursor = std::min(parse_cursor(db_->get_meta("backfill_oldest_published")).value_or(now),
+                           now);
+
+    // On a fresh backfill start, pin the freshness cursor to now so that after a
+    // multi-day backfill the first freshness pass re-checks everything modified
+    // *during* the build, not just the last 2 days (UP-6).
+    if (db_->get_meta("last_freshness_check").empty())
+        db_->set_meta("last_freshness_check", std::to_string(epoch_secs(now)));
+
     std::size_t total = 0;
 
     while (cursor > floor && !stopping_.load()) {
@@ -206,9 +249,14 @@ void NvdSyncManager::do_backfill() {
         }
         cursor = window_start;
         db_->set_meta("backfill_oldest_published", std::to_string(epoch_secs(cursor)));
+        db_->set_meta("last_sync_time", iso_of(now)); // persist so status survives restart (S1)
+        // Compute the count OUTSIDE the status lock so a concurrent status()
+        // reader never blocks on a SQLite query (cpp-safety SHOULD).
+        const auto count = db_->total_cve_count();
         {
             std::lock_guard<std::mutex> lock{mu_};
-            status_.total_cves = db_->total_cve_count();
+            status_.total_cves = count;
+            status_.last_sync_time = iso_of(now);
         }
     }
 
@@ -244,9 +292,11 @@ void NvdSyncManager::do_freshness() {
         db_->set_meta("last_freshness_check", std::to_string(epoch_secs(we)));
     }
 
+    db_->set_meta("last_sync_time", iso_of(now)); // persist for restart (S1)
+    const auto count = db_->total_cve_count();     // off the status lock (cpp-safety)
     {
         std::lock_guard<std::mutex> lock{mu_};
-        status_.total_cves = db_->total_cve_count();
+        status_.total_cves = count;
         status_.last_sync_time = iso_of(now);
     }
     spdlog::info("NVD freshness re-check complete — {} CVEs updated", total);

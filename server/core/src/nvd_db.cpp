@@ -314,6 +314,18 @@ void NvdDatabase::create_tables() {
             CREATE INDEX IF NOT EXISTS idx_cve_match_product ON cve_match(cpe_product);
             CREATE INDEX IF NOT EXISTS idx_cve_match_cveid   ON cve_match(cve_id);
         )"},
+        // v2's idx_cve_match_product is BINARY-collated, but match_inventory
+        // filters with a case-insensitive `LIKE 'name%'`. SQLite only uses an
+        // index for a LIKE prefix when the index collation matches the LIKE's
+        // case-mode — a BINARY index does NOT qualify for the default
+        // (case-insensitive) LIKE, so the "prefix-anchor" query still full-scans
+        // cve_match. Rebuild the index NOCASE so the prefix seek actually engages
+        // at full-catalog scale (governance perf-P1). NOCASE is safe here: the
+        // values are already stored lowercased.
+        {3, R"(
+            DROP INDEX IF EXISTS idx_cve_match_product;
+            CREATE INDEX idx_cve_match_product ON cve_match(cpe_product COLLATE NOCASE);
+        )"},
     };
     const int before = MigrationRunner::current_version(db_, "nvd_database");
     if (!MigrationRunner::run(db_, "nvd_database", kMigrations)) {

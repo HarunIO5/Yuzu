@@ -30,8 +30,16 @@ public:
     void start(); // Start background sync thread
     void stop();  // Signal stop and join thread
 
-    // Manual sync (blocks until complete)
+    // Synchronous sync on the CALLING thread (blocks until complete). Used by
+    // tests; NOT for request handlers — see request_sync().
     void sync_now();
+
+    // Ask the (already-running, already-joined-on-shutdown) background loop to
+    // run a sync at the next opportunity and return immediately. This replaces
+    // the old detached-thread trigger, which could outlive the manager and
+    // use-after-free db_/fetcher_ during the now-hours-long backfill (governance
+    // cpp-safety/security BLOCKING).
+    void request_sync();
 
     // Status info for UI
     struct SyncStatus {
@@ -39,6 +47,8 @@ public:
         std::string last_sync_time; // ISO 8601 or empty
         std::size_t total_cves = 0;
         std::string last_error;
+        bool backfill_complete = false;       // catalog build reached the floor
+        std::string backfill_oldest_published; // ISO 8601 cursor (progress), or empty
     };
     SyncStatus status() const;
 
@@ -64,6 +74,8 @@ private:
     // Set by stop() so a long backfill/freshness pass aborts between windows
     // (cooperative cancellation — #1867 fix #2). Checked in do_backfill/do_freshness.
     std::atomic<bool> stopping_{false};
+    // Set by request_sync() to make the loop run a sync at its next wake.
+    bool sync_requested_{false}; // guarded by mu_
 
 #ifdef __cpp_lib_jthread
     void sync_loop(std::stop_token stop);
