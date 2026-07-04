@@ -67,6 +67,12 @@ public:
 private:
     std::shared_ptr<NvdDatabase> db_;
     FailureCallback on_sync_failure_; // optional; invoked on a non-cancel sync failure (#1880)
+    // Set by stop() so a long backfill/freshness pass aborts between windows
+    // (cooperative cancellation — #1867 fix #2). Checked in do_backfill/do_freshness.
+    // DECLARED BEFORE fetcher_ on purpose: the fetcher's NvdClient borrows
+    // &stopping_ (set_cancel_flag), so the borrower (fetcher_) must destruct FIRST
+    // — members destruct in reverse declaration order (#1879 cpp-safety).
+    std::atomic<bool> stopping_{false};
     std::unique_ptr<INvdFetcher> fetcher_;
     std::chrono::seconds interval_;
     int backfill_years_;
@@ -84,9 +90,6 @@ private:
     // thread both call it on the same fetcher; running two concurrently races
     // the client's rate-limit state and doubles NVD load (#1867 governance).
     std::atomic<bool> sync_active_{false};
-    // Set by stop() so a long backfill/freshness pass aborts between windows
-    // (cooperative cancellation — #1867 fix #2). Checked in do_backfill/do_freshness.
-    std::atomic<bool> stopping_{false};
     // Set by request_sync() to make the loop run a sync at its next wake.
     bool sync_requested_{false}; // guarded by mu_
     // Set true when sync_loop() actually returns. stop() waits on this (bounded
