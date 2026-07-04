@@ -8,6 +8,11 @@ FROM gcr.io/oss-fuzz-base/base-builder@sha256:7e051ff2f22c7ab9bd4714427ad92165b2
 # matches the major.minor line vcpkg resolves for the server build.
 RUN git clone --depth 1 --branch v3.12.0 https://github.com/nlohmann/json.git "$SRC/nlohmann_json"
 
-COPY . "$SRC/yuzu"
+# $SRC/Yuzu — EXACT repo-name case. ClusterFuzzLite bind-mounts the PR
+# checkout at $SRC/<github-repo-name> ("Yuzu"), shadowing this COPY; a
+# lowercase path here leaves the container building the image-time copy
+# instead of the PR (first run failed exactly that way — "no such file
+# /src/yuzu/tests/fuzz/...").
+COPY . "$SRC/Yuzu"
 COPY .clusterfuzzlite/build.sh "$SRC/build.sh"
-WORKDIR "$SRC/yuzu"
+WORKDIR "$SRC/Yuzu"

@@ -9,7 +9,9 @@
 # sources). Drift is caught by the cflite-pr.yml build job on any PR touching
 # these paths.
 
-SRC_DIR="$SRC/yuzu"
+# EXACT repo-name case — CFLite mounts the checkout at $SRC/Yuzu (see the
+# Dockerfile comment).
+SRC_DIR="$SRC/Yuzu"
 INC="-I$SRC_DIR/server/core/src -I$SRC/nlohmann_json/include"
 STD="-std=c++23"
 
