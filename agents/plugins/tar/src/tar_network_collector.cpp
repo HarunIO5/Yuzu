@@ -1141,9 +1141,9 @@ std::vector<TcpQualitySample> collect_tcp_quality() {
             row.dwRemoteAddr = r.dwRemoteAddr;
             row.dwRemotePort = r.dwRemotePort;
             std::string remote = format_win_addr4(r.dwRemoteAddr);
-            std::string key = std::format("tcp|{}:{}|{}:{}", format_win_addr4(r.dwLocalAddr),
-                                          ntohs(static_cast<u_short>(r.dwLocalPort)), remote,
-                                          ntohs(static_cast<u_short>(r.dwRemotePort)));
+            std::string key = nq_v4_key(format_win_addr4(r.dwLocalAddr),
+                                        ntohs(static_cast<u_short>(r.dwLocalPort)), remote,
+                                        ntohs(static_cast<u_short>(r.dwRemotePort)));
             denied = !nq_visit(row, std::move(key), "tcp", std::move(remote),
                                static_cast<uint32_t>(r.dwOwningPid), enables, name_cache, out);
         }
@@ -1163,9 +1163,12 @@ std::vector<TcpQualitySample> collect_tcp_quality() {
             row.dwRemoteScopeId = r.dwRemoteScopeId;
             row.dwRemotePort = r.dwRemotePort;
             std::string remote = format_win_addr6(r.ucRemoteAddr);
-            std::string key = std::format("tcp6|{}:{}|{}:{}", format_win_addr6(r.ucLocalAddr),
-                                          ntohs(static_cast<u_short>(r.dwLocalPort)), remote,
-                                          ntohs(static_cast<u_short>(r.dwRemotePort)));
+            // Scope IDs are part of the key (see nq_v6_key): two link-local
+            // connections can share address+port and differ only by zone.
+            std::string key = nq_v6_key(format_win_addr6(r.ucLocalAddr), r.dwLocalScopeId,
+                                        ntohs(static_cast<u_short>(r.dwLocalPort)), remote,
+                                        r.dwRemoteScopeId,
+                                        ntohs(static_cast<u_short>(r.dwRemotePort)));
             denied = !nq_visit(row, std::move(key), "tcp6", std::move(remote),
                                static_cast<uint32_t>(r.dwOwningPid), enables, name_cache, out);
         }
@@ -1196,7 +1199,19 @@ std::vector<TcpQualitySample> collect_tcp_quality() {
 }
 
 std::string_view netqual_effective_capture_method() {
-    return g_nq_gate.load(std::memory_order_relaxed) == kNqGateDenied ? "none" : "estats";
+    // Tri-state, honestly: only claim "estats" once the elevation gate has
+    // actually latched active. Until the first collect_fast tick tests it (or
+    // when netqual is disabled), the gate is kNqGateUnknown and we report
+    // "estats_pending" — NOT "estats" — so a non-elevated agent no longer
+    // advertises "estats" for the first interval before flipping to "none".
+    switch (g_nq_gate.load(std::memory_order_relaxed)) {
+    case kNqGateDenied:
+        return "none";
+    case kNqGateActive:
+        return "estats";
+    default:
+        return "estats_pending";
+    }
 }
 
 #else

@@ -1086,6 +1086,30 @@ TEST_CASE("TarDatabase: insert_netconn_events returns false (no crash) when the 
     REQUIRE(t.db.execute_query("SELECT 1").has_value());
 }
 
+TEST_CASE("netqual: nq_v6_key includes scope IDs so same-text/different-scope rows are distinct",
+          "[tar][netqual]") {
+    using yuzu::tar::nq_v4_key;
+    using yuzu::tar::nq_v6_key;
+
+    // Two link-local connections with IDENTICAL textual address + port but
+    // different zone (scope) IDs must NOT collide in g_nq_tracked — otherwise
+    // one connection's RTT/retransmit deltas are attributed to the other.
+    const auto a = nq_v6_key("fe80::1", 11, 5000, "fe80::2", 11, 443);
+    const auto b = nq_v6_key("fe80::1", 22, 5000, "fe80::2", 22, 443); // same text, diff scope
+    CHECK(a != b);
+
+    // Identical everything (incl. scope) yields the SAME key (stable tracking).
+    CHECK(nq_v6_key("fe80::1", 11, 5000, "fe80::2", 11, 443) == a);
+
+    // The scope is embedded, not merely appended out of band.
+    CHECK(a == "tcp6|fe80::1%11:5000|fe80::2%11:443");
+
+    // v4 has no scope dimension; the key is proto|laddr:lport|raddr:rport.
+    CHECK(nq_v4_key("10.0.0.1", 5000, "8.8.8.8", 443) == "tcp|10.0.0.1:5000|8.8.8.8:443");
+    // v4 and v6 keys never collide (distinct proto prefixes).
+    CHECK(nq_v4_key("10.0.0.1", 1, "10.0.0.2", 2) != nq_v6_key("10.0.0.1", 0, 1, "10.0.0.2", 0, 2));
+}
+
 TEST_CASE("netqual: nq_win_ca_state severity precedence", "[tar][netqual]") {
     using yuzu::tar::NqPathDeltas;
     using yuzu::tar::nq_win_ca_state;

@@ -261,9 +261,12 @@ A block is emitted for every capture source. The opt-in sources report
 above), `procperf`, `netqual`, `netconn`, `arp`, and `dns` are off by default and
 must be enabled explicitly via `configure` (see the configuration table above).
 `netqual_capture_method` reports the per-connection quality mechanism actually
-in effect — `inetdiag` (Linux), `estats` (Windows, elevated agent), or `none`
-(Windows non-elevated, macOS) — so "opted in but the agent can't collect" is
-distinguishable from "off". The
+in effect — `inetdiag` (Linux), `estats` (Windows once the elevation gate has
+latched active), `estats_pending` (Windows, netqual enabled but the first
+collect tick has not yet tested elevation — or netqual is off), or `none`
+(Windows non-elevated after the access-denied latch, macOS) — so "opted in but
+the agent can't collect" is distinguishable from "off", and a non-elevated agent
+never briefly advertises `estats` before flipping to `none`. The
 default-ON sources — `process`, `tcp`, `service`, `user`, and `perf` — report
 `<source>_enabled|true`. `module_live_rows` stays `0` until a collector for the
 host's OS ships; likewise `arp`/`dns` are **Windows-only today** (planned on

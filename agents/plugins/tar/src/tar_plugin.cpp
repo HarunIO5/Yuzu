@@ -79,15 +79,14 @@ int64_t next_snapshot_id() {
 // pre-notice collection is not permitted. Clamped to [0, 90 days] so a bad
 // config value cannot request an unbounded window.
 int64_t netconn_lookback_seconds(yuzu::tar::TarDatabase& db) {
-    int64_t v = yuzu::tar::kNetConnLookbackS;
     try {
-        v = std::stoll(db.get_config("netconn_lookback_seconds",
-                                     std::to_string(yuzu::tar::kNetConnLookbackS)));
+        return yuzu::tar::nq_clamp_lookback(std::stoll(db.get_config(
+            "netconn_lookback_seconds", std::to_string(yuzu::tar::kNetConnLookbackS))));
     } catch (...) {
+        // Non-numeric stored value (should be impossible — do_configure rejects
+        // it) → fall back to the default rather than throw across a collect leg.
         return yuzu::tar::kNetConnLookbackS;
     }
-    constexpr int64_t kMaxLookback = 90LL * 24 * 3600;
-    return std::clamp<int64_t>(v, 0, kMaxLookback);
 }
 
 // ── State serialization helpers ──────────────────────────────────────────────
@@ -594,24 +593,30 @@ public:
             //
             // The retroactive REACH is operator-configurable (ADR-0020 privacy
             // note): netconn_lookback_seconds bounds how far before enablement
-            // the backfill reads. 0 disables the retrospective read entirely
-            // (the window collapses to empty) for jurisdictions/works-councils
-            // where pre-notice collection is not permitted; the source then
-            // records only forward connectivity from enablement onward.
-            const std::int64_t lookback = netconn_lookback_seconds(*db_);
-            auto nc_rows = yuzu::tar::backfill_netconn_events(t_live - lookback, t_live);
-            const auto nc_snap = next_snapshot_id();
-            for (auto& r : nc_rows)
-                r.snapshot_id = nc_snap;
-            if (nc_rows.empty()) {
-                db_->set_config("netconn_backfill_hwm", std::to_string(t_live));
-            } else if (db_->insert_netconn_events(nc_rows)) {
-                db_->set_config("netconn_backfill_hwm", std::to_string(t_live));
-                spdlog::info("TAR: netconn backfilled {} pre-TAR connectivity events",
-                             nc_rows.size());
+            // the backfill reads. nq_netconn_plan turns lookback==0 into a
+            // FORWARD-ONLY plan (read nothing, seed the hwm to t_live) so no
+            // pre-enablement history is read where a works-council/DPO forbids
+            // it; a positive lookback reads [t_live - lookback, t_live).
+            const auto plan = yuzu::tar::nq_netconn_plan(/*have_hwm=*/false, 0,
+                                                         netconn_lookback_seconds(*db_), t_live);
+            if (!plan.read) {
+                // Forward-only: seed the hwm so the slow leg reads forward from here.
+                db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
             } else {
-                spdlog::warn(
-                    "TAR: netconn history backfill insert failed (slow tick retries)");
+                auto nc_rows = yuzu::tar::backfill_netconn_events(plan.from, plan.to);
+                const auto nc_snap = next_snapshot_id();
+                for (auto& r : nc_rows)
+                    r.snapshot_id = nc_snap;
+                if (nc_rows.empty()) {
+                    db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
+                } else if (db_->insert_netconn_events(nc_rows)) {
+                    db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
+                    spdlog::info("TAR: netconn backfilled {} pre-TAR connectivity events",
+                                 nc_rows.size());
+                } else {
+                    spdlog::warn(
+                        "TAR: netconn history backfill insert failed (slow tick retries)");
+                }
             }
         }
 
@@ -1344,25 +1349,39 @@ private:
         // window; rows carry the EVENT's own ts. Non-fatal like every opt-in leg.
         if (db_->get_config("netconn_enabled", "false") == "true") {
             // Empty hwm (fresh enable / init backfill failed) -> deep read bounded
-            // by the operator-configurable retroactive reach (0 = forward-only,
-            // see netconn_lookback_seconds and the ADR-0020 privacy note).
-            int64_t from = ts - netconn_lookback_seconds(*db_);
+            // by the operator-configurable retroactive reach; a set hwm -> forward
+            // incremental read [hwm, ts). nq_netconn_plan centralises this AND the
+            // forward-only case: with netconn_lookback_seconds=0 and no hwm the
+            // window is empty, so the plan reads nothing but STILL seeds the hwm
+            // to ts — otherwise the leg would recompute from==ts every tick and
+            // never advance (a late enable with lookback=0 would wedge). rows
+            // carry the EVENT's own ts. Non-fatal like every opt-in leg.
             const auto hwm_str = db_->get_config("netconn_backfill_hwm", "");
-            if (!hwm_str.empty()) {
+            bool have_hwm = !hwm_str.empty();
+            int64_t hwm = 0;
+            if (have_hwm) {
                 try {
-                    from = std::stoll(hwm_str);
-                } catch (...) {}
+                    hwm = std::stoll(hwm_str);
+                } catch (...) {
+                    have_hwm = false; // corrupt hwm -> treat as fresh (deep read)
+                }
             }
-            if (from < ts) {
-                auto rows = yuzu::tar::backfill_netconn_events(from, ts);
+            const auto plan =
+                yuzu::tar::nq_netconn_plan(have_hwm, hwm, netconn_lookback_seconds(*db_), ts);
+            if (!plan.read) {
+                // Empty/backward window (lookback 0 forward-only, or clock skew):
+                // read nothing, but advance the hwm so forward reads begin.
+                db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
+            } else {
+                auto rows = yuzu::tar::backfill_netconn_events(plan.from, plan.to);
                 for (auto& r : rows)
                     r.snapshot_id = snap_id;
                 if (rows.empty()) {
                     // Nothing in the window (or channels missing) — still advance
                     // so the next tick doesn't re-scan the same empty window.
-                    db_->set_config("netconn_backfill_hwm", std::to_string(ts));
+                    db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
                 } else if (db_->insert_netconn_events(rows)) {
-                    db_->set_config("netconn_backfill_hwm", std::to_string(ts));
+                    db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
                     total_events += static_cast<int>(rows.size());
                 } else {
                     spdlog::error("TAR: netconn insert failed this tick (skipped)");
@@ -1574,8 +1593,9 @@ private:
                                      module_stream_ ? module_stream_->dropped() : 0));
 
         // netqual capture method (ADR-0020) — the method actually in effect:
-        // "inetdiag" (Linux), "estats" (Windows, elevated), "none" (Windows
-        // after the non-elevated ACCESS_DENIED latch, macOS). Emitted
+        // "inetdiag" (Linux), "estats" (Windows once the elevation gate latches
+        // active), "estats_pending" (Windows, gate not yet tested — or netqual
+        // off), "none" (Windows after the ACCESS_DENIED latch, macOS). Emitted
         // UNCONDITIONALLY (key-always-present contract, same as the process/
         // module keys above) so an operator can tell "netqual is on but the
         // agent can't collect" apart from "netqual is off".
@@ -2025,6 +2045,7 @@ private:
         auto fast_interval = params.get("fast_interval");
         auto slow_interval = params.get("slow_interval");
         auto software_interval = params.get("software_interval");
+        auto netconn_lookback = params.get("netconn_lookback_seconds");
         auto redaction = params.get("redaction_patterns");
 
         bool changed = false;
@@ -2035,6 +2056,12 @@ private:
         // needs a "was it provided" flag distinct from the 0 sentinel.
         int software_secs = 0;
         bool software_provided = false;
+        // netconn_lookback_seconds: the documented forward-only privacy control
+        // (ADR-0020). A numeric value is CLAMPED to [0, 90 days] (0 = no
+        // pre-enablement read) so a privacy-tightening request never fails on a
+        // fat-fingered bound; a non-numeric value is rejected.
+        int64_t netconn_lookback_secs = 0;
+        bool netconn_lookback_provided = false;
 
         // M13 contract: validate EVERY parameter in the request in PHASE 1 and
         // only persist them in PHASE 2 once all pass. A request that mixes a
@@ -2091,6 +2118,22 @@ private:
                 ctx.write_output("error|software_interval must be 0 (disable) or 300-86400 seconds");
                 return 1;
             }
+        }
+
+        if (!netconn_lookback.empty()) {
+            netconn_lookback_provided = true;
+            bool parsed = false;
+            try {
+                netconn_lookback_secs = std::stoll(std::string{netconn_lookback});
+                parsed = true;
+            } catch (...) {}
+            if (!parsed) {
+                ctx.write_output("error|netconn_lookback_seconds must be an integer 0-7776000 "
+                                 "(0 = forward-only, no pre-enablement read)");
+                return 1;
+            }
+            // Clamp rather than reject an out-of-range bound (see the field decl).
+            netconn_lookback_secs = yuzu::tar::nq_clamp_lookback(netconn_lookback_secs);
         }
 
         // Cross-field validation BEFORE any writes
@@ -2247,6 +2290,15 @@ private:
         if (software_provided) {
             db_->set_config("software_interval_seconds", std::to_string(software_secs));
             ctx.write_output(std::format("config|software_interval_seconds|{}", software_secs));
+            changed = true;
+        }
+        if (netconn_lookback_provided) {
+            // Persist the CLAMPED value so the stored config and the echo agree
+            // with what the collect legs will actually read (nq_clamp_lookback is
+            // applied again on read, defensively). 0 => forward-only.
+            db_->set_config("netconn_lookback_seconds", std::to_string(netconn_lookback_secs));
+            ctx.write_output(
+                std::format("config|netconn_lookback_seconds|{}", netconn_lookback_secs));
             changed = true;
         }
         if (have_redaction) {

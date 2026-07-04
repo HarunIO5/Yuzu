@@ -191,3 +191,58 @@ TEST_CASE("netconn: backfill_netconn_events guard/no-op contract", "[tar][netcon
     // harness/UAT, matching the "collector platform code is not unit-tested"
     // convention (see test_tar_proc_etw.cpp / docs/tar-implementer.md).
 }
+
+TEST_CASE("netconn: nq_clamp_lookback bounds the configured retroactive reach",
+          "[tar][netconn]") {
+    using yuzu::tar::kNetConnLookbackMaxS;
+    using yuzu::tar::nq_clamp_lookback;
+    CHECK(nq_clamp_lookback(0) == 0);                 // forward-only, preserved exactly
+    CHECK(nq_clamp_lookback(-5) == 0);                // negative clamps to 0 (never < 0)
+    CHECK(nq_clamp_lookback(7 * 24 * 3600) == 7 * 24 * 3600); // in-range preserved
+    CHECK(nq_clamp_lookback(kNetConnLookbackMaxS) == kNetConnLookbackMaxS);
+    CHECK(nq_clamp_lookback(999LL * 24 * 3600) == kNetConnLookbackMaxS); // huge clamps to ceiling
+}
+
+TEST_CASE("netconn: nq_netconn_plan — a persisted lookback of 0 skips the retrospective read",
+          "[tar][netconn][privacy]") {
+    using yuzu::tar::nq_netconn_plan;
+    const std::int64_t now = 1'700'000'000;
+
+    // The HIGH regression (ADR-0020 forward-only control): first read (no hwm)
+    // with netconn_lookback_seconds == 0 reads NOTHING and seeds the hwm to now,
+    // so no pre-enablement history is ever ingested — the works-council/DPO
+    // mitigation is real, not fiction.
+    auto zero = nq_netconn_plan(/*have_hwm=*/false, 0, /*lookback=*/0, now);
+    CHECK_FALSE(zero.read);
+    CHECK(zero.hwm == now); // hwm still advances, so the source never wedges
+
+    // A negative lookback is clamped to 0 -> still forward-only.
+    CHECK_FALSE(nq_netconn_plan(false, 0, -100, now).read);
+
+    // First read with a positive lookback reads the retrospective window.
+    auto deep = nq_netconn_plan(false, 0, 7 * 24 * 3600, now);
+    CHECK(deep.read);
+    CHECK(deep.from == now - 7 * 24 * 3600);
+    CHECK(deep.to == now);
+    CHECK(deep.hwm == now);
+
+    // With a hwm set, the window is the forward increment [hwm, now).
+    auto inc = nq_netconn_plan(/*have_hwm=*/true, now - 300, 7 * 24 * 3600, now);
+    CHECK(inc.read);
+    CHECK(inc.from == now - 300);
+    CHECK(inc.to == now);
+
+    // A backward clock step (established hwm > now) reads nothing AND must NOT
+    // rewind the mark — rewinding would re-read + re-insert already-stored events
+    // (netconn_live has no dedup) once the clock advanced back past the old hwm.
+    // So the mark is preserved (max(hwm, now)), not moved to now.
+    auto skew = nq_netconn_plan(/*have_hwm=*/true, now + 500, 7 * 24 * 3600, now);
+    CHECK_FALSE(skew.read);
+    CHECK(skew.hwm == now + 500); // preserved, not rewound to now
+
+    // A fresh source (no hwm) with an empty window still seeds `now` (nothing to
+    // preserve) so it cannot wedge re-reading an empty window forever.
+    auto fresh_empty = nq_netconn_plan(/*have_hwm=*/false, 0, /*lookback=*/0, now);
+    CHECK_FALSE(fresh_empty.read);
+    CHECK(fresh_empty.hwm == now);
+}

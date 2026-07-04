@@ -150,10 +150,14 @@ std::vector<TcpQualitySample> collect_tcp_quality();
 
 /**
  * The netqual capture method actually in effect on this host right now:
- * "inetdiag" (Linux), "estats" (Windows, elevated), "none" (Windows
- * non-elevated after the ACCESS_DENIED latch, macOS, unsupported). Surfaced by
- * the status action as `config|netqual_capture_method|<token>` — mirrors the
- * process/module capture-method pattern.
+ * "inetdiag" (Linux), "estats" (Windows once the elevation gate has latched
+ * active), "estats_pending" (Windows, netqual enabled but the first collect tick
+ * has not yet tested elevation — or netqual disabled), "none" (Windows after the
+ * ACCESS_DENIED latch, macOS, unsupported). The pending token exists so a
+ * non-elevated agent does not advertise "estats" for the first interval before
+ * flipping to "none". Surfaced by the status action as
+ * `config|netqual_capture_method|<token>` — mirrors the process/module
+ * capture-method pattern.
  */
 std::string_view netqual_effective_capture_method();
 

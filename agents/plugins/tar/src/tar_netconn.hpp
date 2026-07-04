@@ -34,9 +34,67 @@ namespace yuzu::tar {
 /// Per-channel cap on backfilled events per read (a Wi-Fi flap storm or NCSI
 /// chatter must bound the work; row-count retention is the storage backstop).
 inline constexpr std::size_t kNetConnPerChannelCap = 5000;
-/// First-run backfill lookback. The OS channels are ~1MB circular, so this is
-/// an upper bound on intent, not a promise of depth.
+/// First-run backfill lookback DEFAULT (netconn_lookback_seconds). The OS
+/// channels are ~1MB circular, so this is an upper bound on intent, not a
+/// promise of depth. Operator-configurable; 0 = forward-only (no pre-enablement
+/// read) for jurisdictions/works-councils where retrospective collection is not
+/// permitted (ADR-0020 privacy note).
 inline constexpr std::int64_t kNetConnLookbackS = 7 * 24 * 3600;
+/// Ceiling for netconn_lookback_seconds (90 days). A configured value is clamped
+/// to [0, this] so a fat-fingered bound can neither request an unbounded window
+/// nor go negative.
+inline constexpr std::int64_t kNetConnLookbackMaxS = 90LL * 24 * 3600;
+
+/// PURE: clamp a configured lookback to [0, kNetConnLookbackMaxS]. The single
+/// home for the bound — both do_configure (persist) and the read helper
+/// (defensive re-clamp) route through here so a stored value and its effect
+/// always agree.
+inline std::int64_t nq_clamp_lookback(std::int64_t seconds) {
+    if (seconds < 0)
+        return 0;
+    if (seconds > kNetConnLookbackMaxS)
+        return kNetConnLookbackMaxS;
+    return seconds;
+}
+
+/// What the netconn leg should read this tick.
+struct NetConnReadPlan {
+    bool read{false};    ///< true => call backfill_netconn_events(from, to)
+    std::int64_t from{0};
+    std::int64_t to{0};
+    std::int64_t hwm{0}; ///< high-water mark to persist (immediately when !read;
+                         ///< after a successful read otherwise)
+};
+
+/// PURE: decide the netconn read window.
+///  - No hwm yet (first read): retrospective window [now - lookback, now).
+///    lookback == 0 makes it empty (FORWARD-ONLY — the documented privacy mode):
+///    read nothing, but still seed hwm = now so forward reads begin next tick.
+///  - Hwm present: incremental forward window [hwm, now).
+/// An empty or backward window (from >= now — lookback 0, or a backward clock
+/// step) reads nothing yet ALWAYS advances the hwm to now, so the source can
+/// never wedge itself re-reading an empty window forever. This is the guard the
+/// forward-only mode depends on: a persisted netconn_lookback_seconds=0 skips
+/// the retrospective read entirely and the source records only forward.
+inline NetConnReadPlan nq_netconn_plan(bool have_hwm, std::int64_t hwm, std::int64_t lookback,
+                                       std::int64_t now) {
+    NetConnReadPlan p;
+    p.to = now;
+    // NEVER move an established mark backward. A backward wall-clock step (NTP
+    // step, VM snapshot restore, manual clock change) can make `hwm > now`; if
+    // we then persisted `now` we would rewind the mark and, once the clock
+    // advanced past the old hwm, re-read and re-INSERT events already stored
+    // (netconn_live has no dedup) — duplicating the very presence signal the
+    // table is analysed for. So the seeded mark is max(hwm, now) when a mark
+    // exists; a fresh source (no hwm) seeds `now`.
+    p.hwm = (have_hwm && hwm > now) ? hwm : now;
+    const std::int64_t from = have_hwm ? hwm : now - nq_clamp_lookback(lookback);
+    if (from < now) {
+        p.read = true;
+        p.from = from;
+    }
+    return p;
+}
 
 namespace netconn_detail {
 

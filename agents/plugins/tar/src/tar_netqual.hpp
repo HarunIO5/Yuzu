@@ -38,7 +38,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <string>
+#include <string_view>
 #include <utility> // std::move (nq_win_build_sample)
 #include <vector>
 
@@ -161,6 +163,24 @@ inline std::vector<NetQualRow> select_netqual_rows(const std::vector<TcpQualityS
 }
 
 // ── Windows ESTATS derivation (pure — the platform reads stay in the collector) ──
+
+/// PURE: build the g_nq_tracked key for a v6 connection. The scope IDs are
+/// LOAD-BEARING: two link-local connections can share the same textual
+/// address+port and differ only by zone (dwLocalScopeId / dwRemoteScopeId) —
+/// which the MIB_TCP6ROW the collector builds also requires — so a key without
+/// them would collide and attribute one connection's RTT/retransmit deltas to
+/// the other. Kept pure + header-inline so the distinctness is unit-testable
+/// cross-platform.
+inline std::string nq_v6_key(std::string_view laddr, std::uint32_t lscope, int lport,
+                             std::string_view raddr, std::uint32_t rscope, int rport) {
+    return std::format("tcp6|{}%{}:{}|{}%{}:{}", laddr, lscope, lport, raddr, rscope, rport);
+}
+
+/// PURE: build the g_nq_tracked key for a v4 connection (no scope id in IPv4).
+inline std::string nq_v4_key(std::string_view laddr, int lport, std::string_view raddr,
+                             int rport) {
+    return std::format("tcp|{}:{}|{}:{}", laddr, lport, raddr, rport);
+}
 
 /// One tick's raw Windows ESTATS counters for a connection, cumulative since
 /// stats-enable (TCP_ESTATS_PATH_ROD_v0 + TCP_ESTATS_DATA_ROD_v0), copied into
