@@ -282,6 +282,35 @@ TEST_CASE("TAR schema: software source is registered with three tiers + Windows 
     }
 }
 
+TEST_CASE("TAR schema: perf + procperf are supported on Windows AND Linux (procfs)",
+          "[tar][schema][perf]") {
+    const auto& sources = capture_sources();
+    for (const auto* name : {"perf", "procperf"}) {
+        auto it = std::find_if(sources.begin(), sources.end(),
+                               [&](const CaptureSourceDef& s) { return s.name == name; });
+        REQUIRE(it != sources.end());
+        // All three OS rows must be PRESENT — without this the loop would pass
+        // vacuously if a row were ever dropped from os_support.
+        REQUIRE(it->os_support.size() == 3);
+        bool saw_windows = false, saw_linux = false, saw_macos = false;
+        for (const auto& os : it->os_support) {
+            INFO("source=" << name << " os=" << os.os);
+            if (os.os == "windows" || os.os == "linux") {
+                (os.os == "windows" ? saw_windows : saw_linux) = true;
+                CHECK(os.status == OsSupportStatus::kSupported);
+                if (os.os == "linux")
+                    CHECK(os.capture_method == "procfs");
+            } else {
+                saw_macos = (os.os == "macos");
+                CHECK(os.status == OsSupportStatus::kPlanned); // macOS still planned
+            }
+        }
+        CHECK(saw_windows);
+        CHECK(saw_linux);
+        CHECK(saw_macos);
+    }
+}
+
 TEST_CASE("TAR schema: $Software dollar-names translate and DDL has the columns",
           "[tar][schema][software]") {
     CHECK(translate_dollar_name("$Software_Live") == "software_live");

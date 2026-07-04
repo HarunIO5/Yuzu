@@ -528,6 +528,13 @@ int main(int argc, char* argv[]) {
     app.add_option("--saml-sp-acs-url", cfg.saml_sp_acs_url,
                    "SAML SP Assertion Consumer Service URL (POST binding endpoint)")
         ->envname("YUZU_SAML_SP_ACS_URL");
+    app.add_option("--saml-group-attribute", cfg.saml_group_attribute,
+                   "SAML <Attribute Name=\"...\"> whose values are group identifiers "
+                   "(e.g. the Entra groups claim URI); empty disables group parsing")
+        ->envname("YUZU_SAML_GROUP_ATTRIBUTE");
+    app.add_option("--saml-admin-group", cfg.saml_admin_group,
+                   "SAML group value (from --saml-group-attribute) that maps to admin role")
+        ->envname("YUZU_SAML_ADMIN_GROUP");
 
     // Data infrastructure options
     app.add_option("--response-retention-days", cfg.response_retention_days,

@@ -413,7 +413,10 @@ bool nq_send_dump(int fd, uint8_t family) {
 
 /// Owning-process image name from the socket inode's pid. /proc/[pid]/comm is
 /// the image name only (kernel-truncated to 15 chars) — matches the procperf
-/// "names only" privacy posture, never a command line.
+/// "names only" privacy posture, never a command line. NOTE: unlike procperf's
+/// parse_linux_pid_stat, the bytes are stored UNSANITIZED ('|'/control bytes
+/// pass through) — same class as the process source's status Name:; hardening
+/// all raw-comm consumers together is a tracked follow-up.
 std::string nq_read_comm(uint32_t pid) {
     if (pid == 0)
         return {};
