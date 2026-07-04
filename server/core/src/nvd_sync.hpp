@@ -51,6 +51,10 @@ private:
     mutable std::mutex mu_;
     std::condition_variable cv_;
     SyncStatus status_;
+    // Serialises do_sync(): the periodic loop and the detached POST /api/nvd/sync
+    // thread both call it on the same NvdClient; running two concurrently races
+    // the client's rate-limit state and doubles NVD load (#1867 governance).
+    std::atomic<bool> sync_active_{false};
 
 #ifdef __cpp_lib_jthread
     void sync_loop(std::stop_token stop);
