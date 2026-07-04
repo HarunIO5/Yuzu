@@ -38,8 +38,16 @@ if host_os == 'windows'
     # Catch2 satisfies the leftover refs.
     dependencies: [_libcatch2main, _libcatch2],
   )
+  # No-main variant for yuzu_agent_tests (#1648 diagnostic): the suite
+  # supplies its own main() via unit/test_runner_main.cpp so it can log
+  # Catch2's real return code, so it must NOT also pull in Catch2Main.
+  catch2_nomain_dep = declare_dependency(
+    include_directories: _vcpkg_inc_win,
+    dependencies: [_libcatch2],
+  )
 else
   catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true, include_type: 'system')
+  catch2_nomain_dep = dependency('Catch2', modules: ['Catch2::Catch2'], method: 'cmake', required: true, include_type: 'system')
 endif
 
 # ── Test fixture: plugin with a reserved name (#453) ─────────────────────────
@@ -110,6 +118,10 @@ endif
 agent_test_exe = executable(
   'yuzu_agent_tests',
   files(
+    # Custom Catch2 entry point (#1648 diagnostic) — logs Session::run()'s
+    # real return value; see unit/test_runner_main.cpp and catch2_nomain_dep
+    # above.
+    'unit/test_runner_main.cpp',
     'unit/test_plugin_loader.cpp',
     'unit/test_sdk_utilities.cpp',
     'unit/test_temp_file.cpp',
@@ -158,7 +170,7 @@ agent_test_exe = executable(
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
   ],
   cpp_args: test_partial_init_args,
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
