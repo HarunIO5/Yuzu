@@ -3100,7 +3100,14 @@ public:
         if (schedule_engine_)
             schedule_engine_->stop();
         if (nvd_sync_) {
-            nvd_sync_->stop();
+            if (!nvd_sync_->stop()) {
+                // stop() had to detach a wedged sync thread that still references
+                // the manager (client_, mu_, cv_, status_, and the NvdDatabase).
+                // LEAK the manager so the abandoned thread can't touch freed
+                // memory once it wakes — the process is exiting; the OS reclaims
+                // it. Destroying it here would be a teardown UAF (#1867).
+                (void)nvd_sync_.release();
+            }
         }
         if (analytics_store_)
             analytics_store_->stop_drain();

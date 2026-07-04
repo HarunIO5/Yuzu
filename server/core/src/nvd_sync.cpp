@@ -29,7 +29,13 @@ NvdSyncManager::NvdSyncManager(std::shared_ptr<NvdDatabase> db, std::string api_
       interval_{sync_interval} {}
 
 NvdSyncManager::~NvdSyncManager() {
-    stop();
+    // If stop() returns false here it detached a wedged thread, which means the
+    // owner did NOT honour the leak contract (ServerImpl::stop() releases the
+    // unique_ptr on false, so the dtor normally never runs on that path). By the
+    // time the dtor runs on a false result the members are already being torn
+    // down under a live thread — unavoidable at that point; the fix lives at the
+    // owner (see ServerImpl::stop()). Discard the result here.
+    (void)stop();
 }
 
 void NvdSyncManager::start() {
@@ -46,9 +52,9 @@ void NvdSyncManager::start() {
     spdlog::info("NVD sync manager started (interval={}s)", interval_.count());
 }
 
-void NvdSyncManager::stop() {
+bool NvdSyncManager::stop() {
     if (!sync_thread_.joinable()) {
-        return;
+        return true; // never started or already cleanly stopped — safe to destroy
     }
 #ifdef __cpp_lib_jthread
     sync_thread_.request_stop();
@@ -74,12 +80,18 @@ void NvdSyncManager::stop() {
     if (finished_.load()) {
         sync_thread_.join();
         spdlog::info("NVD sync manager stopped");
-    } else {
-        spdlog::warn("NVD sync thread did not exit within {}s (stuck in a fetch?); detaching to "
-                     "avoid wedging shutdown (see #1867)",
-                     kGrace.count());
-        sync_thread_.detach();
+        return true;
     }
+    // Detached: the abandoned thread still references this manager's members
+    // (client_, mu_, cv_, status_, and the NvdDatabase). Signal the owner to
+    // LEAK this manager instead of destroying it — otherwise the thread wakes
+    // (once #1872 lets it make real requests) and writes freed memory. Returning
+    // false is the contract for "do not destroy me".
+    spdlog::warn("NVD sync thread did not exit within {}s (stuck in a fetch?); detaching + leaking "
+                 "the manager to avoid wedging shutdown / a teardown UAF (see #1867)",
+                 kGrace.count());
+    sync_thread_.detach();
+    return false;
 }
 
 void NvdSyncManager::sync_now() {

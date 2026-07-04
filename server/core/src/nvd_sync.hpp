@@ -23,7 +23,12 @@ public:
     NvdSyncManager& operator=(const NvdSyncManager&) = delete;
 
     void start(); // Start background sync thread
-    void stop();  // Signal stop and join thread
+    // Signal stop and join the sync thread. Returns true when the manager is safe
+    // to destroy (thread joined cleanly, or never started). Returns FALSE when a
+    // wedged thread had to be detached and still references this manager — the
+    // owner MUST then leak the manager (not destroy it) to avoid a teardown UAF
+    // (see ServerImpl::stop(), #1867).
+    [[nodiscard]] bool stop();
 
     // Manual sync (blocks until complete)
     void sync_now();
