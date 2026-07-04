@@ -258,8 +258,12 @@ struct CommandContextImpl {
     // *truncated with a marker* rather than retained-and-failing. The
     // 2 MiB value matches `FleetTopologyStore::kPushedSnapshotMaxBytes`
     // on the server (in-tree convention: same constant in two places
-    // until typed proto lands and renders both moot).
+    // until typed proto lands and renders both moot). This is the
+    // DEFAULT; a caller that needs a larger bounded payload (the
+    // installed_software sync's v2 rows, blob contract v2) overrides it
+    // per-dispatch via `capture_max_bytes` below — see dispatch_with_capture.
     static constexpr std::size_t kCaptureMaxBytes = 2ull * 1024 * 1024;
+    std::size_t capture_max_bytes{kCaptureMaxBytes};
     bool capture_truncated{false};
 
     void append_output(const char* text) {
@@ -272,7 +276,7 @@ struct CommandContextImpl {
             if (capture_truncated)
                 return;
             std::size_t prospective = capture->size() + (capture->empty() ? 0 : 1) + len;
-            if (prospective > kCaptureMaxBytes) {
+            if (prospective > capture_max_bytes) {
                 // Truncate with a sentinel suffix so the server-side
                 // parser cleanly rejects the payload as malformed JSON
                 // rather than ingesting a half-finished structure. The
@@ -350,14 +354,15 @@ int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* ac
     ctx_impl.command_id = "__local_dispatch__";
     ctx_impl.start_time = std::chrono::steady_clock::now();
     ctx_impl.capture = capture_out;
-    // CommandContextImpl currently bakes the cap into its append_output
-    // (kCaptureMaxBytes constant). LocalDispatcher::kCaptureMaxBytes
-    // tracks the same value so the externally-visible policy lives in
-    // one place; the static_assert below catches divergence at compile
-    // time if either side drifts.
+    // Per-dispatch cap: append_output enforces ctx_impl.capture_max_bytes, not
+    // the class-static kCaptureMaxBytes default. The two DEFAULTS are pinned
+    // equal by the static_assert below so a caller relying on the default
+    // (every caller except the installed_software sync source) is unaffected;
+    // a caller that passes a non-default capture_cap (LocalDispatcher::run's
+    // parameter) actually gets that bound enforced here.
     static_assert(CommandContextImpl::kCaptureMaxBytes ==
                   yuzu::agent::LocalDispatcher::kCaptureMaxBytes);
-    (void)capture_cap;
+    ctx_impl.capture_max_bytes = capture_cap;
 
     auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
     int rc = descriptor->execute(raw_ctx, action, params, param_count);

@@ -96,6 +96,17 @@ endif
 # depend on `openssl(1)` at runtime or pre-baked .pem files that drift.
 agent_test_openssl_dep = dependency('openssl', required: true, include_type: 'system')
 
+# Test fixtures deliberately partial-aggregate-init wide inventory structs
+# (SwEntry / SoftwareEntry are 12 fields since blob contract v2; a 4-field
+# init IS the contract — "the rest stays empty"). -Wextra's
+# missing-field-initializers would flag every such fixture; suppress it for
+# the TEST targets only — production code stays fully warned.
+if cxx.get_id() == 'msvc'
+  test_partial_init_args = []
+else
+  test_partial_init_args = ['-Wno-missing-field-initializers']
+endif
+
 agent_test_exe = executable(
   'yuzu_agent_tests',
   files(
@@ -137,6 +148,7 @@ agent_test_exe = executable(
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
     'unit/test_installed_apps_registry_utf8.cpp',
+    'unit/test_installed_apps_inventory.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -145,6 +157,7 @@ agent_test_exe = executable(
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
   ],
+  cpp_args: test_partial_init_args,
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
@@ -273,6 +286,8 @@ if build_server
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
       'unit/server/test_schedule_engine.cpp',
+      'unit/server/test_schedule_routes.cpp',
+      'unit/server/test_schedule_runner.cpp',
       'unit/server/test_rbac_store.cpp',
       'unit/server/test_oidc_provider.cpp',
       'unit/server/test_saml_provider.cpp',
@@ -349,6 +364,7 @@ if build_server
       'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_sessions.cpp',
       'unit/server/test_rest_guaranteed_state.cpp',
+      'unit/server/test_discovery_routes.cpp', # A2 discovery surface (Issue 17.1)
       'unit/server/test_security_headers.cpp',
       'unit/server/test_insecure_tls_gate.cpp',
       'unit/server/test_settings_routes_users.cpp',
@@ -399,7 +415,8 @@ if build_server
     # YUZU_TEST_ENABLE_PG exposes the PostgresTestDb fixture in
     # test_helpers.hpp — only the server suite links libpq, so the guard
     # keeps the agent/tar suites (which share the header) libpq-free.
-    cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG'],
+    cpp_args: https_cpp_args + test_partial_init_args +
+              ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG'],
     # Server unit tests #include <openssl/...> directly (e.g.
     # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
     # propagate the OpenSSL include path, so declare it explicitly here

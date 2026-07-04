@@ -22,7 +22,8 @@ int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* ac
 
 LocalDispatcher::Result LocalDispatcher::run(const YuzuPluginDescriptor* descriptor,
                                              std::string_view action,
-                                             std::span<const YuzuParam> params) {
+                                             std::span<const YuzuParam> params,
+                                             std::size_t capture_cap) {
     Result r;
     if (!descriptor || !descriptor->execute) {
         r.rc = -1;
@@ -32,7 +33,7 @@ LocalDispatcher::Result LocalDispatcher::run(const YuzuPluginDescriptor* descrip
     // C string. Materialise on the stack — actions are short symbols.
     std::string action_z(action);
     r.rc = dispatch_with_capture(descriptor, action_z.c_str(), params.data(), params.size(),
-                                 &r.captured, &r.truncated, kCaptureMaxBytes);
+                                 &r.captured, &r.truncated, capture_cap);
     return r;
 }
 
