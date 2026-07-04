@@ -297,8 +297,12 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "GetPerformanceInfo, IOCTL_DISK_PERFORMANCE, GetIfTable2. "
                  "No PDH, no WMI, no shell-out. Some virtual disks do not "
                  "answer IOCTL_DISK_PERFORMANCE — disk columns read 0 there."},
-                {"linux",   OsSupportStatus::kPlanned,    "procfs",
-                 "/proc/stat, /proc/meminfo, /proc/diskstats, /proc/net/dev."},
+                {"linux",   OsSupportStatus::kSupported,  "procfs",
+                 "/proc/stat (aggregate jiffies, DEX busy conventions), "
+                 "/proc/meminfo (MemAvailable; commit_pct reads 0 under "
+                 "vm.overcommit_memory=1 — CommitLimit is advisory there), "
+                 "/proc/diskstats (whole disks only, 512-byte ABI sectors), "
+                 "/proc/net/dev (non-loopback). No shell-out."},
                 {"macos",   OsSupportStatus::kPlanned,    "host_statistics",
                  "host_processor_info / host_statistics64 + IOKit counters."},
             },
@@ -367,8 +371,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "every process; no PDH, no WMI. The per-app file version is "
                  "the bounded exception: a least-privilege OpenProcess on each "
                  "top-N representative only (<= 2N/tick), failures → empty."},
-                {"linux",   OsSupportStatus::kPlanned,    "procfs",
-                 "/proc/[pid]/stat utime+stime + VmRSS."},
+                {"linux",   OsSupportStatus::kSupported,  "procfs",
+                 "One /proc/[pid]/stat pass per tick — comm, utime+stime, rss, "
+                 "starttime; no ptrace, no per-process handles. Names are the "
+                 "kernel's 15-char comm (joins process_live). version is "
+                 "always '' (on-disk version capture is a follow-up)."},
                 {"macos",   OsSupportStatus::kPlanned,    "libproc",
                  "proc_pid_rusage / proc_taskinfo per sysctl PID list."},
             },
@@ -748,6 +755,80 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"hour_ts",      "INTEGER"},
                         {"name",         "TEXT"},
                         {"record_type",  "TEXT"},
+                        {"appear_count", "INTEGER"},
+                        {"remove_count", "INTEGER"},
+                    },
+                },
+            },
+        },
+
+        // ── Mapped drives (capability-map §3.8) ───────────────────────────
+        // Network-share mappings in BOTH directions, distinguished by the
+        // `direction` column: `outbound` = drives THIS host maps to remote
+        // shares; `inbound` = remote hosts mapping THIS host's shares (the
+        // lateral-movement signal §3.8 calls out). Live snapshot-diff emits
+        // appeared/removed keyed on (direction, local_mount, remote_path,
+        // remote_host, username); `provider` is a value-only field (not keyed).
+        // A one-time init backfill seeds PAST mappings from persistent OS
+        // artifacts (Windows registry Network/MRU/MountPoints2 + Security
+        // event log; Linux fstab + Samba logs) as `origin='historical'` rows
+        // — the `origin` column separates historically-inferred from
+        // live-observed, and `historical` rows bypass the live diff entirely.
+        // Opt-in (default_enabled=false): rows expose usernames + share paths
+        // (identity/usage-class PII), shipped disabled per the standing
+        // capture-source posture (like arp/dns).
+        {
+            .name = "mapdrive",
+            .dollar_name = "MapDrive",
+            .default_enabled = false,
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported,            "wnet",
+                 "Outbound live: WNetOpenEnumW/WNetEnumResourceW + WNetGetUserW "
+                 "(unprivileged). Outbound history: HKCU\\Network + Map Network "
+                 "Drive MRU + MountPoints2 across offline profiles, ts = subkey "
+                 "last-write. Inbound live: NetSessionEnum L502→L10 — needs "
+                 "local-admin / Server-Operator, degrades to empty on "
+                 "ERROR_ACCESS_DENIED. Inbound history: Security event log 4624 "
+                 "(logon_type=3 network) via wevtutil, ts = event time."},
+                {"linux",   OsSupportStatus::kSupportedConstrained, "procfs",
+                 "Outbound live: /proc/mounts fstype∈{cifs,smb3,nfs,nfs4,"
+                 "fuse.sshfs} (username unavailable). Outbound history: /etc/fstab "
+                 "cifs/nfs entries (ts=0). Inbound live: smbstatus -b — needs Samba "
+                 "installed + read access, degrades to empty otherwise. Inbound "
+                 "history: /var/log/samba connect events (bounded tail), journalctl "
+                 "-u smbd fallback."},
+                {"macos",   OsSupportStatus::kPlanned,              "getfsstat",
+                 "Outbound via getfsstat / `mount` NFS/SMB entries; inbound via "
+                 "smbutil. Wired in the macOS follow-up (returns empty today)."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    .retention_default = 5000,
+                    .columns = {
+                        {"ts",          "INTEGER"},
+                        {"snapshot_id", "INTEGER"},
+                        {"action",      "TEXT"}, // appeared, removed, historical
+                        {"direction",   "TEXT"}, // outbound, inbound
+                        {"local_mount", "TEXT"},
+                        {"remote_path", "TEXT"},
+                        {"remote_host", "TEXT"},
+                        {"username",    "TEXT"},
+                        {"provider",    "TEXT"},
+                        {"origin",      "TEXT"}, // live, historical
+                    },
+                },
+                {
+                    .suffix = "hourly",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 86400, // 24 hours
+                    .columns = {
+                        {"hour_ts",      "INTEGER"},
+                        {"direction",    "TEXT"},
+                        {"local_mount",  "TEXT"},
+                        {"remote_path",  "TEXT"},
+                        {"remote_host",  "TEXT"},
                         {"appear_count", "INTEGER"},
                         {"remove_count", "INTEGER"},
                     },
@@ -1194,6 +1275,25 @@ SELECT (ts / 3600) * 3600, name, record_type,
 FROM dns_live
 WHERE ts >= ? AND ts < ?
 GROUP BY (ts / 3600) * 3600, name, record_type)";
+        }
+    }
+
+    // ── Mapped-drive rollups (capability-map §3.8) — per (direction, mount, remote) ──
+    // Only live appeared/removed transitions roll up. `historical` backfill rows
+    // are EXCLUDED by the action filter: a backfill row can carry a RECENT artifact
+    // timestamp (registry last-write, event-log time) that lands inside the current
+    // hour, so without the filter its group would emit a $MapDrive_Hourly row with
+    // both counts zero. `username` is intentionally dropped from the hourly grain
+    // (aggregate-by-mapping, matching process_hourly which drops pid/cmdline).
+    if (source_name == "mapdrive") {
+        if (target_suffix == "hourly") {
+            return R"(INSERT INTO mapdrive_hourly (hour_ts, direction, local_mount, remote_path, remote_host, appear_count, remove_count)
+SELECT (ts / 3600) * 3600, direction, local_mount, remote_path, remote_host,
+       SUM(CASE WHEN action = 'appeared' THEN 1 ELSE 0 END),
+       SUM(CASE WHEN action = 'removed' THEN 1 ELSE 0 END)
+FROM mapdrive_live
+WHERE ts >= ? AND ts < ? AND action IN ('appeared', 'removed')
+GROUP BY (ts / 3600) * 3600, direction, local_mount, remote_path, remote_host)";
         }
     }
 

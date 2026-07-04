@@ -33,6 +33,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 
@@ -114,6 +115,11 @@ struct SamlTestFixture {
     /// @param use_sha1_digest_only  If true, the SignatureMethod stays rsa-sha256
     ///        but the Reference DigestMethod is sha1 — isolates the Reference-digest
     ///        allowlist (proves the digest is restricted, not just the SignatureMethod).
+    /// @param evil_attribute_statement_xml  Only used when inject_extra_assertion
+    ///        is true: an <saml:AttributeStatement> (e.g. from
+    ///        make_attribute_statement) embedded in the UNSIGNED injected
+    ///        assertion — qa-S3, proves group extraction never leaks a value
+    ///        from the unverified node.
     std::string make_response(
         const std::string& request_id,
         const std::string& name_id        = "user@example.com",
@@ -123,7 +129,9 @@ struct SamlTestFixture {
         bool inject_extra_assertion       = false,
         const std::string* signing_priv_key = nullptr,
         bool use_sha1_algorithms           = false,
-        bool use_sha1_digest_only          = false) const
+        bool use_sha1_digest_only          = false,
+        const std::string& attribute_statement_xml = {},
+        const std::string& evil_attribute_statement_xml = {}) const
     {
         const auto& aud = audience.empty()  ? sp_entity_id : audience;
         const auto& rec = recipient.empty() ? sp_acs_url   : recipient;
@@ -205,6 +213,7 @@ struct SamlTestFixture {
                   "<saml:Audience>" + aud + "</saml:Audience>"
                 "</saml:AudienceRestriction>"
               "</saml:Conditions>"
+              + attribute_statement_xml +
             "</saml:Assertion>";
         // clang-format on
 
@@ -229,6 +238,7 @@ struct SamlTestFixture {
                         " InResponseTo=\"" + request_id + "\"/>"
                     "</saml:SubjectConfirmation>"
                   "</saml:Subject>"
+                  + evil_attribute_statement_xml +
                 "</saml:Assertion>";
             // clang-format on
         }
@@ -525,6 +535,22 @@ struct SamlTestFixture {
         const std::string signed_xml = sign_assertion(response_xml, assertion_id, priv_key_pem);
         return b64_encode(
             reinterpret_cast<const unsigned char*>(signed_xml.data()), signed_xml.size());
+    }
+
+    /// Build a single <saml:AttributeStatement> containing one <saml:Attribute
+    /// Name="attr_name"> with one <saml:AttributeValue> per entry in `values`.
+    /// Pass the result as make_response's attribute_statement_xml parameter.
+    static std::string make_attribute_statement(const std::string& attr_name,
+                                                 const std::vector<std::string>& values) {
+        std::string value_elems;
+        for (const auto& v : values) {
+            value_elems += "<saml:AttributeValue>" + v + "</saml:AttributeValue>";
+        }
+        return "<saml:AttributeStatement>"
+                 "<saml:Attribute Name=\"" + attr_name + "\">"
+                   + value_elems +
+                 "</saml:Attribute>"
+               "</saml:AttributeStatement>";
     }
 
 private:
@@ -1115,6 +1141,224 @@ TEST_CASE("SAML: XSW — second injected Assertion is rejected (exactly-1 rule)"
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().find("XSW") != std::string::npos);
     CHECK(result.error().find("2") != std::string::npos); // reported count
+}
+
+// ── Group attribute parsing (SAML group→role mapping) ──────────────────────
+
+TEST_CASE("SAML: AttributeStatement group values parse into assertion.groups", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    cfg.group_attribute = "http://schemas.microsoft.com/ws/2008/06/identity/claims/groups";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto attr_stmt = SamlTestFixture::make_attribute_statement(
+        cfg.group_attribute, {"admins", "engineering"});
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {}, false, nullptr, false, false, attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    CHECK(result->name_id == "user@example.com");
+    REQUIRE(result->groups.size() == 2);
+    CHECK(result->groups[0] == "admins");
+    CHECK(result->groups[1] == "engineering");
+}
+
+TEST_CASE("SAML: AttributeStatement with non-matching Attribute Name yields no groups",
+          "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    cfg.group_attribute = "groups";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // Attribute Name is "department", not the configured "groups" — must be ignored.
+    const auto attr_stmt =
+        SamlTestFixture::make_attribute_statement("department", {"engineering"});
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {}, false, nullptr, false, false, attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    CHECK(result->groups.empty());
+}
+
+TEST_CASE("SAML: empty group_attribute parses no groups (thin-slice-compatible default)",
+          "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config(); // group_attribute left default-empty
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto attr_stmt = SamlTestFixture::make_attribute_statement("groups", {"admins"});
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {}, false, nullptr, false, false, attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    CHECK(result->groups.empty());
+}
+
+TEST_CASE("SAML: group values are capped at 64 entries (DoS guard)", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    cfg.group_attribute = "groups";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    std::vector<std::string> many_values;
+    for (int i = 0; i < 100; ++i) many_values.push_back("group" + std::to_string(i));
+    const auto attr_stmt = SamlTestFixture::make_attribute_statement("groups", many_values);
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {}, false, nullptr, false, false, attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    CHECK(result->groups.size() == 64);
+    CHECK(result->groups.front() == "group0");
+    CHECK(result->groups.back() == "group63");
+}
+
+TEST_CASE("SAML: empty <AttributeValue/> is skipped, not pushed (UP-8)", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    cfg.group_attribute = "groups";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // Two genuinely-empty values sandwiched between real ones — an empty
+    // value can never match a non-empty admin_group, and must not occupy a
+    // slot against the 64-entry DoS cap.
+    const auto attr_stmt =
+        SamlTestFixture::make_attribute_statement("groups", {"", "admins", "", "engineering"});
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {}, false, nullptr, false, false, attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    REQUIRE(result->groups.size() == 2);
+    CHECK(result->groups[0] == "admins");
+    CHECK(result->groups[1] == "engineering");
+}
+
+TEST_CASE("SAML: a match beyond index 0 still resolves; an XML comment inside an "
+          "AttributeValue does not change its resolved text (qa-NICE / UP-6)",
+          "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    cfg.group_attribute = "groups";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // "Admins" (capital A) is spelled with an inline XML comment splitting the
+    // text node — libxml2's xmlNodeGetContent concatenates the surrounding
+    // text nodes and drops the comment, so this must resolve to the literal
+    // string "Admins", not something the comment could smuggle a bypass into.
+    std::string attr_stmt =
+        "<saml:AttributeStatement>"
+          "<saml:Attribute Name=\"groups\">"
+            "<saml:AttributeValue>engineering</saml:AttributeValue>"
+            "<saml:AttributeValue>Ad<!--x-->mins</saml:AttributeValue>"
+            "<saml:AttributeValue>sales</saml:AttributeValue>"
+          "</saml:Attribute>"
+        "</saml:AttributeStatement>";
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {}, false, nullptr, false, false, attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    REQUIRE(result->groups.size() == 3);
+    CHECK(result->groups[0] == "engineering");
+    CHECK(result->groups[1] == "Admins"); // comment dropped, not smuggled
+    CHECK(result->groups[2] == "sales");
+}
+
+TEST_CASE("SAML: XSW — group values from an unsigned injected Assertion never leak "
+          "into result->groups (qa-S3)", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    cfg.group_attribute = "groups";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // The legit SIGNED assertion carries NO groups. The evil UNSIGNED
+    // injected assertion (classic XSW shape) carries the admin group value.
+    // Today's exactly-one-Assertion rule already rejects any two-assertion
+    // document outright; this test pins that AND makes a future loosening of
+    // that rule fail loudly if it ever let a value through carrying the evil
+    // group — group extraction must stay scoped to the XSW-verified node,
+    // never a document-wide search.
+    const auto evil_attr_stmt = SamlTestFixture::make_attribute_statement("groups", {"admins"});
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {}, /*inject_extra_assertion=*/true, nullptr,
+        false, false, /*attribute_statement_xml=*/{}, evil_attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    if (result.has_value()) {
+        CHECK(std::find(result->groups.begin(), result->groups.end(), "admins") ==
+              result->groups.end());
+    } else {
+        CHECK(result.error().find("XSW") != std::string::npos);
+    }
+}
+
+TEST_CASE("SAML: XSW — second injected Assertion is still rejected when attributes are present",
+          "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    cfg.group_attribute = "groups";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto attr_stmt = SamlTestFixture::make_attribute_statement("groups", {"admins"});
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {}, /*inject_extra_assertion=*/true, nullptr,
+        false, false, attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("XSW") != std::string::npos);
 }
 
 TEST_CASE("SAML: expired assertion (NotOnOrAfter in past) is rejected", "[saml]") {
