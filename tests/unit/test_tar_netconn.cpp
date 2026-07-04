@@ -168,35 +168,26 @@ TEST_CASE("netconn: unknown channel tag or missing timestamp is rejected", "[tar
 // its no-op contract is pinned). Event COUNTS are host-dependent, so the
 // assertions pin the reader's invariants, not the host's history.
 
-TEST_CASE("netconn: backfill_netconn_events honours the window and the closed enums",
-          "[tar][netconn]") {
+TEST_CASE("netconn: backfill_netconn_events guard/no-op contract", "[tar][netconn]") {
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
-#ifdef _WIN32
-    // Live read of the real OS channels over the last 7 days. Whatever comes
-    // back must respect the window, the closed enum sets, and the privacy
-    // shape (enum tokens never look like SSIDs/GUIDs/addresses).
-    const auto rows = yuzu::tar::backfill_netconn_events(now - 7 * 24 * 3600, now);
-    for (const auto& r : rows) {
-        INFO("action=" << r.action << " channel=" << r.channel << " ts=" << r.ts);
-        CHECK(r.ts >= now - 7 * 24 * 3600);
-        CHECK(r.ts < now);
-        CHECK((r.channel == "networkprofile" || r.channel == "ncsi" || r.channel == "wlan"));
-        CHECK((r.action == "connected" || r.action == "disconnected" ||
-               r.action == "wifi_connected" || r.action == "wifi_connect_failed" ||
-               r.action == "wifi_disconnected" || r.action == "capability_changed"));
-        CHECK((r.category.empty() || r.category == "public" || r.category == "private" ||
-               r.category == "domain"));
-        CHECK((r.capability.empty() || r.capability == "none" || r.capability == "local" ||
-               r.capability == "internet"));
-        CHECK((r.iface_kind.empty() || r.iface_kind == "wifi"));
-    }
-    // Inverted / empty windows are a guaranteed no-op.
+    // Only the GUARD paths are exercised here — they return before any OS read,
+    // so they are cross-platform and fast: an inverted window and a zero cap
+    // both yield an empty result.
     CHECK(yuzu::tar::backfill_netconn_events(now, now - 60).empty());
     CHECK(yuzu::tar::backfill_netconn_events(now - 60, now, /*cap=*/0).empty());
-#else
-    // Clean no-op off Windows (journald/oslog readers are kPlanned).
+#ifndef _WIN32
+    // Off Windows the reader is a clean no-op (journald/oslog are kPlanned), so
+    // even a wide window returns empty without touching any OS facility.
     CHECK(yuzu::tar::backfill_netconn_events(now - 7 * 24 * 3600, now).empty());
 #endif
+    // NB: the LIVE channel read (EvtQuery/EvtRender over NetworkProfile / NCSI /
+    // WLAN-AutoConfig) is deliberately NOT driven from a unit test. Reading the
+    // real OS event log is host-dependent and on a long-lived runner can take
+    // minutes to render thousands of events — an earlier version of this test
+    // timed the tar suite out on CI. The parse/mapping/privacy contract is fully
+    // covered by the fixture tests above; the live reader is exercised by the
+    // harness/UAT, matching the "collector platform code is not unit-tested"
+    // convention (see test_tar_proc_etw.cpp / docs/tar-implementer.md).
 }

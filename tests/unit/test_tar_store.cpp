@@ -958,34 +958,22 @@ TEST_CASE("netqual: select_netqual_rows with cap=0 keeps everything", "[tar][net
     CHECK(rows.size() == 5);
 }
 
-TEST_CASE("netqual: collect_netqual_boot per-platform contract", "[tar][netqual]") {
-    // Pattern: test_tar_proc_etw.cpp — the collector compiles everywhere;
-    // Windows reads the real since-boot counters, elsewhere the no-op contract
-    // is pinned. Counter VALUES are host-dependent; assert shape, not history.
+TEST_CASE("netqual: collect_netqual_boot off-Windows no-op contract", "[tar][netqual]") {
+    // The platform collector itself is NOT driven from a unit test — it reads
+    // live OS counters and belongs to the harness/UAT, matching how the ETW /
+    // ARP / DNS collectors are treated (docs/tar-implementer.md,
+    // test_tar_proc_etw.cpp). Here we pin only the cross-platform contract: off
+    // Windows the collector is a clean nullopt no-op. The row's warehouse
+    // persistence is covered cross-platform by the insert_netqual_boot_row
+    // round-trip test above (hand-built row); the Windows since-boot read is a
+    // UAT concern.
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
-    auto row = yuzu::tar::collect_netqual_boot(now);
-#ifdef _WIN32
-    REQUIRE(row.has_value());
-    CHECK(row->ts == now);
-    CHECK(row->boot_ts > 0);
-    CHECK(row->boot_ts <= now);
-    CHECK(row->window_s == now - row->boot_ts);
-    // Any live Windows host has sent TCP segments by the time tests run.
-    CHECK(row->segs_out > 0);
-    CHECK(row->retrans_segs >= 0);
-    CHECK(row->snapshot_id == 0); // the caller's to fill
-    // ...and the row round-trips into the warehouse tier.
-    auto t = make_test_db();
-    row->snapshot_id = 7;
-    REQUIRE(t.db.insert_netqual_boot_row(*row));
-    auto res = t.db.execute_query("SELECT boot_ts, window_s, segs_out FROM netqual_boot");
-    REQUIRE(res.has_value());
-    REQUIRE(res->rows.size() == 1);
-    CHECK(res->rows[0][0] == std::to_string(row->boot_ts));
+#ifndef _WIN32
+    CHECK_FALSE(yuzu::tar::collect_netqual_boot(now).has_value());
 #else
-    CHECK_FALSE(row.has_value()); // Linux/macOS baselines are a follow-up
+    (void)now; // Windows since-boot read is exercised by UAT, not here
 #endif
 }
 
