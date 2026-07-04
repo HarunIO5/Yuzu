@@ -496,7 +496,8 @@ spec:
           degrades to empty otherwise. NOTE: the one-time HISTORICAL backfill (all
           PREVIOUSLY mapped drives, from the registry / fstab / event logs) is
           seeded at agent init, so it materializes on the first agent restart
-          AFTER you enable this. See process_enabled for disable semantics.
+          AFTER you enable this. See software_enabled for disable semantics (same
+          opt-in posture; disabling leaves existing rows queryable).
           Requires agent v0.12.0+; older agents silently ignore. Valid:
           "true" | "false".
         validation:

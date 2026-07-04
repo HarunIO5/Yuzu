@@ -1273,8 +1273,11 @@ GROUP BY (ts / 3600) * 3600, name, record_type)";
 
     // ── Mapped-drive rollups (capability-map §3.8) — per (direction, mount, remote) ──
     // Only live appeared/removed transitions roll up. `historical` backfill rows
-    // carry the artifact time (or 0), which falls outside every hourly window, so
-    // they never contribute to a count — no special-casing needed.
+    // are EXCLUDED by the action filter: a backfill row can carry a RECENT artifact
+    // timestamp (registry last-write, event-log time) that lands inside the current
+    // hour, so without the filter its group would emit a $MapDrive_Hourly row with
+    // both counts zero. `username` is intentionally dropped from the hourly grain
+    // (aggregate-by-mapping, matching process_hourly which drops pid/cmdline).
     if (source_name == "mapdrive") {
         if (target_suffix == "hourly") {
             return R"(INSERT INTO mapdrive_hourly (hour_ts, direction, local_mount, remote_path, remote_host, appear_count, remove_count)
@@ -1282,7 +1285,7 @@ SELECT (ts / 3600) * 3600, direction, local_mount, remote_path, remote_host,
        SUM(CASE WHEN action = 'appeared' THEN 1 ELSE 0 END),
        SUM(CASE WHEN action = 'removed' THEN 1 ELSE 0 END)
 FROM mapdrive_live
-WHERE ts >= ? AND ts < ?
+WHERE ts >= ? AND ts < ? AND action IN ('appeared', 'removed')
 GROUP BY (ts / 3600) * 3600, direction, local_mount, remote_path, remote_host)";
         }
     }

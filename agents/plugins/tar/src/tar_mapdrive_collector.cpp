@@ -26,6 +26,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -218,10 +219,22 @@ std::string word_after(const std::string& line, const std::string& marker) {
     return line.substr(start, pos - start);
 }
 
-// popen/_popen capture (constant command strings only — see the header note; no
-// untrusted value is ever interpolated into these commands).
+// cpp-conventions.md §Shell/process boundaries: this is a popen/_popen shell
+// site. DOCUMENTED EXCEPTION (a shell is used rather than argv-style
+// CreateProcess/posix_spawn):
+//   1. Every command passed here is a COMPILE-TIME CONSTANT literal — no value
+//      from the network, registry, filesystem, or operator is ever interpolated,
+//      so there is no command-injection surface.
+//   2. The Linux tools (smbstatus/journalctl) live at distro-varying paths and we
+//      parse their line-oriented text output; an argv helper would still need a
+//      PATH lookup. The one Windows tool (wevtutil) is invoked by its ABSOLUTE
+//      System32 path (see system32_path) so PATH resolution cannot be hijacked on
+//      the privileged agent.
+//   3. Output is byte-capped (max_bytes) so a runaway tool cannot exhaust memory;
+//      the pipe is fully drained so the child never blocks on a full pipe.
 // [[maybe_unused]]: unused on the macOS stub build.
-[[maybe_unused]] std::string run_command(const std::string& cmd) {
+[[maybe_unused]] std::string run_command(const std::string& cmd,
+                                         std::size_t max_bytes = 8u * 1024 * 1024) {
     std::string out;
 #ifdef _WIN32
     FILE* pipe = _popen(cmd.c_str(), "r");
@@ -232,13 +245,24 @@ std::string word_after(const std::string& line, const std::string& marker) {
         return out;
     std::array<char, 4096> buf{};
     std::size_t n;
-    while ((n = std::fread(buf.data(), 1, buf.size(), pipe)) > 0)
-        out.append(buf.data(), n);
+    bool capped = false;
+    while ((n = std::fread(buf.data(), 1, buf.size(), pipe)) > 0) {
+        if (out.size() < max_bytes) {
+            std::size_t take = std::min(n, max_bytes - out.size());
+            out.append(buf.data(), take);
+            if (out.size() >= max_bytes)
+                capped = true;
+        }
+        // Past the cap: keep reading (discarding) so the child can finish writing
+        // rather than blocking on a full pipe — memory stays bounded by max_bytes.
+    }
 #ifdef _WIN32
     _pclose(pipe);
 #else
     pclose(pipe);
 #endif
+    if (capped)
+        spdlog::warn("TAR mapdrive: command output capped at {} bytes (tail discarded)", max_bytes);
     return out;
 }
 
@@ -515,12 +539,51 @@ void warn_capped(std::atomic<bool>& flag, const char* what, std::size_t cap) {
                      what, cap);
 }
 
+// RAII owners for the Win32 enumeration resources (cpp-conventions.md §Resource
+// ownership: manual cleanup between a throwing acquire/use and release is a
+// governance finding). from_wide / vector::push_back below can throw, so the
+// handle/buffer must free on every exit including an exceptional unwind. Same
+// shape as this file's RegKeyGuard/HiveUnloadGuard and the in-repo HandleGuard
+// (processes_plugin.cpp) / MibTableGuard (network_config_plugin.cpp).
+struct WNetEnumGuard {
+    HANDLE h{nullptr};
+    explicit WNetEnumGuard(HANDLE hh) noexcept : h(hh) {}
+    ~WNetEnumGuard() {
+        if (h)
+            WNetCloseEnum(h);
+    }
+    WNetEnumGuard(const WNetEnumGuard&) = delete;
+    WNetEnumGuard& operator=(const WNetEnumGuard&) = delete;
+};
+struct NetApiBufGuard {
+    LPVOID p{nullptr};
+    explicit NetApiBufGuard(LPVOID pp) noexcept : p(pp) {}
+    ~NetApiBufGuard() {
+        if (p)
+            NetApiBufferFree(p);
+    }
+    NetApiBufGuard(const NetApiBufGuard&) = delete;
+    NetApiBufGuard& operator=(const NetApiBufGuard&) = delete;
+};
+
+// Absolute path to a System32 tool, quoted for the shell (cpp-conventions §Shell:
+// removes PATH-hijack exposure for wevtutil on the privileged agent). Falls back
+// to the bare name if GetSystemDirectoryW fails (defensive; effectively never).
+std::string system32_path(const char* exe) {
+    wchar_t dir[MAX_PATH]{};
+    UINT n = GetSystemDirectoryW(dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH)
+        return exe; // fallback: bare name resolved via PATH
+    return "\"" + yuzu::win::from_wide(dir) + "\\" + exe + "\"";
+}
+
 // --- outbound live: currently-connected network drives (WNet) ---
 void enum_wnet_outbound(std::vector<MapDriveEntry>& out) {
     HANDLE hEnum = nullptr;
     DWORD rc = WNetOpenEnumW(RESOURCE_CONNECTED, RESOURCETYPE_DISK, 0, nullptr, &hEnum);
     if (rc != NO_ERROR)
         return; // no connected network resources (or provider unavailable)
+    WNetEnumGuard eg{hEnum}; // closes on every exit (cap return / throw / normal)
 
     std::vector<char> buffer(16384);
     for (;;) {
@@ -528,6 +591,8 @@ void enum_wnet_outbound(std::vector<MapDriveEntry>& out) {
         DWORD size = static_cast<DWORD>(buffer.size());
         rc = WNetEnumResourceW(hEnum, &count, buffer.data(), &size);
         if (rc == ERROR_MORE_DATA) {
+            // Buffer too small for this page — grow and retry (distinct from
+            // session pagination; WNet has no resume handle).
             buffer.resize(size);
             continue;
         }
@@ -553,12 +618,10 @@ void enum_wnet_outbound(std::vector<MapDriveEntry>& out) {
             if (out.size() >= kMapDriveEntryCap) {
                 static std::atomic<bool> warned{false};
                 warn_capped(warned, "live", kMapDriveEntryCap);
-                WNetCloseEnum(hEnum);
-                return;
+                return; // eg unwinds WNetCloseEnum
             }
         }
     }
-    WNetCloseEnum(hEnum);
 }
 
 // --- inbound live: remote sessions into our shares (NetSessionEnum) ---
@@ -581,36 +644,56 @@ void collect_sessions(INFO* buf, DWORD n, std::vector<MapDriveEntry>& out,
     }
 }
 
+// Drain one NetSessionEnum level, paging on ERROR_MORE_DATA via the resume
+// handle (MAX_PREFERRED_LENGTH usually returns everything in one call, but the
+// API may still page — a single call silently drops sessions past page one on a
+// busy file server). Stops at kMapDriveEntryCap with a truncation warn (§8
+// cap-with-warn); each page's buffer is freed by NetApiBufGuard even on a throw.
+// Returns the final NET_API_STATUS so the caller can branch on access-denied.
+template <typename INFO>
+NET_API_STATUS enum_sessions_level(DWORD level, LPWSTR INFO::*cname, LPWSTR INFO::*uname,
+                                   std::vector<MapDriveEntry>& out) {
+    DWORD resume = 0; // NetSessionEnum resume_handle is LPDWORD (DWORD), not DWORD_PTR
+    NET_API_STATUS s;
+    // Hard progress backstop: the cap check below only trips once `out` grows, so a
+    // (pathological) provider returning ERROR_MORE_DATA without advancing `resume`
+    // and yielding only skipped rows could otherwise spin. Real result sets need
+    // far fewer than this many pages; exceeding it means no forward progress.
+    constexpr unsigned kMaxPages = 4096;
+    unsigned pages = 0;
+    do {
+        INFO* buf = nullptr;
+        DWORD read = 0, total = 0;
+        s = NetSessionEnum(nullptr, nullptr, nullptr, level, reinterpret_cast<LPBYTE*>(&buf),
+                           MAX_PREFERRED_LENGTH, &read, &total, &resume);
+        NetApiBufGuard g{buf};
+        if (s == NERR_Success || s == ERROR_MORE_DATA)
+            collect_sessions<INFO>(buf, read, out, cname, uname); // caps internally
+        if (out.size() >= kMapDriveEntryCap) {
+            static std::atomic<bool> warned{false};
+            warn_capped(warned, "inbound", kMapDriveEntryCap);
+            return s;
+        }
+        if (s == ERROR_MORE_DATA && (read == 0 || ++pages >= kMaxPages)) {
+            spdlog::warn("TAR mapdrive: NetSessionEnum paging made no progress — stopping "
+                         "(read={}, pages={})",
+                         read, pages);
+            break; // no forward progress — bail rather than spin
+        }
+    } while (s == ERROR_MORE_DATA);
+    return s;
+}
+
 void enum_netsession_inbound(std::vector<MapDriveEntry>& out) {
     // Level 502 (rich) → fall back to level 10 → give up on access-denied.
-    PSESSION_INFO_502 b502 = nullptr;
-    DWORD read = 0, total = 0;
-    DWORD resume = 0;
-    NET_API_STATUS s = NetSessionEnum(nullptr, nullptr, nullptr, 502,
-                                      reinterpret_cast<LPBYTE*>(&b502), MAX_PREFERRED_LENGTH,
-                                      &read, &total, &resume);
-    if (s == NERR_Success || s == ERROR_MORE_DATA) {
-        collect_sessions<SESSION_INFO_502>(b502, read, out, &SESSION_INFO_502::sesi502_cname,
-                                           &SESSION_INFO_502::sesi502_username);
-        if (b502)
-            NetApiBufferFree(b502);
-        return;
-    }
-    if (s == ERROR_ACCESS_DENIED) {
-        PSESSION_INFO_10 b10 = nullptr;
-        read = 0;
-        total = 0;
-        resume = 0;
-        s = NetSessionEnum(nullptr, nullptr, nullptr, 10, reinterpret_cast<LPBYTE*>(&b10),
-                           MAX_PREFERRED_LENGTH, &read, &total, &resume);
-        if (s == NERR_Success || s == ERROR_MORE_DATA) {
-            collect_sessions<SESSION_INFO_10>(b10, read, out, &SESSION_INFO_10::sesi10_cname,
-                                              &SESSION_INFO_10::sesi10_username);
-            if (b10)
-                NetApiBufferFree(b10);
-            return;
-        }
-    }
+    NET_API_STATUS s = enum_sessions_level<SESSION_INFO_502>(
+        502, &SESSION_INFO_502::sesi502_cname, &SESSION_INFO_502::sesi502_username, out);
+    // Access is checked up front, so a 502 denial leaves `out` empty — the level-10
+    // fallback cannot double-collect.
+    if (s == ERROR_ACCESS_DENIED)
+        s = enum_sessions_level<SESSION_INFO_10>(
+            10, &SESSION_INFO_10::sesi10_cname, &SESSION_INFO_10::sesi10_username, out);
+
     // Access denied at both levels (not local-admin / Server-Operator) — degrade
     // to empty, warned once.
     static std::atomic<bool> s_denied_warned{false};
@@ -872,8 +955,8 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
     // budget on events we discard, halving the effective backfill depth. Bounded
     // read; constant query (no interpolation). Empty on access denial.
     const std::string cmd =
-        "wevtutil qe Security "
-        "/q:\"*[System[(EventID=4624)]]\" /c:5000 /f:text /rd:true 2>nul";
+        system32_path("wevtutil.exe") +
+        " qe Security /q:\"*[System[(EventID=4624)]]\" /c:5000 /f:text /rd:true 2>nul";
     auto inbound = parse_win_security_logons(run_command(cmd));
     rows.insert(rows.end(), inbound.begin(), inbound.end());
     return dedup_history(std::move(rows));

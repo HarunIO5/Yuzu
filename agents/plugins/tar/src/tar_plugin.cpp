@@ -1561,6 +1561,18 @@ private:
             (module_stream_active_ && module_stream_) ? module_stream_->method_name() : "none"));
         ctx.write_output(std::format("config|module_stream_dropped|{}",
                                      module_stream_ ? module_stream_->dropped() : 0));
+
+        // §3.8 mapdrive — the capture mechanism is fixed per-OS (no runtime/health-
+        // dependent path like process/module), so this reports the platform method
+        // for parity with the other *_capture_method keys; the full per-OS matrix is
+        // in the `compatibility` action. "none" where the source is kPlanned.
+#if defined(_WIN32)
+        ctx.write_output("config|mapdrive_capture_method|wnet");
+#elif defined(__linux__)
+        ctx.write_output("config|mapdrive_capture_method|procfs");
+#else
+        ctx.write_output("config|mapdrive_capture_method|none");
+#endif
         return 0;
     }
 

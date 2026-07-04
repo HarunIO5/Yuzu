@@ -329,6 +329,10 @@ TEST_CASE("TAR warehouse rollups: mapdrive is live + hourly only (§3.8)",
           std::string::npos);
     // direction participates in the rollup grouping.
     CHECK(rollup_sql("mapdrive", "hourly").find("direction") != std::string::npos);
+    // `historical` rows are excluded so a recent-artifact backfill row cannot emit a
+    // zero-count hourly row (adversarial-review LOW).
+    CHECK(rollup_sql("mapdrive", "hourly").find("action IN ('appeared', 'removed')") !=
+          std::string::npos);
 
     auto ddl = generate_warehouse_ddl();
     CHECK(ddl.find("mapdrive_live") != std::string::npos);
