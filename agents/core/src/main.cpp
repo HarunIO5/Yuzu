@@ -77,6 +77,13 @@ static std::unique_ptr<yuzu::agent::Agent> make_agent(yuzu::agent::Config cfg) {
     }
     cfg.agent_id = std::move(*id_result);
     spdlog::info("Agent ID: {}", cfg.agent_id);
+    // Unconditional so a service left running against the wrong address (e.g. a
+    // manual --install-service re-run that reset binPath and dropped a prior
+    // --server, or a fleet upgrade script that didn't replay --server on a silent
+    // reinstall) is diagnosable from the log alone -- the reconnect loop in run()
+    // is otherwise silent about what it's even trying to reach (Gate 4 unhappy-
+    // path finding, governance re-run).
+    spdlog::info("Server address: {}", cfg.server_address);
 
     return yuzu::agent::Agent::create(std::move(cfg));
 }
@@ -252,7 +259,21 @@ int main(int argc, char* argv[]) {
 
             bool updated_existing = false;
             if (!svc) {
-                if (GetLastError() != ERROR_SERVICE_EXISTS) {
+                DWORD create_err = GetLastError();
+                if (create_err == ERROR_SERVICE_MARKED_FOR_DELETE) {
+                    // 1072: the service was just deleted (e.g. a --remove-service
+                    // moments earlier, or a concurrent uninstall) and stays in this
+                    // state until every open handle to it closes -- typically the
+                    // exiting old process's own SCM handle. Distinguished from the
+                    // generic failure below so a scripted repair/reinstall doesn't
+                    // read "Failed to create service" as an unrelated problem when a
+                    // short retry would succeed (Gate 4 unhappy-path finding,
+                    // governance re-run).
+                    std::cerr << "Service is pending deletion from a recent removal -- "
+                                 "wait a moment and retry --install-service\n";
+                    return EXIT_FAILURE;
+                }
+                if (create_err != ERROR_SERVICE_EXISTS) {
                     std::cerr << "Failed to create service\n";
                     return EXIT_FAILURE;
                 }
@@ -391,7 +412,10 @@ int main(int argc, char* argv[]) {
 
     // Signal handling — installed only once `agent` exists, so on_signal (which
     // no-ops when g_agent is null) never silently swallows a Ctrl-C/SIGTERM that
-    // arrives during make_agent()'s work (plugin load, KV/TAR store open):
+    // arrives during make_agent()'s work (a SQLite open/write in resolve_agent_id()
+    // plus a trivial in-memory Agent construction -- the actual heavy work, plugin
+    // load and KV/TAR store open, happens later inside agent->run() below, which
+    // was already covered by this registration point before make_agent() existed):
     // extracting that work into make_agent() moved it to run *after* this
     // registration point, which would otherwise widen the pre-existing signal
     // gap to cover it too (Gate 3 cpp-expert finding, governance re-run).

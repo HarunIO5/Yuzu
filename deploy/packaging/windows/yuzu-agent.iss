@@ -333,6 +333,19 @@ begin
         Break;
       Sleep(1000);
     end;
+    { The install itself still proceeds either way (Result stays '') -- a stuck
+      prior service is not fatal, CloseApplications=force below will forcibly
+      close a still-locking yuzu-agent.exe during file copy. But a poll that
+      never observed STOPPED was previously indistinguishable, in the install
+      log, from one that succeeded quickly -- at fleet scale (this installer
+      runs unattended via SCCM/Intune/GPO) that meant a slow/stuck-shutdown
+      machine looked identical to a clean upgrade in aggregate reporting. Log it
+      so a fleet log-aggregation pipeline (via /LOG=) can flag it (Gate 6 sre
+      finding, governance re-run). }
+    if ResultCode <> 0 then
+      Log('PrepareToInstall: prior YuzuAgent service did not reach STOPPED ' +
+          'within the 15s poll window; proceeding with install regardless ' +
+          '(CloseApplications=force will handle a still-locked executable).');
   end;
 end;
 

@@ -1244,11 +1244,18 @@ REM Register the service (binPath is written for you, including the internal
 REM --service marker the agent needs to run under the SCM control protocol)
 yuzu-agent.exe --install-service
 
-REM Point it at your server / data dir / log file via sc config, same as the installer does.
-REM Quote the executable path ON ITS OWN (nested "" inside the outer quotes) --
-REM only the exe needs quoting, not the whole binPath -- so this still works
-REM unmodified if you install under a spaced path like "Program Files".
-sc.exe config YuzuAgent binPath= "\"C:\Yuzu\bin\yuzu-agent.exe\" --service --server yuzu.example.com:50051 --data-dir C:\ProgramData\Yuzu --log-file C:\Yuzu\logs\yuzu-agent.log"
+REM Point it at your server / data dir / log file via sc config -- this is the
+REM EXACT quoting convention the shipped installer's own [Run] sc.exe config
+REM line uses (empirically verified working per #1822): quote ONLY the
+REM executable path, leave --service and the flag tokens bare/individually
+REM quoted after it. sc.exe reassembles all of this back into one binPath
+REM value regardless of how many separate quoted segments the command line
+REM contains, so this still works unmodified under a spaced path like
+REM "Program Files" (Gate 4 consistency-auditor finding, governance re-run --
+REM a prior revision of this example wrapped the entire value in one outer
+REM quote pair with escaped inner quotes, a different, less copy-paste-
+REM friendly convention from what the installer itself actually ships).
+sc.exe config YuzuAgent binPath= "C:\Yuzu\bin\yuzu-agent.exe" --service --server yuzu.example.com:50051 --data-dir "C:\ProgramData\Yuzu" --plugin-dir "C:\Yuzu\plugins" --log-file "C:\Yuzu\logs\yuzu-agent.log"
 
 sc.exe start YuzuAgent
 sc.exe stop YuzuAgent
@@ -1262,6 +1269,10 @@ The service currently registers to run as **LocalSystem** (unchanged by the #182
 Re-running `--install-service` is idempotent — it updates an existing registration's binPath in place rather than failing with "service already exists", so it's safe to re-run after an upgrade. **It resets binPath to the bare exe + `--service` marker** (the same minimal form shown above), dropping any `--server`/`--data-dir`/`--plugin-dir`/`--log-file` a prior `sc config` had applied — always follow it with `sc.exe config` to restore your runtime args, exactly as the installer's own `[Run]` sequence does (`--install-service` then `sc config` then `sc start`). Recovery actions (3 restarts, 60s apart, resetting after 24h) are configured automatically and fire on both crashes and clean-exit-with-error.
 
 > **Important:** the `--service` flag tells the binary to speak the SCM control protocol (`ServiceMain`/`SetServiceStatus`) instead of running as a console program — it is added automatically by `--install-service` and must be present in any `sc.exe`/manually-crafted binPath for the agent. Omitting it reproduces the pre-fix behavior: `sc start` fails with error 1053. Do **not** add `--service` when wrapping the agent with NSSM (below) — NSSM launches the agent as an ordinary child process, not via the SCM itself, so the agent would try (and fail) to connect to a dispatcher that isn't there.
+
+> **Fleet-upgrade gotcha:** because `--install-service` always resets binPath to the bare minimal form, a silent/unattended re-run of the shipped installer (e.g. an SCCM/Intune package upgrade) that does **not** re-supply the original `/SERVER=`/`/TOKEN=`/`/NOTLS` parameters on that specific invocation will reconfigure the agent back to `localhost:50051` with TLS on — and because the SCM protocol now actually works (post-#1822), the service **starts successfully** against that wrong address instead of failing loudly the way it always did before this fix. The agent goes dark from the fleet with no installer-visible error. Always replay the same install-time parameters on every upgrade run, not just the first install.
+
+**If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`) — it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** (the agent failed to construct — bad `agent.db`, SQLite/config problem; see the log), **specific error 2** (the agent stopped on its own without a stop/shutdown request — unexpected, check the log for what `run()` returned early on), **specific error 3** (an unhandled exception reached the service dispatcher — check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives.
 
 ### Server: sc.exe (native wrapper not yet available)
 

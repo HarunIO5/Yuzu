@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <iostream>
 #include <mutex>
 
 namespace {
@@ -143,6 +144,15 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
 
         report_status(SERVICE_START_PENDING, NO_ERROR, 0, 30000);
 
+        // No checkpoint-bumping thread runs during this call because it's cheap
+        // today (make_agent() in main.cpp: an in-process flag check, one small
+        // SQLite open/write, and a trivial in-memory constructor -- the real
+        // startup cost, plugin load and KV/TAR store open, is deliberately deferred
+        // into agent->run() below, past the RUNNING report). If a future change
+        // ever moves real work into the factory ahead of run(), this single
+        // 30s-hint START_PENDING report stops being long enough and needs either a
+        // periodic checkpoint bump or a longer hint (Gate 6 sre finding, governance
+        // re-run).
         auto agent = g_factory ? g_factory() : nullptr;
         if (!agent) {
             spdlog::critical(
@@ -150,6 +160,16 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
             report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, /*specific=*/1);
             return;
         }
+
+        // Constructed here, BEFORE g_agent is published below, so the "guard exists"
+        // invariant is structural rather than resting on every statement between
+        // publish and construction happening to be non-throwing today (it is, but a
+        // future edit inserting a throwing statement in that window would otherwise
+        // silently reopen the pre-#1822 UAF gap this guard exists to close --
+        // Gate 3 cpp-safety hardening, governance re-run). `agent` is still declared
+        // first, so reverse-declaration-order destruction still runs this guard
+        // before `agent`'s own destructor on every exit path below.
+        AgentUnpublisher unpublisher;
 
         bool stop_already_requested = false;
         {
@@ -168,7 +188,6 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
             if (stop_already_requested)
                 g_agent->stop();
         }
-        AgentUnpublisher unpublisher; // destructs before `agent` on every exit below
 
         // Report RUNNING now, before run() -- run()'s reconnect loop is unbounded
         // while the server is unreachable (agent.cpp), so waiting for it to return
@@ -212,6 +231,12 @@ namespace yuzu::agent::win {
 int run_service(std::move_only_function<std::unique_ptr<Agent>()> factory) {
     g_factory = std::move(factory);
 
+    // const_cast is safe here: SERVICE_TABLE_ENTRYW.lpServiceName is only ever READ
+    // by StartServiceCtrlDispatcherW for an OWN_PROCESS service (used to match the
+    // ServiceMain callback to a name) -- nothing writes through it, so casting away
+    // constness off the constexpr kServiceName array is not UB in practice, just an
+    // artifact of the Win32 API predating const-correctness (Gate 3 cpp-safety/
+    // cpp-expert finding, governance re-run).
     SERVICE_TABLE_ENTRYW table[] = {
         {const_cast<LPWSTR>(kServiceName), service_main},
         {nullptr, nullptr},
@@ -220,6 +245,17 @@ int run_service(std::move_only_function<std::unique_ptr<Agent>()> factory) {
     if (!StartServiceCtrlDispatcherW(table)) {
         auto err = GetLastError();
         if (err == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
+            // This specific error means the process was NOT launched by the SCM --
+            // i.e. --service was passed at a real interactive console by mistake --
+            // so a console is guaranteed present here. spdlog's stderr sink is
+            // suppressed whenever --service is passed (service_mode gates it in
+            // main.cpp, since it can't tell "really under the SCM" from "misused at
+            // a console" until this exact call fails), so this specific message
+            // would otherwise land only in the log file the operator isn't looking
+            // at. Print directly so the one case where we KNOW a console exists
+            // actually reaches it (Gate 4 unhappy-path finding, governance re-run).
+            std::cerr << "--service is for use by the Windows Service Control Manager; "
+                         "run without --service for interactive/console mode\n";
             spdlog::error(
                 "--service is for use by the Windows Service Control Manager; "
                 "run without --service for interactive/console mode");
