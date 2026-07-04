@@ -65,7 +65,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--oidc-client-id` | *(none)* | OIDC application (client) ID. Env: `YUZU_OIDC_CLIENT_ID`. |
 | `--oidc-client-secret` | *(none)* | OIDC client secret. Env: `YUZU_OIDC_CLIENT_SECRET`. |
 | `--oidc-redirect-uri` | *(auto)* | OIDC redirect URI. If omitted, auto-computed from the web address and port. Must match the registered redirect in your identity provider. Env: `YUZU_OIDC_REDIRECT_URI`. |
-| `--oidc-admin-group` | *(none)* | Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login. Env: `YUZU_OIDC_ADMIN_GROUP`. |
+| `--oidc-admin-group` | *(none)* | Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login. Env: `YUZU_OIDC_ADMIN_GROUP`. (Value is trimmed automatically, same as `--saml-admin-group` — #1830.) |
 | `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
 | `--saml-idp-entity-id` | *(none)* | **SAML 2.0 SP.** Entity ID URI of the IdP (must match what the IdP uses in its assertions). Required and validated at startup — omitting it (along with the other four `--saml-*` flags) leaves SAML disabled. Env: `YUZU_SAML_IDP_ENTITY_ID`. |
 | `--saml-idp-sso-url` | *(none)* | **SAML 2.0 SP.** IdP's HTTP-Redirect SSO endpoint URL. Env: `YUZU_SAML_IDP_SSO_URL`. |
@@ -816,7 +816,7 @@ Yuzu supports SAML 2.0 SP-initiated single sign-on as an alternative to OIDC for
 
 ### Configuration
 
-All five flags must be supplied for correct operation, and all five are validated at startup — a partial set leaves SAML disabled (fail-closed) until every flag is set.
+All five flags below must be supplied for correct operation, and all five are validated at startup — a partial set leaves SAML disabled (fail-closed) until every flag is set. The two group→role flags further down are optional and independent of this five-flag gate.
 
 | Flag | Env var | Description |
 |---|---|---|
@@ -839,9 +839,42 @@ Example startup:
   --saml-sp-acs-url    "https://yuzu.example.com/saml/acs"
 ```
 
+### Role mapping
+
+Two additional, optional flags grant admin access via IdP-attested group
+membership — mirroring the OIDC `--oidc-admin-group` mechanism:
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--saml-group-attribute` | `YUZU_SAML_GROUP_ATTRIBUTE` | `<Attribute Name="...">` in the assertion's `<AttributeStatement>` whose `<AttributeValue>`s are group identifiers. |
+| `--saml-admin-group` | `YUZU_SAML_ADMIN_GROUP` | The group value (from `--saml-group-attribute`) that grants `role=admin`. |
+
+A session is `role=admin` only when both flags are set and the assertion's
+group list contains an **exact match** for `--saml-admin-group`; otherwise
+(including when either flag is left empty, the default) the session is
+`role=user`. Group values are read from the same signature-verified assertion
+`NameID` is read from, and `NameID`/email/display name are never treated as
+group-membership evidence. Changing either flag requires a server restart
+(no hot-reload). JIT elevation remains non-functional for SAML users (no
+local `users` row in auth.db) regardless of role — a group-mapped admin gets
+`role=admin` directly at login, not via the elevation endpoint. Unlike OIDC,
+SAML group values are **not** synced into `rbac_store` — group-scoped RBAC
+role assignments do not apply to SAML principals (they only feed the
+admin-or-user decision above) — deferred pending source-aware group
+resolution, see issue #1832.
+
+> **Configuring `--saml-admin-group` against a real IdP:** the value must be
+> the exact identifier the IdP puts in the assertion, not a display name —
+> Entra ID sends group **object ID GUIDs**, not group names, so configure the
+> GUID. Matching is case-sensitive. A user in more than ~150 Entra groups hits
+> **"groups overage"**: Entra omits the `groups` claim entirely for that
+> assertion (substituting a Graph API link), so such users can never resolve
+> to admin via `--saml-admin-group` regardless of actual membership — use a
+> dedicated low-membership group for the mapping. At most 64 group values
+> from the configured attribute are considered.
+
 ### Known limitations in this release
 
-- **Role:** All SAML users are permanently `role=user`. JIT elevation is non-functional for SAML users (no local `users` row in auth.db). For admin access, use OIDC or a local account.
 - **MFA step-up:** MFA step-up is not supported for SAML sessions — a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement`. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
 - **`--auth-mode=sso-only`:** Requires OIDC configuration. A SAML-only deployment cannot disable local-password login.
 - **HA / multi-replica:** Pending AuthnRequest state is in-process. Configure load-balancer sticky sessions (session affinity) on `/auth/saml/start` + `/saml/acs`. Without affinity, approximately `(N−1)/N` of logins fail as unsolicited. OIDC shares this limitation.
