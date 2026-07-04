@@ -4857,13 +4857,20 @@ Returns recent analytics events. Accepts `limit` as a query parameter (default 5
 
 Returns the status of the NVD (National Vulnerability Database) sync.
 
-Response fields: `enabled`, `syncing`, `last_sync_time`, `last_error`, and
-`total_cves`. **`total_cves` is a count of distinct CVEs** in the local store.
+Response fields: `enabled`, `syncing`, `last_sync_time`, `last_error`,
+`total_cves`, `backfill_complete`, and `backfill_oldest_published`.
+**`total_cves` is a count of distinct CVEs** in the local store.
 (Prior to the CPE-range-matching change it counted one row per affected
 product, so a multi-product CVE inflated the figure — after upgrade the number
 reads lower even once fully synced, and reads near-zero briefly after the
 one-time schema migration until the next sync repopulates the mirror. This is
 expected, not data loss.)
+
+`backfill_complete` (boolean) reports whether the newest-first catalog backfill
+has reached its configured floor. `backfill_oldest_published` (ISO 8601 string)
+is the progress cursor — the `published` date of the oldest CVE fetched so far,
+walking backwards. During the initial backfill `total_cves` climbs continuously
+and `last_sync_time` stays empty until the backfill floor is first reached.
 
 #### `POST /api/nvd/sync`
 

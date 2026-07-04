@@ -20,11 +20,12 @@ This document covers Yuzu server deployment, configuration, and ongoing administ
 12. [SAML 2.0 SP Configuration](#saml-20-sp-configuration)
 13. [Data Storage and Encryption](#data-storage-and-encryption)
 14. [PostgreSQL Substrate](#postgresql-substrate)
-15. [Retention Settings](#retention-settings)
-16. [Settings API Reference](#settings-api-reference)
-17. [Deployment](#deployment)
-18. [Windows Service Installation](#windows-service-installation)
-19. [Planned Features](#planned-features)
+15. [NVD CVE sync](#nvd-cve-sync)
+16. [Retention Settings](#retention-settings)
+17. [Settings API Reference](#settings-api-reference)
+18. [Deployment](#deployment)
+19. [Windows Service Installation](#windows-service-installation)
+20. [Planned Features](#planned-features)
 
 ---
 
@@ -1003,6 +1004,29 @@ Secret columns in PostgreSQL are **envelope-encrypted app-side** (ADR-0010): eac
 Decrypt failures are counted per store and failure class as `yuzu_server_secret_decrypt_failures_total{store, failure_class}` (classes: `tag_mismatch`, `kek_unresolvable`, `malformed_blob`, `crypto_failure`) once the codec is wired into a serving store. A sustained non-zero `kek_unresolvable` rate after a deployment or restore is the primary backup-skew alert signal; a single-row `tag_mismatch` is the tamper signal and warrants investigation, not retry.
 
 **Break-glass (KEK permanently lost).** KEK loss is painful, never a total lockout: admin sign-in survives by design (MFA recovery codes are verify-only hashes and need no KEK — sign in with a recovery code and re-enroll TOTP), and every gated secret class is re-enrollable/re-issuable (webhook secrets re-issued, offload credentials re-issued, OIDC client secret re-pasted). The explicit voided-secrets boot flag described in ADR-0010 ships with the first secret-bearing store migration.
+
+---
+
+## NVD CVE sync
+
+The server maintains a local mirror of the NVD (National Vulnerability Database) CVE
+catalog, used by the fleet-topology vulnerability overlay. On first boot it runs a
+newest-first **backfill** of the full catalog, then switches to periodic freshness
+re-checks. Configuration is via CLI flags at startup (each has an env-var equivalent).
+
+| CLI Flag | Env | Default | Description |
+|---|---|---|---|
+| `--nvd-api-key` | `YUZU_NVD_API_KEY` | *(none)* | NVD API key. Raises the NVD rate limit substantially — the difference between the initial backfill taking minutes versus hours. |
+| `--nvd-proxy` | `YUZU_NVD_PROXY` | *(none)* | HTTP proxy URL for egress to `services.nvd.nist.gov`, for deployments with restricted outbound network access. |
+| `--nvd-sync-interval` | `YUZU_NVD_SYNC_INTERVAL` | `4` | Freshness re-check cadence, in hours, once the backfill has completed. |
+| `--nvd-backfill-years` | `YUZU_NVD_BACKFILL_YEARS` | `8` | How far back (in years) the newest-first backfill walks. `0` = full history. |
+| `--no-nvd-sync` | — | off | Disable NVD sync entirely. |
+
+> **Note:** the initial backfill makes sustained HTTPS requests to `services.nvd.nist.gov`
+> and grows the local NVD database to hundreds of MB. Without an API key it can take hours.
+> The backfill is resumable — after a restart it resumes from where it left off rather than
+> starting over. Sync progress is observable via `GET /api/nvd/status`
+> (`backfill_complete`, `backfill_oldest_published`, `total_cves`).
 
 ---
 
