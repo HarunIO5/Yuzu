@@ -28,7 +28,12 @@ public:
     NvdSyncManager& operator=(const NvdSyncManager&) = delete;
 
     void start(); // Start background sync thread
-    void stop();  // Signal stop and join thread
+    // Signal stop and join the sync thread. Returns true when the manager is safe
+    // to destroy (thread joined cleanly, or never started). Returns FALSE when a
+    // wedged thread had to be detached and still references this manager — the
+    // owner MUST then leak the manager (not destroy it) to avoid a teardown UAF
+    // (see ServerImpl::stop(), #1867).
+    [[nodiscard]] bool stop();
 
     // Synchronous sync on the CALLING thread (blocks until complete). Used by
     // tests; NOT for request handlers — see request_sync().
@@ -76,6 +81,10 @@ private:
     std::atomic<bool> stopping_{false};
     // Set by request_sync() to make the loop run a sync at its next wake.
     bool sync_requested_{false}; // guarded by mu_
+    // Set true when sync_loop() actually returns. stop() waits on this (bounded
+    // grace) so a thread wedged in an uncancellable fetch (#1867) is detached +
+    // leaked rather than joined-forever, letting the process exit.
+    std::atomic<bool> finished_{false};
 
 #ifdef __cpp_lib_jthread
     void sync_loop(std::stop_token stop);

@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace yuzu::server {
@@ -64,7 +65,9 @@ NvdSyncManager::NvdSyncManager(std::shared_ptr<NvdDatabase> db,
       backfill_years_{backfill_years} {}
 
 NvdSyncManager::~NvdSyncManager() {
-    stop();
+    // On the detach path stop() returns false; the owner (ServerImpl::stop())
+    // releases the unique_ptr so the dtor normally doesn't run there. Discard.
+    (void)stop();
 }
 
 void NvdSyncManager::start() {
@@ -72,6 +75,7 @@ void NvdSyncManager::start() {
         return; // already running
     }
     stopping_.store(false);
+    finished_.store(false);
 #ifdef __cpp_lib_jthread
     sync_thread_ = std::jthread([this](std::stop_token stop) { sync_loop(stop); });
 #else
@@ -82,11 +86,11 @@ void NvdSyncManager::start() {
                  backfill_years_);
 }
 
-void NvdSyncManager::stop() {
+bool NvdSyncManager::stop() {
     if (!sync_thread_.joinable()) {
-        return;
+        return true; // never started or already cleanly stopped — safe to destroy
     }
-    stopping_.store(true); // abort a long backfill/freshness pass between windows
+    stopping_.store(true); // cooperative: abort a long backfill/freshness pass between windows
 #ifdef __cpp_lib_jthread
     sync_thread_.request_stop();
 #else
@@ -96,8 +100,27 @@ void NvdSyncManager::stop() {
         std::lock_guard<std::mutex> lock{mu_};
         cv_.notify_all();
     }
-    sync_thread_.join();
-    spdlog::info("NVD sync manager stopped");
+
+    // #1867 bounded join. Cooperative cancellation (stopping_) aborts between
+    // windows, but a fetch wedged mid-page (see #1879) can still take a while;
+    // wait a short grace for a clean exit, then detach + signal the owner to LEAK
+    // this manager (ServerImpl::stop()) rather than hang shutdown or UAF freed
+    // members from the abandoned thread.
+    constexpr auto kGrace = std::chrono::seconds(5);
+    const auto deadline = std::chrono::steady_clock::now() + kGrace;
+    while (!finished_.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (finished_.load()) {
+        sync_thread_.join();
+        spdlog::info("NVD sync manager stopped");
+        return true;
+    }
+    spdlog::warn("NVD sync thread did not exit within {}s (stuck in a fetch?); detaching + leaking "
+                 "the manager to avoid wedging shutdown / a teardown UAF (see #1867)",
+                 kGrace.count());
+    sync_thread_.detach();
+    return false;
 }
 
 void NvdSyncManager::sync_now() {
@@ -170,6 +193,10 @@ void NvdSyncManager::sync_loop() {
         lock.unlock();
         do_sync();
     }
+
+    // Signal a clean exit so stop() can join() within its grace instead of
+    // detaching (#1867).
+    finished_.store(true);
 }
 
 void NvdSyncManager::do_sync() {

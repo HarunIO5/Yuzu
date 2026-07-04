@@ -4883,6 +4883,13 @@ evaluates full CPE version ranges (`versionStartIncluding/Excluding`,
 `versionEndIncluding/Excluding`, exact and wildcard). Product identity is
 matched by name (case-insensitive); vendor-precise CPE identity is a planned
 enhancement (ADR-0018), so name-collision false positives are possible.
+In each match, `fixed_in` carries the range's **exclusive upper bound**
+(`versionEndExcluding`) when present; it is empty for inclusive-end, exact,
+or wildcard matches — empty means "no fix boundary derivable from the range
+shape", not "no fix available". Distro revision markers (e.g. Debian `~` in
+`1.0.0~deb1`) are compared as plain separators rather than pre-release
+markers, so distro-backported versions can produce false negatives until
+backport-aware matching (M1b/OVAL) lands.
 
 ---
 
