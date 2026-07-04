@@ -4,8 +4,8 @@
 /// The `installed_software` daily-sync source (ADR-0016) — source #1 of the
 /// agent sync framework. Collects the machine-wide installed-software inventory
 /// by invoking the existing `installed_apps` plugin in-process (`LocalDispatcher`,
-/// action `list`) and renders it into the canonical wire form the server
-/// expects. NO per-user data (machine scope only — no PII).
+/// action `list_inventory` — blob contract v2) and renders it into the canonical
+/// wire form the server expects. NO per-user data (machine scope only — no PII).
 
 #include "sync_scheduler.hpp"
 
@@ -18,16 +18,29 @@ namespace yuzu::agent {
 
 /// One machine-scope installed-software entry (mirror of the server's
 /// SoftwareEntry; kept agent-local so this module needs no server headers).
+/// Blob contract v2: member order == the wire/hash field order (append-only).
+/// Fields an ecosystem does not store stay EMPTY, never synthesised.
 struct SwEntry {
     std::string name;
-    std::string version;
-    std::string publisher;
+    std::string version; // upstream version, release/revision stripped
+    std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
+    std::string kind;      // "package" | "app"
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|homebrew
+    std::string epoch;
+    std::string release;   // rpm RELEASE / deb revision / apk pkgrel
+    std::string arch;
+    std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
+    std::string distro_id;        // /etc/os-release ID
+    std::string distro_version;   // /etc/os-release VERSION_ID
 };
 
-/// Parse `installed_apps` `list` output (pipe-delimited `app|name|version|
-/// publisher|install_date` lines) into machine-scope entries. `user_app|`,
-/// `error|`, and the `No applications found` sentinel are ignored.
+/// Parse `installed_apps` `list_inventory` output (pipe-delimited
+/// `inv|name|version|publisher|install_date|kind|ecosystem|epoch|release|arch|
+/// signature_status|distro_id|distro_version` lines) into machine-scope
+/// entries. Rows with any other prefix (`app|`, `user_app|`, `error|`, ...) are
+/// ignored; missing trailing tokens read as empty fields (tolerant), tokens
+/// beyond the 12th field are dropped (fields never shift).
 YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& out);
 
 /// Canonical wire blob: sorted + deduped; fields unit-separated (0x1F), entries

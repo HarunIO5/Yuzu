@@ -4,14 +4,17 @@
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
+#include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
 #include "guardian_rule_spec.hpp"
 #include "guardian_schema_registry.hpp"
 #include "http_route_sink.hpp"
 #include "inventory_eval.hpp"
+#include "openapi_spec_access.hpp" // external-linkage accessor for discover_routes.cpp / mcp_server.cpp
 #include "rest_a4_envelope.hpp"
-#include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
+#include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
+#include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
 #include "software_inventory_store.hpp" // ADR-0016: typed installed-software fleet read
@@ -182,17 +185,10 @@ std::string ok_json(std::string_view data_json) {
     return JObj().raw("data", data_json).raw("meta", R"({"api_version":"v1"})").str();
 }
 
-std::string error_json(std::string_view message, int code = 0) {
-    JObj j;
-    if (code != 0) {
-        auto err = JObj().add("code", code).add("message", message).str();
-        j.raw("error", err);
-    } else {
-        j.add("error", message);
-    }
-    j.raw("meta", R"({"api_version":"v1"})");
-    return j.str();
-}
+// The legacy bare error_json() helper is retired (#1470): every /api/v1 error
+// body now goes through detail::a4_error(res, msg) (code derived from
+// res.status) or detail::a4_denial, so it carries correlation_id +
+// retry_after_ms per agentic-first §A4.
 
 std::string list_json(std::string_view data_json, int64_t total, int64_t start = 0,
                       int64_t page_size = 50) {
@@ -505,16 +501,34 @@ const std::string& openapi_spec() {
         "properties": {
           "error": {
             "type": "object",
-            "required": ["code", "message", "correlation_id"],
+            "required": ["code", "message", "correlation_id", "retry_after_ms"],
             "properties": {
               "code": {"type": "integer", "description": "HTTP status code echoed into the body for self-describing error frames."},
               "message": {"type": "string", "description": "One-sentence human-readable summary."},
               "correlation_id": {"type": "string", "description": "Server-issued grep token of form `req-<hex-ms>-<hex-seq>`. Also echoed in the X-Correlation-Id response header and (when audit emits) the audit row detail field."},
               "retry_after_ms": {"type": ["integer", "null"], "format": "int64", "description": "Always present in an A4 error body; null unless the condition is retryable, in which case it advises the worker to back off this many milliseconds before retrying (e.g. 503 warmup)."},
-              "remediation": {"type": "string", "description": "Optional natural-language hint for self-recovery."}
+              "remediation": {"type": "string", "description": "Optional natural-language hint for self-recovery."},
+              "permission": {"type": "string", "description": "kPermissionDenied specialisation (§A4): on a 403 permission denial, the missing grant as `<securable_type>:<operation>` (e.g. Tag:Write). Absent when the denial is not permission-specific (e.g. a whole-route admin gate)."},
+              "approval_id": {"type": "string", "description": "kApprovalRequired specialisation (§A4): the id of the approval a worker must poll instead of re-issuing the request. Present only once approval re-dispatch ships (Phase 2)."},
+              "status_url": {"type": "string", "description": "kApprovalRequired specialisation (§A4): the GET /api/v1/approvals/{id} URL to poll for approval_id's status. Paired with approval_id."}
             }
           },
           "meta": {"type": "object", "properties": {"api_version": {"type": "string"}}}
+        }
+      },
+      "Approval": {
+        "type": "object",
+        "description": "A queued instruction-approval request. Returned by GET /api/v1/approvals/{id} (the A4 status_url target).",
+        "properties": {
+          "id": {"type": "string"},
+          "definition_id": {"type": "string"},
+          "status": {"type": "string", "enum": ["pending", "approved", "rejected", "expired"]},
+          "submitted_by": {"type": "string"},
+          "submitted_at": {"type": "integer", "format": "int64", "description": "Unix epoch seconds."},
+          "reviewed_by": {"type": "string", "description": "Empty until reviewed."},
+          "reviewed_at": {"type": "integer", "format": "int64", "description": "Unix epoch seconds; 0 until reviewed."},
+          "review_comment": {"type": "string"},
+          "scope_expression": {"type": "string"}
         }
       }
     }
@@ -621,7 +635,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Query inventory across agents with filter expression", "tags": ["Inventory"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Filter by agent ID"}, "plugin": {"type": "string", "description": "Filter by plugin name"}, "since": {"type": "integer", "description": "Only records after this epoch"}, "until": {"type": "integer", "description": "Only records before this epoch"}, "limit": {"type": "integer", "default": 100}}}}}}, "responses": {"200": {"description": "Matching inventory records"}}}
     },
     "/inventory/software": {
-      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Requires Inventory:Read. Results are scoped to the caller's management groups; out-of-scope devices are dropped and counted in devices_omitted (a positive value means matching software exists outside your scope — an empty/short result does NOT mean the software is absent fleet-wide). Capped at limit rows (max 1000); result_truncated_by_cap=true means more exist past the cap (keyset pagination is a follow-up). On store degradation the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Unauthenticated"}, "403": {"description": "Requires Inventory:Read"}, "503": {"description": "Software inventory store unavailable or degraded"}}}
+      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app), ecosystem (rpm|deb|apk|pacman|windows|macos|homebrew), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version — fields an ecosystem does not store are empty, never synthesised. Requires Inventory:Read. Results are scoped to the caller's management groups; out-of-scope devices are dropped and counted in devices_omitted (a positive value means matching software exists outside your scope — an empty/short result does NOT mean the software is absent fleet-wide). Capped at limit rows (max 1000); result_truncated_by_cap=true means more exist past the cap (keyset pagination is a follow-up). On store degradation the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Unauthenticated"}, "403": {"description": "Requires Inventory:Read"}, "503": {"description": "Software inventory store unavailable or degraded"}}}
     },)json"
         // Split again (MSVC C2026 16,380-byte cap); concatenated at compile time.
         // NOTE: the preceding literal segment (incl. /inventory/software) is ~12 KB —
@@ -640,7 +654,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Grant or revoke a user's JIT-admin-elevation eligibility (SOC 2 CC6.3/CC6.6)", "tags": ["Users"], "description": "Admin (or an active elevation) + MFA step-up. Sets the per-user users.elevation_eligible flag. Self-grant is blocked. Setting eligible=false also terminates any in-flight elevation for that user. Errors use the A4 envelope (correlation_id + remediation).", "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["eligible"], "properties": {"eligible": {"type": "boolean"}}}}}}, "responses": {"200": {"description": "{status: ok}"}, "400": {"description": "Invalid username or non-boolean body"}, "401": {"description": "Not authenticated"}, "403": {"description": "Not admin, MFA step-up refused, or self-grant"}, "404": {"description": "User not found"}, "503": {"description": "No auth.db (--data-dir unset)"}}}
     },
     "/elevate": {
-      "post": {"summary": "Activate a time-boxed JIT admin elevation on the current cookie session (SOC 2 CC6.3/CC6.6)", "tags": ["Authentication"], "description": "Cookie session only (API/MCP tokens get 401 and can never elevate). Caller must be elevation_eligible, have MFA enrolled (mandatory regardless of --mfa-enforcement), and pass a fresh MFA step-up. duration_secs defaults to and is clamped by --jit-max-elevation-secs; a negative value is 400. The grant audit is fail-closed. Errors use the A4 envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["justification"], "properties": {"justification": {"type": "string", "description": "Required, non-empty; control bytes sanitised; truncated to 1 KiB at a UTF-8 code-point boundary"}, "duration_secs": {"type": "integer", "minimum": 1}}}}}}, "responses": {"200": {"description": "{status: ok, expires_in}"}, "400": {"description": "Blank/missing justification, wrong-typed field, or negative duration"}, "401": {"description": "Not authenticated, no cookie (token caller), or session dissolved mid-request"}, "403": {"description": "Not eligible, eligibility read failed, or no MFA enrolled"}, "500": {"description": "Grant audit unrecordable — elevation rolled back (Sec-Audit-Failed header)"}, "503": {"description": "No auth.db"}}}
+      "post": {"summary": "Activate a time-boxed JIT admin elevation on the current cookie session (SOC 2 CC6.3/CC6.6)", "tags": ["Authentication"], "description": "Cookie session only (API/MCP tokens get 401 and can never elevate). Caller must be elevation_eligible, have MFA enrolled (mandatory regardless of --mfa-enforcement), and pass a fresh MFA step-up. duration_secs defaults to and is clamped by --jit-max-elevation-secs; a negative value is 400. The grant audit is fail-closed. Errors use the A4 envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["justification"], "properties": {"justification": {"type": "string", "description": "Required, non-empty; control bytes sanitised; truncated to 1 KiB at a UTF-8 code-point boundary"}, "duration_secs": {"type": "integer", "minimum": 1}}}}}}, "responses": {"200": {"description": "{status: ok, expires_in: <true remaining seconds, clamped to the session's own absolute expiry>, expires_at: <RFC3339 UTC timestamp>}"}, "400": {"description": "Blank/missing justification, wrong-typed field, or negative duration"}, "401": {"description": "Not authenticated, no cookie (token caller), session dissolved mid-request, or the session is already at/past its own absolute expiry (dead-window guard)"}, "403": {"description": "Not eligible, eligibility read failed, or no MFA enrolled"}, "500": {"description": "Grant audit unrecordable — elevation rolled back (Sec-Audit-Failed header)"}, "503": {"description": "No auth.db"}}}
     },
     "/elevate/revoke": {
       "post": {"summary": "Step an active JIT elevation down early", "tags": ["Authentication"], "description": "Cookie session only; no MFA step-up (reduces privilege). Always 200; whether a window was active is recorded in the role.elevation.revoked audit detail.", "responses": {"200": {"description": "{status: ok}"}, "401": {"description": "Not authenticated"}}}
@@ -714,6 +728,11 @@ const std::string& openapi_spec() {
     "/executions/{id}": {
       "get": {"summary": "Fetch the final state of a single execution (#1088)", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Requires Execution:Read.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Final execution state", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
+        // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) before the A4 approvals row.
+        R"json(,
+    "/approvals/{id}": {
+      "get": {"summary": "Fetch a single approval by id", "tags": ["Approvals"], "description": "The versioned single-approval status endpoint, and the target of an A4 error envelope's status_url (the kApprovalRequired specialisation): a worker told its request needs approval polls this for the current status rather than re-issuing the gated request. Read-only — it never mutates the approval lifecycle (submit/approve/reject live on the legacy /api/approvals/* routes). Requires Approval:Read. 404 (A4 envelope) when no approval matches the id. Response always includes X-Correlation-Id.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Approval object", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/Approval"}, "meta": {"type": "object", "properties": {"api_version": {"type": "string"}}}}}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Approval:Read)"}, "404": {"description": "Approval not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Approval store not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    })json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) before the DEX block.
         R"json(,
     "/dex/signals": {
@@ -766,6 +785,21 @@ const std::string& openapi_spec() {
     },
     "/network/devices": {
       "get": {"summary": "Device list behind every network-quality drill", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default rtt), devices NOT reporting network this cycle (filter=not_reporting), a co-occurrence band (cooc=device|app|network_only|degraded), or one cohort's members. Cohort handling mirrors the /network dashboard fragment: the optional key selects a tag dimension and cohort_value (empty string = the untagged residual) filters to it. Rows carry the co-occurring facts (under_pressure, app_unstable) and fleet_pctile (nearest-rank position for the sort metric) — evidence for correlation, never a verdict. Device-aggregate link health — NOT audited.", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["rtt", "retrans", "throughput"], "default": "rtt"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cooc", "in": "query", "required": false, "schema": {"type": "string", "enum": ["device", "app", "network_only", "degraded"]}}, {"name": "key", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Cohort tag key to resolve per-device cohort values; empty = no cohort dimension. NOTE: the network surface uses 'key' (with a length guard, empty allowed) where /dex/perf uses 'cohort_key' (validated, default 'model') — the difference mirrors each surface's cohort-resolution model."}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, platform, cohort, rtt_ms?, retrans_pct?, throughput_bps?, net_degraded, under_pressure, app_unstable, fleet_pctile?)"}, "400": {"description": "Invalid limit"}, "503": {"description": "service unavailable"}}}
+    },
+    "/discover/permissions": {
+      "get": {"summary": "RBAC permission catalog (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Agentic-first (A1/A2, docs/agentic-first-principle.md) — every securable_type x operation pair the RbacStore recognizes, plus the full role -> allowed-operations grid (RbacStore::list_roles + get_role_permissions). Cheap pass-through over in-memory RBAC state; ETag + Cache-Control:max-age=300 + 304 revalidation, same contract as GET /guaranteed-state/schemas.", "responses": {"200": {"description": "{version, description, securable_types[], operations[], roles[].{name, description, is_system, permissions[].{securable_type, operation, effect}}}"}, "304": {"description": "Not Modified (If-None-Match matched)"}, "503": {"description": "RBAC store unavailable"}}}
+    },
+    "/discover/instructions": {
+      "get": {"summary": "Published InstructionDefinition catalog (A2 discovery)", "tags": ["Discovery"], "description": "Requires InstructionDefinition:Read. Agentic-first (A1/A2) subset of InstructionStore::query_definitions (enabled_only=true — only invokable definitions are published) carrying id/name/plugin/action/description/parameter_schema/platforms/approval_mode. parameter_schema is parsed into a nested JSON Schema object when the stored value is valid JSON, else null. Same ETag/Cache-Control/304 contract as GET /guaranteed-state/schemas, computed per-request over the live definition set.", "responses": {"200": {"description": "{version, description, instructions[].{id, name, plugin, action, description, parameter_schema, platforms, approval_mode}}"}, "304": {"description": "Not Modified"}, "503": {"description": "Instruction store unavailable"}}}
+    },
+    "/discover/routes": {
+      "get": {"summary": "REST route catalog (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Subsets the SAME hand-maintained OpenAPI document GET /api/v1/openapi.json serves (openapi_spec_json(), so the two can never show different data), so it inherits that document's known limitation: it is NOT generated from the live route table and can under-report a route that exists but was never documented. The response therefore carries \"source\":\"openapi\" plus a caveat string. RBAC requirement per route is embedded in each route's free-text description (no structured field yet), same as the source document.", "responses": {"200": {"description": "{version, source:\"openapi\", caveat, routes[].{method, path, summary, tags[], description}}"}, "304": {"description": "Not Modified"}}}
+    },
+    "/discover/scope-kinds": {
+      "get": {"summary": "Scope DSL kind + operator catalog (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Compiled-in static catalog (answers even when every store is down, like GET /guaranteed-state/schemas): the two GROUND kinds (__all__, group:<name>) that short-circuit per-device evaluation, every ATTRIBUTE kind the AgentRegistry::evaluate_scope resolver answers (from scope_kind_catalog(), agent_registry.hpp — colocated with the resolver so the two can't silently diverge), the CompOp comparison operators (via yuzu::scope::operator_token, scope_engine.hpp), and the EXISTS/LEN(...)/STARTSWITH(...) extended forms.", "responses": {"200": {"description": "{version, description, ground_kinds[], attribute_kinds[], operators[].{token,name,description}, extended_forms[], combinators[]}"}, "304": {"description": "Not Modified"}}}
+    },
+    "/discover/plugins": {
+      "get": {"summary": "Plugin/action catalog observed across connected agents (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Wraps AgentRegistry::help_json() (deduplicated plugin metadata across all currently-connected agents, richest action list wins per plugin name) with a discovery envelope. NOT a build-time manifest of every plugin that could ever load — a plugin no currently-connected agent reports is absent. Action entries are bare {name, description} pairs; per-action PARAMETER schemas are NOT available from agents and the response says so explicitly (consult GET /discover/instructions for the subset of actions that also have a published InstructionDefinition with parameter_schema).", "responses": {"200": {"description": "{version, description, limitation, plugins[].{name, version, description, actions[].{name, description}}, commands[]}"}, "304": {"description": "Not Modified"}, "503": {"description": "Agent registry unavailable"}}}
     }
   }
 })json";
@@ -850,6 +884,13 @@ bool is_safe_install_command(std::string_view s) {
 
 } // anonymous namespace
 
+// External-linkage accessor declared in openapi_spec_access.hpp — see that
+// header for why this thin wrapper exists (openapi_spec() itself stays
+// TU-local; this just forwards to it from outside the anonymous namespace).
+const std::string& openapi_spec_json() {
+    return openapi_spec();
+}
+
 namespace detail {
 
 // W5.1 — definitions for the agentic JSON SSE shape contract. Declared
@@ -871,33 +912,52 @@ std::string make_correlation_id() {
 }
 
 std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
-                          std::string_view remediation) {
-    // A4 (docs/agentic-first-principle.md) lists retry_after_ms as a REQUIRED,
-    // nullable envelope field. This no-retry overload emits it as null so every
-    // REST A4 error body carries the full field set (matching the MCP a4_data
-    // sibling); the second overload below supplies a concrete value. #1470.
+                          const A4ErrorOpts& opts) {
+    // The ONE unified A4 envelope builder (folds the old auth_routes.cpp
+    // a4_denial into a single wire shape). A4 (docs/agentic-first-principle.md)
+    // lists retry_after_ms as a REQUIRED, nullable field, so it is ALWAYS a
+    // key: `null` unless opts.retry_after_ms is set. remediation is omitted
+    // when empty (absence == "no recovery hint" per §A4). permission is the
+    // kPermissionDenied specialisation ("<securable_type>:<operation>");
+    // approval_id + status_url are the kApprovalRequired specialisation. #1470.
     auto err = JObj()
                    .add("code", code)
                    .add("message", message)
-                   .add("correlation_id", correlation_id)
-                   .raw("retry_after_ms", "null");
-    if (!remediation.empty()) {
-        err.add("remediation", remediation);
+                   .add("correlation_id", correlation_id);
+    if (opts.retry_after_ms.has_value()) {
+        err.add("retry_after_ms", *opts.retry_after_ms);
+    } else {
+        err.raw("retry_after_ms", "null");
+    }
+    if (!opts.remediation.empty()) {
+        err.add("remediation", opts.remediation);
+    }
+    if (!opts.permission.empty()) {
+        err.add("permission", opts.permission);
+    }
+    if (!opts.approval_id.empty()) {
+        err.add("approval_id", opts.approval_id);
+    }
+    if (!opts.status_url.empty()) {
+        err.add("status_url", opts.status_url);
     }
     return JObj().raw("error", err.str()).raw("meta", R"({"api_version":"v1"})").str();
 }
 
 std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
+                          std::string_view remediation) {
+    // Backward-compatible no-retry overload — delegates to the unified builder
+    // so the wire shape stays byte-identical (retry_after_ms:null, remediation
+    // omitted when empty).
+    return error_json_a4(code, message, correlation_id, A4ErrorOpts{.remediation = remediation});
+}
+
+std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
                           std::int64_t retry_after_ms, std::string_view remediation) {
-    auto err = JObj()
-                   .add("code", code)
-                   .add("message", message)
-                   .add("correlation_id", correlation_id)
-                   .add("retry_after_ms", retry_after_ms);
-    if (!remediation.empty()) {
-        err.add("remediation", remediation);
-    }
-    return JObj().raw("error", err.str()).raw("meta", R"({"api_version":"v1"})").str();
+    // Backward-compatible concrete-retry overload. Passes the value through
+    // even when 0 — this overload's contract is "always a concrete number".
+    return error_json_a4(code, message, correlation_id,
+                         A4ErrorOpts{.retry_after_ms = retry_after_ms, .remediation = remediation});
 }
 
 /// Payload size cap on `ev.data` before raw-embed into the envelope.
@@ -1078,33 +1138,33 @@ void RestApiV1::register_routes(
                       return;
                   if (!bundle_orch) {
                       res.status = 503;
-                      res.set_content(error_json("service unavailable", 503), "application/json");
+                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                       return;
                   }
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
                   if (body.is_discarded()) {
                       res.status = 400;
-                      res.set_content(error_json("invalid JSON"), "application/json");
+                      res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                       return;
                   }
                   if (!body.contains("agent_id") || !body["agent_id"].is_string() ||
                       body["agent_id"].get<std::string>().empty()) {
                       res.status = 400;
                       res.set_content(
-                          error_json("agent_id (non-empty string) is required — a bundle "
+                          detail::a4_error(res, "agent_id (non-empty string) is required — a bundle "
                                      "targets one device"),
                           "application/json");
                       return;
                   }
                   if (!body.contains("steps")) {
                       res.status = 400;
-                      res.set_content(error_json("steps is required"), "application/json");
+                      res.set_content(detail::a4_error(res, "steps is required"), "application/json");
                       return;
                   }
                   auto specs = validate_bundle_steps(body["steps"].dump());
                   if (!specs) {
                       res.status = 400;
-                      res.set_content(error_json("steps: " + specs.error()), "application/json");
+                      res.set_content(detail::a4_error(res, "steps: " + specs.error()), "application/json");
                       return;
                   }
                   auto session = auth_fn(req, res);
@@ -1116,7 +1176,7 @@ void RestApiV1::register_routes(
                   // (governance sec-M2 / comp-S1).
                   if (principal.empty()) {
                       res.status = 500;
-                      res.set_content(error_json("authenticated session has no principal", 500),
+                      res.set_content(detail::a4_error(res, "authenticated session has no principal"),
                                       "application/json");
                       return;
                   }
@@ -1137,7 +1197,7 @@ void RestApiV1::register_routes(
                       audit_fn(req, "bundle.dispatch", "failure", "Execution", "",
                                std::string("agent=") + agent_id + " error=" + e.what());
                       res.status = 503;
-                      res.set_content(error_json("bundle dispatch failed", 503), "application/json");
+                      res.set_content(detail::a4_error(res, "bundle dispatch failed"), "application/json");
                       return;
                   }
                   audit_fn(req, "bundle.dispatch", "success", "Execution", r.correlation_id,
@@ -1262,7 +1322,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!bundle_orch) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  auto session = auth_fn(req, res);
@@ -1277,7 +1337,7 @@ void RestApiV1::register_routes(
                      audit_fn(req, "bundle.collate", "denied", "Execution", id,
                               "not found or not owned");
                      res.status = 404;
-                     res.set_content(error_json("bundle not found"), "application/json");
+                     res.set_content(detail::a4_error(res, "bundle not found"), "application/json");
                      return;
                  }
                  audit_fn(req, "bundle.collate", "success", "Execution", id,
@@ -1293,7 +1353,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!mgmt_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -1322,14 +1382,14 @@ void RestApiV1::register_routes(
             return;
         if (!mgmt_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded()) {
             res.status = 400;
-            res.set_content(error_json("invalid JSON"), "application/json");
+            res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
             return;
         }
 
@@ -1347,7 +1407,7 @@ void RestApiV1::register_routes(
         auto result = mgmt_store->create_group(g);
         if (!result) {
             res.status = 400;
-            res.set_content(error_json(result.error()), "application/json");
+            res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
         audit_fn(req, "management_group.create", "success", "ManagementGroup", *result, g.name);
@@ -1361,7 +1421,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!mgmt_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -1369,7 +1429,7 @@ void RestApiV1::register_routes(
                  auto g = mgmt_store->get_group(id);
                  if (!g) {
                      res.status = 404;
-                     res.set_content(error_json("group not found"), "application/json");
+                     res.set_content(detail::a4_error(res, "group not found"), "application/json");
                      return;
                  }
                  auto members = mgmt_store->get_members(id);
@@ -1402,7 +1462,7 @@ void RestApiV1::register_routes(
             return;
         if (!mgmt_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -1410,14 +1470,14 @@ void RestApiV1::register_routes(
         auto existing = mgmt_store->get_group(id);
         if (!existing) {
             res.status = 404;
-            res.set_content(error_json("group not found"), "application/json");
+            res.set_content(detail::a4_error(res, "group not found"), "application/json");
             return;
         }
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded()) {
             res.status = 400;
-            res.set_content(error_json("invalid JSON"), "application/json");
+            res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
             return;
         }
 
@@ -1435,7 +1495,7 @@ void RestApiV1::register_routes(
 
         if (id == ManagementGroupStore::kRootGroupId && !updated.parent_id.empty()) {
             res.status = 400;
-            res.set_content(error_json("cannot re-parent root group"), "application/json");
+            res.set_content(detail::a4_error(res, "cannot re-parent root group"), "application/json");
             return;
         }
 
@@ -1444,14 +1504,14 @@ void RestApiV1::register_routes(
             if (std::find(descendants.begin(), descendants.end(), updated.parent_id) !=
                 descendants.end()) {
                 res.status = 400;
-                res.set_content(error_json("re-parenting would create a cycle"),
+                res.set_content(detail::a4_error(res, "re-parenting would create a cycle"),
                                 "application/json");
                 return;
             }
             auto ancestors = mgmt_store->get_ancestor_ids(updated.parent_id);
             if (ancestors.size() >= 4) {
                 res.status = 400;
-                res.set_content(error_json("maximum hierarchy depth (5) exceeded"),
+                res.set_content(detail::a4_error(res, "maximum hierarchy depth (5) exceeded"),
                                 "application/json");
                 return;
             }
@@ -1460,7 +1520,7 @@ void RestApiV1::register_routes(
         auto result = mgmt_store->update_group(updated);
         if (!result) {
             res.status = 400;
-            res.set_content(error_json(result.error()), "application/json");
+            res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
         audit_fn(req, "management_group.update", "success", "ManagementGroup", id, updated.name);
@@ -1474,7 +1534,7 @@ void RestApiV1::register_routes(
                 return;
             if (!mgmt_store) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
@@ -1482,7 +1542,7 @@ void RestApiV1::register_routes(
             auto result = mgmt_store->delete_group(id);
             if (!result) {
                 res.status = (result.error() == "cannot delete root group") ? 403 : 404;
-                res.set_content(error_json(result.error()), "application/json");
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }
             audit_fn(req, "management_group.delete", "success", "ManagementGroup", id, "");
@@ -1496,7 +1556,7 @@ void RestApiV1::register_routes(
                       return;
                   if (!mgmt_store) {
                       res.status = 503;
-                      res.set_content(error_json("service unavailable", 503), "application/json");
+                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                       return;
                   }
 
@@ -1505,7 +1565,7 @@ void RestApiV1::register_routes(
                   auto agent_id = body.value("agent_id", "");
                   if (agent_id.empty()) {
                       res.status = 400;
-                      res.set_content(error_json("agent_id required"), "application/json");
+                      res.set_content(detail::a4_error(res, "agent_id required"), "application/json");
                       return;
                   }
                   mgmt_store->add_member(group_id, agent_id);
@@ -1522,7 +1582,7 @@ void RestApiV1::register_routes(
                 return;
             if (!mgmt_store) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
@@ -1542,7 +1602,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!mgmt_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -1567,7 +1627,7 @@ void RestApiV1::register_routes(
                       return;
                   if (!mgmt_store || !rbac_store) {
                       res.status = 503;
-                      res.set_content(error_json("service unavailable", 503), "application/json");
+                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                       return;
                   }
 
@@ -1575,7 +1635,7 @@ void RestApiV1::register_routes(
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
                   if (body.is_discarded()) {
                       res.status = 400;
-                      res.set_content(error_json("invalid JSON"), "application/json");
+                      res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                       return;
                   }
 
@@ -1585,14 +1645,14 @@ void RestApiV1::register_routes(
 
                   if (principal_id.empty() || role_name.empty()) {
                       res.status = 400;
-                      res.set_content(error_json("principal_id and role_name required"),
+                      res.set_content(detail::a4_error(res, "principal_id and role_name required"),
                                       "application/json");
                       return;
                   }
 
                   if (role_name != "Operator" && role_name != "Viewer") {
                       res.status = 403;
-                      res.set_content(error_json("only Operator and Viewer roles can be delegated"),
+                      res.set_content(detail::a4_error(res, "only Operator and Viewer roles can be delegated"),
                                       "application/json");
                       return;
                   }
@@ -1611,7 +1671,7 @@ void RestApiV1::register_routes(
                   }
                   if (!authorized) {
                       res.status = 403;
-                      res.set_content(error_json("forbidden"), "application/json");
+                      res.set_content(detail::a4_error(res, "forbidden"), "application/json");
                       return;
                   }
 
@@ -1624,7 +1684,7 @@ void RestApiV1::register_routes(
                   auto result = mgmt_store->assign_role(assignment);
                   if (!result) {
                       res.status = 400;
-                      res.set_content(error_json(result.error()), "application/json");
+                      res.set_content(detail::a4_error(res, result.error()), "application/json");
                       return;
                   }
                   audit_fn(req, "management_group.assign_role", "success", "ManagementGroup",
@@ -1642,7 +1702,7 @@ void RestApiV1::register_routes(
                 return;
             if (!mgmt_store || !rbac_store) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
@@ -1650,7 +1710,7 @@ void RestApiV1::register_routes(
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded()) {
                 res.status = 400;
-                res.set_content(error_json("invalid JSON"), "application/json");
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                 return;
             }
 
@@ -1672,7 +1732,7 @@ void RestApiV1::register_routes(
             }
             if (!authorized) {
                 res.status = 403;
-                res.set_content(error_json("forbidden"), "application/json");
+                res.set_content(detail::a4_error(res, "forbidden"), "application/json");
                 return;
             }
 
@@ -1693,7 +1753,7 @@ void RestApiV1::register_routes(
                  // "no database".
                  if (!token_store || !token_store->is_open()) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -1714,6 +1774,11 @@ void RestApiV1::register_routes(
                          .add("revoked", t.revoked);
                      if (!t.scope_service.empty())
                          item.add("scope_service", t.scope_service);
+                     // Echo the MCP tier so an operator can verify what they
+                     // minted (authdb Q3 / consistency #6 — the field is settable
+                     // now, so it must be readable back).
+                     if (!t.mcp_tier.empty())
+                         item.add("mcp_tier", t.mcp_tier);
                      arr.add(item);
                  }
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens.size())),
@@ -1727,7 +1792,7 @@ void RestApiV1::register_routes(
             return;
         if (!token_store || !token_store->is_open()) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -1744,6 +1809,48 @@ void RestApiV1::register_routes(
         auto name = body.value("name", "");
         auto expires_at = body.value("expires_at", int64_t{0});
         auto scope_service = body.value("scope_service", "");
+        // MCP tier (#289 follow-up): create_token already accepts this — the
+        // handler had silently dropped it, so a documented `mcp_tier` in the body
+        // produced an empty-tier (RBAC-defer) token, defeating self-service MCP
+        // provisioning. Honor it, validating against the closed tier set so a
+        // typo can't mint an unrecognised tier (which tier_allows would treat as
+        // "defer to RBAC" — a silent privilege surprise).
+        auto mcp_tier = body.value("mcp_tier", "");
+        if (!mcp_tier.empty() && !mcp::is_valid_tier(mcp_tier)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid mcp_tier: must be one of readonly, "
+                                                  "operator, supervised (or omitted)"),
+                            "application/json");
+            return;
+        }
+        // A token carrying an MCP tier or a service scope MUST have an expiration
+        // (create_token enforces this + a 90-day cap). Pre-validate here so a
+        // routine client omission / over-long TTL returns a clean 400 instead of
+        // falling through to the shared `!result` branch below, which is
+        // CSPRNG-failure-ONLY: it would 503, false-page on-call via
+        // yuzu_secure_random_failure_total, and write a false `csprng_unavailable`
+        // SOC-2 audit row for a plain input error (gov Gate: security-guardian /
+        // authdb / compliance / consistency / enterprise / happy+unhappy-path).
+        // Mirrors create_token's two expiry rules; the full de-duplication (a
+        // discriminable create_token error) is the tracked typed-error follow-up.
+        if (!mcp_tier.empty() || !scope_service.empty()) {
+            if (expires_at <= 0) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "expires_at is required for an MCP-tier or "
+                                                      "service-scoped token"),
+                                "application/json");
+                return;
+            }
+            if (!mcp_tier.empty()) {
+                const int64_t now = static_cast<int64_t>(std::time(nullptr));
+                if (expires_at - now > 90LL * 24 * 3600) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "MCP token TTL cannot exceed 90 days"),
+                                    "application/json");
+                    return;
+                }
+            }
+        }
 
         // UP-H2 (gov Gate 4, unhappy-path): clamp user-controlled string
         // length BEFORE any audit emission. An unbounded `name` would be
@@ -1758,13 +1865,13 @@ void RestApiV1::register_routes(
         // amplification vector outright.
         if (name.size() > 256) {
             res.status = 400;
-            res.set_content(error_json("invalid_input_length: name exceeds 256 chars"),
+            res.set_content(detail::a4_error(res, "invalid_input_length: name exceeds 256 chars"),
                             "application/json");
             return;
         }
         if (scope_service.size() > 256) {
             res.status = 400;
-            res.set_content(error_json("invalid_input_length: scope_service exceeds 256 chars"),
+            res.set_content(detail::a4_error(res, "invalid_input_length: scope_service exceeds 256 chars"),
                             "application/json");
             return;
         }
@@ -1772,7 +1879,7 @@ void RestApiV1::register_routes(
         if (!scope_service.empty()) {
             if (!rbac_store || !rbac_store->is_rbac_enabled()) {
                 res.status = 400;
-                res.set_content(error_json("service-scoped tokens require RBAC to be enabled"),
+                res.set_content(detail::a4_error(res, "service-scoped tokens require RBAC to be enabled"),
                                 "application/json");
                 return;
             }
@@ -1793,14 +1900,15 @@ void RestApiV1::register_routes(
             }
             if (!authorized) {
                 res.status = 403;
-                res.set_content(error_json("ITServiceOwner authority required for service '" +
+                res.set_content(detail::a4_error(res, "ITServiceOwner authority required for service '" +
                                            scope_service + "'"),
                                 "application/json");
                 return;
             }
         }
 
-        auto result = token_store->create_token(name, session->username, expires_at, scope_service);
+        auto result =
+            token_store->create_token(name, session->username, expires_at, scope_service, mcp_tier);
         if (!result) {
             // sre-1 (gov Gate 6): Prometheus signal for CSPRNG failure so
             // on-call has a paging surface short of grepping audit logs.
@@ -1860,7 +1968,13 @@ void RestApiV1::register_routes(
             res.set_content(envelope.str(), "application/json");
             return;
         }
-        auto detail = scope_service.empty() ? "" : "scope_service=" + scope_service;
+        // Record the granted MCP tier in the create audit — it is the privilege
+        // boundary of the credential, and a SOC-2 CC6.1/6.2 access review must be
+        // answerable from durable evidence, not the mutable api_tokens table
+        // (gov Gate 6 compliance HIGH; authdb Q4 / consistency #6).
+        std::string detail = "mcp_tier=" + (mcp_tier.empty() ? std::string("none") : mcp_tier);
+        if (!scope_service.empty())
+            detail += "; scope_service=" + scope_service;
         // Success-path audit fire-and-forget — bool intentionally discarded
         // because the response is 201 Created regardless; if the audit row
         // fails to persist, the AuditStore::emit_failed_ counter still
@@ -1880,7 +1994,7 @@ void RestApiV1::register_routes(
             return;
         if (!token_store || !token_store->is_open()) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -1914,7 +2028,7 @@ void RestApiV1::register_routes(
                          "owner=" + existing->principal_id);
             }
             res.status = 404;
-            res.set_content(error_json("token not found"), "application/json");
+            res.set_content(detail::a4_error(res, "token not found"), "application/json");
             return;
         }
 
@@ -1923,7 +2037,7 @@ void RestApiV1::register_routes(
             // Either the token vanished between get and revoke, or the
             // revoke call itself failed. Treat as not-found for the client.
             res.status = 404;
-            res.set_content(error_json("token not found"), "application/json");
+            res.set_content(detail::a4_error(res, "token not found"), "application/json");
             return;
         }
         audit_fn(req, "api_token.revoke", "success", "ApiToken", token_id,
@@ -1970,7 +2084,7 @@ void RestApiV1::register_routes(
             // through to revoke — comparing two empty strings would
             // mis-attribute the action.
             res.status = 500;
-            res.set_content(error_json("session has empty username", 500), "application/json");
+            res.set_content(detail::a4_error(res, "session has empty username"), "application/json");
             return;
         }
         // Audit emission helper — wraps audit_fn so we can capture both
@@ -2010,13 +2124,13 @@ void RestApiV1::register_routes(
                 res.set_header("Sec-Audit-Failed", "true");
             res.status = 403;
             res.set_content(
-                error_json("self-revoke requires an interactive session, not an API token", 403),
+                detail::a4_error(res, "self-revoke requires an interactive session, not an API token"),
                 "application/json");
             return;
         }
         if (!session_revoke_fn) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         const auto result = session_revoke_fn(session->username, /*revoke_api_tokens=*/true);
@@ -2067,7 +2181,7 @@ void RestApiV1::register_routes(
             // sec-M1: empty caller username would mis-attribute the
             // self-vs-cross-user audit action selection below.
             res.status = 500;
-            res.set_content(error_json("session has empty username", 500), "application/json");
+            res.set_content(detail::a4_error(res, "session has empty username"), "application/json");
             return;
         }
         // PR2 — MFA step-up gate. Admin force-logout of another user
@@ -2076,13 +2190,13 @@ void RestApiV1::register_routes(
             return;
         if (!session_revoke_fn) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         const auto username = req.get_param_value("username");
         if (username.empty()) {
             res.status = 400;
-            res.set_content(error_json("username query parameter required", 400),
+            res.set_content(detail::a4_error(res, "username query parameter required"),
                             "application/json");
             return;
         }
@@ -2092,7 +2206,7 @@ void RestApiV1::register_routes(
             // attacker-controlled string while the SQL bind silently
             // truncates at NUL — different rows hit memory vs disk.
             res.status = 400;
-            res.set_content(error_json("invalid username format", 400), "application/json");
+            res.set_content(detail::a4_error(res, "invalid username format"), "application/json");
             return;
         }
         const auto result = session_revoke_fn(username, /*revoke_api_tokens=*/false);
@@ -2236,7 +2350,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!quarantine_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -2261,7 +2375,7 @@ void RestApiV1::register_routes(
             return;
         if (!quarantine_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -2276,7 +2390,7 @@ void RestApiV1::register_routes(
         auto result = quarantine_store->quarantine_device(agent_id, by, reason, whitelist);
         if (!result) {
             res.status = 400;
-            res.set_content(error_json(result.error()), "application/json");
+            res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
         audit_fn(req, "quarantine.enable", "success", "Security", agent_id, reason);
@@ -2291,7 +2405,7 @@ void RestApiV1::register_routes(
                 return;
             if (!quarantine_store) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
@@ -2299,7 +2413,7 @@ void RestApiV1::register_routes(
             auto result = quarantine_store->release_device(agent_id);
             if (!result) {
                 res.status = 400;
-                res.set_content(error_json(result.error()), "application/json");
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }
             audit_fn(req, "quarantine.disable", "success", "Security", agent_id, "");
@@ -2314,7 +2428,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!rbac_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -2337,7 +2451,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!rbac_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -2360,7 +2474,7 @@ void RestApiV1::register_routes(
             return;
         if (!rbac_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -2400,7 +2514,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!tag_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -2423,14 +2537,14 @@ void RestApiV1::register_routes(
                      return;
                  if (!tag_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
                  auto agent_id = req.get_param_value("agent_id");
                  if (agent_id.empty()) {
                      res.status = 400;
-                     res.set_content(error_json("agent_id parameter required"), "application/json");
+                     res.set_content(detail::a4_error(res, "agent_id parameter required"), "application/json");
                      return;
                  }
                  auto tags = tag_store->get_all_tags(agent_id);
@@ -2446,14 +2560,14 @@ void RestApiV1::register_routes(
             return;
         if (!tag_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded()) {
             res.status = 400;
-            res.set_content(error_json("invalid JSON"), "application/json");
+            res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
             return;
         }
         auto agent_id = body.value("agent_id", "");
@@ -2473,14 +2587,14 @@ void RestApiV1::register_routes(
 
         if (agent_id.empty() || key.empty()) {
             res.status = 400;
-            res.set_content(error_json("agent_id and key required"), "application/json");
+            res.set_content(detail::a4_error(res, "agent_id and key required"), "application/json");
             return;
         }
 
         auto result = tag_store->set_tag_checked(agent_id, key, value, "api");
         if (!result) {
             res.status = 400;
-            res.set_content(error_json(result.error()), "application/json");
+            res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
         if (key == "service" && service_group_fn)
@@ -2498,7 +2612,7 @@ void RestApiV1::register_routes(
                 return;
             if (!tag_store) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
@@ -2507,7 +2621,7 @@ void RestApiV1::register_routes(
             bool deleted = tag_store->delete_tag(agent_id, key);
             if (!deleted) {
                 res.status = 404;
-                res.set_content(error_json("tag not found"), "application/json");
+                res.set_content(detail::a4_error(res, "tag not found"), "application/json");
                 return;
             }
             audit_fn(req, "tag.delete", "success", "Tag", agent_id + ":" + key, "");
@@ -2522,7 +2636,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!instruction_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -2600,20 +2714,20 @@ void RestApiV1::register_routes(
                      return;
                  if (!instruction_store || !instruction_store->is_open()) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  auto def_id = req.matches[1].str();
                  if (!std::regex_match(def_id, kRtDefIdRegex)) {
                      res.status = 400;
-                     res.set_content(error_json("definition id must match [A-Za-z0-9._-]{1,128}"),
+                     res.set_content(detail::a4_error(res, "definition id must match [A-Za-z0-9._-]{1,128}"),
                                      "application/json");
                      return;
                  }
                  auto def = instruction_store->get_definition(def_id);
                  if (!def) {
                      res.status = 404;
-                     res.set_content(error_json("definition not found"), "application/json");
+                     res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      return;
                  }
                  ResponseTemplatesEngine engine;
@@ -2649,7 +2763,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!instruction_store || !instruction_store->is_open()) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  auto def_id = req.matches[1].str();
@@ -2657,13 +2771,13 @@ void RestApiV1::register_routes(
                  if (!std::regex_match(def_id, kRtDefIdRegex) ||
                      !std::regex_match(tid, kRtTemplateIdRegex)) {
                      res.status = 400;
-                     res.set_content(error_json("malformed id"), "application/json");
+                     res.set_content(detail::a4_error(res, "malformed id"), "application/json");
                      return;
                  }
                  auto def = instruction_store->get_definition(def_id);
                  if (!def) {
                      res.status = 404;
-                     res.set_content(error_json("definition not found"), "application/json");
+                     res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      return;
                  }
                  ResponseTemplatesEngine engine;
@@ -2690,7 +2804,7 @@ void RestApiV1::register_routes(
                      }
                  }
                  res.status = 404;
-                 res.set_content(error_json("template not found"), "application/json");
+                 res.set_content(detail::a4_error(res, "template not found"), "application/json");
              });
 
     // POST /api/v1/definitions/{id}/response-templates ─ create
@@ -2701,13 +2815,13 @@ void RestApiV1::register_routes(
                       return;
                   if (!instruction_store || !instruction_store->is_open()) {
                       res.status = 503;
-                      res.set_content(error_json("service unavailable", 503), "application/json");
+                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                       return;
                   }
                   auto def_id = req.matches[1].str();
                   if (!std::regex_match(def_id, kRtDefIdRegex)) {
                       res.status = 400;
-                      res.set_content(error_json("definition id must match [A-Za-z0-9._-]{1,128}"),
+                      res.set_content(detail::a4_error(res, "definition id must match [A-Za-z0-9._-]{1,128}"),
                                       "application/json");
                       audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
                                def_id, "reason=malformed_definition_id");
@@ -2715,7 +2829,7 @@ void RestApiV1::register_routes(
                   }
                   if (req.body.size() > kRtMaxBodyBytes) {
                       res.status = 413;
-                      res.set_content(error_json("request body exceeds 64 KiB cap", 413),
+                      res.set_content(detail::a4_error(res, "request body exceeds 64 KiB cap"),
                                       "application/json");
                       audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
                                def_id, "reason=body_too_large");
@@ -2724,7 +2838,7 @@ void RestApiV1::register_routes(
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
                   if (body.is_discarded()) {
                       res.status = 400;
-                      res.set_content(error_json("invalid JSON"), "application/json");
+                      res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                       audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
                                def_id, "reason=invalid_json");
                       return;
@@ -2732,7 +2846,7 @@ void RestApiV1::register_routes(
                   auto def = instruction_store->get_definition(def_id);
                   if (!def) {
                       res.status = 404;
-                      res.set_content(error_json("definition not found"), "application/json");
+                      res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                       audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
                                def_id, "reason=definition_not_found");
                       return;
@@ -2747,7 +2861,7 @@ void RestApiV1::register_routes(
                                                            /*assign_id=*/true);
                   if (!validated) {
                       res.status = 400;
-                      res.set_content(error_json(validated.error()), "application/json");
+                      res.set_content(detail::a4_error(res, validated.error()), "application/json");
                       audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
                                def_id, "reason=validation_failed");
                       return;
@@ -2757,7 +2871,7 @@ void RestApiV1::register_routes(
                       spdlog::error("response_template.create persist failed: def={} err={}",
                                     def_id, *err);
                       res.status = 500;
-                      res.set_content(error_json("persist failure"), "application/json");
+                      res.set_content(detail::a4_error(res, "persist failure"), "application/json");
                       audit_fn(req, "response_template.create", "failure", "InstructionDefinition",
                                def_id, "reason=persist_failure");
                       return;
@@ -2776,7 +2890,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!instruction_store || !instruction_store->is_open()) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  auto def_id = req.matches[1].str();
@@ -2784,14 +2898,14 @@ void RestApiV1::register_routes(
                  if (!std::regex_match(def_id, kRtDefIdRegex) ||
                      !std::regex_match(tid, kRtTemplateIdRegex)) {
                      res.status = 400;
-                     res.set_content(error_json("malformed id"), "application/json");
+                     res.set_content(detail::a4_error(res, "malformed id"), "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
                               def_id, "reason=malformed_id");
                      return;
                  }
                  if (tid == ResponseTemplatesEngine::kDefaultId) {
                      res.status = 400;
-                     res.set_content(error_json("'__default__' is reserved for the synthesised "
+                     res.set_content(detail::a4_error(res, "'__default__' is reserved for the synthesised "
                                                 "default; create a new template instead"),
                                      "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
@@ -2800,7 +2914,7 @@ void RestApiV1::register_routes(
                  }
                  if (req.body.size() > kRtMaxBodyBytes) {
                      res.status = 413;
-                     res.set_content(error_json("request body exceeds 64 KiB cap", 413),
+                     res.set_content(detail::a4_error(res, "request body exceeds 64 KiB cap"),
                                      "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
                               def_id, "reason=body_too_large");
@@ -2809,7 +2923,7 @@ void RestApiV1::register_routes(
                  auto body = nlohmann::json::parse(req.body, nullptr, false);
                  if (body.is_discarded()) {
                      res.status = 400;
-                     res.set_content(error_json("invalid JSON"), "application/json");
+                     res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
                               def_id, "reason=invalid_json");
                      return;
@@ -2817,7 +2931,7 @@ void RestApiV1::register_routes(
                  auto def = instruction_store->get_definition(def_id);
                  if (!def) {
                      res.status = 404;
-                     res.set_content(error_json("definition not found"), "application/json");
+                     res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
                               def_id, "reason=definition_not_found");
                      return;
@@ -2835,7 +2949,7 @@ void RestApiV1::register_routes(
                      }
                  if (!found) {
                      res.status = 404;
-                     res.set_content(error_json("template not found"), "application/json");
+                     res.set_content(detail::a4_error(res, "template not found"), "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
                               def_id, "reason=template_not_found");
                      return;
@@ -2845,7 +2959,7 @@ void RestApiV1::register_routes(
                                                           /*assign_id=*/false);
                  if (!validated) {
                      res.status = 400;
-                     res.set_content(error_json(validated.error()), "application/json");
+                     res.set_content(detail::a4_error(res, validated.error()), "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
                               def_id, "reason=validation_failed");
                      return;
@@ -2860,7 +2974,7 @@ void RestApiV1::register_routes(
                      spdlog::error("response_template.update persist failed: def={} tid={} err={}",
                                    def_id, tid, *err);
                      res.status = 500;
-                     res.set_content(error_json("persist failure"), "application/json");
+                     res.set_content(detail::a4_error(res, "persist failure"), "application/json");
                      audit_fn(req, "response_template.update", "failure", "InstructionDefinition",
                               def_id, "reason=persist_failure");
                      return;
@@ -2879,7 +2993,7 @@ void RestApiV1::register_routes(
                 return;
             if (!instruction_store || !instruction_store->is_open()) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
             auto def_id = req.matches[1].str();
@@ -2887,14 +3001,14 @@ void RestApiV1::register_routes(
             if (!std::regex_match(def_id, kRtDefIdRegex) ||
                 !std::regex_match(tid, kRtTemplateIdRegex)) {
                 res.status = 400;
-                res.set_content(error_json("malformed id"), "application/json");
+                res.set_content(detail::a4_error(res, "malformed id"), "application/json");
                 audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
                          "reason=malformed_id");
                 return;
             }
             if (tid == ResponseTemplatesEngine::kDefaultId) {
                 res.status = 400;
-                res.set_content(error_json("the synthesised default template "
+                res.set_content(detail::a4_error(res, "the synthesised default template "
                                            "cannot be deleted"),
                                 "application/json");
                 audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
@@ -2904,7 +3018,7 @@ void RestApiV1::register_routes(
             auto def = instruction_store->get_definition(def_id);
             if (!def) {
                 res.status = 404;
-                res.set_content(error_json("definition not found"), "application/json");
+                res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                 audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
                          "reason=definition_not_found");
                 return;
@@ -2920,7 +3034,7 @@ void RestApiV1::register_routes(
                             templates.end());
             if (templates.size() == before) {
                 res.status = 404;
-                res.set_content(error_json("template not found"), "application/json");
+                res.set_content(detail::a4_error(res, "template not found"), "application/json");
                 audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
                          "reason=template_not_found");
                 return;
@@ -2929,7 +3043,7 @@ void RestApiV1::register_routes(
                 spdlog::error("response_template.delete persist failed: def={} tid={} err={}",
                               def_id, tid, *err);
                 res.status = 500;
-                res.set_content(error_json("persist failure"), "application/json");
+                res.set_content(detail::a4_error(res, "persist failure"), "application/json");
                 audit_fn(req, "response_template.delete", "failure", "InstructionDefinition",
                          def_id, "reason=persist_failure");
                 return;
@@ -2947,7 +3061,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!audit_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -3163,7 +3277,7 @@ void RestApiV1::register_routes(
             return;
         if (!inventory_store || !inventory_store->is_open()) {
             res.status = 503;
-            res.set_content(error_json("inventory store not available"), "application/json");
+            res.set_content(detail::a4_error(res, "inventory store not available"), "application/json");
             return;
         }
 
@@ -3185,7 +3299,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!inventory_store || !inventory_store->is_open()) {
                      res.status = 503;
-                     res.set_content(error_json("inventory store not available"),
+                     res.set_content(detail::a4_error(res, "inventory store not available"),
                                      "application/json");
                      return;
                  }
@@ -3196,7 +3310,7 @@ void RestApiV1::register_routes(
                  auto record = inventory_store->get(agent_id, plugin);
                  if (!record) {
                      res.status = 404;
-                     res.set_content(error_json("no inventory data found"), "application/json");
+                     res.set_content(detail::a4_error(res, "no inventory data found"), "application/json");
                      return;
                  }
 
@@ -3219,14 +3333,14 @@ void RestApiV1::register_routes(
             return;
         if (!inventory_store || !inventory_store->is_open()) {
             res.status = 503;
-            res.set_content(error_json("inventory store not available"), "application/json");
+            res.set_content(detail::a4_error(res, "inventory store not available"), "application/json");
             return;
         }
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded()) {
             res.status = 400;
-            res.set_content(error_json("invalid JSON"), "application/json");
+            res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
             return;
         }
 
@@ -3404,12 +3518,22 @@ void RestApiV1::register_routes(
 
                  JArr arr;
                  for (const auto& r : rows) {
+                     // Blob contract v2 fields ride along; a field the ecosystem
+                     // does not store is "" (honest-empty, never synthesised).
                      arr.add(JObj()
                                  .add("agent_id", r.agent_id)
                                  .add("name", r.entry.name)
                                  .add("version", r.entry.version)
                                  .add("publisher", r.entry.publisher)
-                                 .add("install_date", r.entry.install_date));
+                                 .add("install_date", r.entry.install_date)
+                                 .add("kind", r.entry.kind)
+                                 .add("ecosystem", r.entry.ecosystem)
+                                 .add("epoch", r.entry.epoch)
+                                 .add("release", r.entry.release)
+                                 .add("arch", r.entry.arch)
+                                 .add("signature_status", r.entry.signature_status)
+                                 .add("distro_id", r.entry.distro_id)
+                                 .add("distro_version", r.entry.distro_version));
                  }
 
                  // Audit posture: SET-AND-PROCEED (see route header) — capture the persist
@@ -3599,6 +3723,68 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(data), "application/json");
         });
 
+    // ── GET /api/v1/approvals/{id} — single approval status (A4 status_url) ──
+    //
+    // The versioned single-fetch approval endpoint. This is the `status_url`
+    // target an approval-required A4 envelope points at (the kApprovalRequired
+    // specialisation): a worker that is told "your request needs approval
+    // approval_id=X, poll status_url" GETs this to learn the current status
+    // rather than re-issuing the gated request. READ-ONLY — it never touches
+    // the approval lifecycle (submit/approve/reject live on the legacy
+    // /api/approvals/* routes). Gated on Approval:Read (parity with the
+    // legacy GET /api/approvals list). 404 is A4-shaped. Uses the store's
+    // single-fetch get() (NOT query()+filter, whose LIMIT 100 would false-404
+    // an aged id).
+    sink.Get(
+        R"(/api/v1/approvals/([A-Za-z0-9_-]{1,128}))",
+        [auth_fn, perm_fn, audit_fn, approval_manager](const httplib::Request& req,
+                                                       httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (!perm_fn(req, res, "Approval", "Read"))
+                return;
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!approval_manager) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "approval service unavailable", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry after server warmup; the approval store "
+                                          "initialises during startup"),
+                    "application/json");
+                return;
+            }
+            const auto id = req.matches[1].str();
+            auto approval = approval_manager->get(id);
+            if (!approval) {
+                res.status = 404;
+                res.set_content(detail::error_json_a4(404, "approval not found", cid),
+                                "application/json");
+                return;
+            }
+            const auto& a = *approval;
+            // Audit the read (S2, adversarial review): this versioned endpoint is
+            // the A4 status_url target and returns submitted_by / reviewed_by /
+            // scope_expression. The legacy list route lacks an audit, but the
+            // stable agentic surface should leave a trail. Best-effort (success
+            // path only; not fail-closed — no new PII beyond the legacy route).
+            (void)audit_fn(req, "approval.read", "success", "Approval", id, "status=" + a.status);
+            auto data = JObj()
+                            .add("id", a.id)
+                            .add("definition_id", a.definition_id)
+                            .add("status", a.status)
+                            .add("submitted_by", a.submitted_by)
+                            .add("submitted_at", static_cast<int64_t>(a.submitted_at))
+                            .add("reviewed_by", a.reviewed_by)
+                            .add("reviewed_at", static_cast<int64_t>(a.reviewed_at))
+                            .add("review_comment", a.review_comment)
+                            .add("scope_expression", a.scope_expression)
+                            .str();
+            res.set_content(ok_json(data), "application/json");
+        });
+
     // ── Response Visualization (issue #253, capability 20.6) ─────────────
     //
     // Renders an instruction's response set as chart-ready JSON using the
@@ -3624,14 +3810,14 @@ void RestApiV1::register_routes(
             if (!response_store || !instruction_store || !response_store->is_open() ||
                 !instruction_store->is_open()) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
             auto execution_id = req.matches[1].str();
             if (!req.has_param("definition_id")) {
                 res.status = 400;
-                res.set_content(error_json("definition_id query parameter is required"),
+                res.set_content(detail::a4_error(res, "definition_id query parameter is required"),
                                 "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
                          "reason=missing_definition_id");
@@ -3646,7 +3832,7 @@ void RestApiV1::register_routes(
             static const std::regex kIdRegex{"^[A-Za-z0-9._-]{1,128}$"};
             if (!std::regex_match(definition_id, kIdRegex)) {
                 res.status = 400;
-                res.set_content(error_json("definition_id must match [A-Za-z0-9._-]{1,128}"),
+                res.set_content(detail::a4_error(res, "definition_id must match [A-Za-z0-9._-]{1,128}"),
                                 "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
                          "reason=malformed_definition_id");
@@ -3661,13 +3847,13 @@ void RestApiV1::register_routes(
                     chart_index = std::stoi(req.get_param_value("index"));
                 } catch (...) {
                     res.status = 400;
-                    res.set_content(error_json("index must be a non-negative integer"),
+                    res.set_content(detail::a4_error(res, "index must be a non-negative integer"),
                                     "application/json");
                     return;
                 }
                 if (chart_index < 0) {
                     res.status = 400;
-                    res.set_content(error_json("index must be a non-negative integer"),
+                    res.set_content(detail::a4_error(res, "index must be a non-negative integer"),
                                     "application/json");
                     return;
                 }
@@ -3676,7 +3862,7 @@ void RestApiV1::register_routes(
             auto def = instruction_store->get_definition(definition_id);
             if (!def) {
                 res.status = 404;
-                res.set_content(error_json("instruction definition not found"), "application/json");
+                res.set_content(detail::a4_error(res, "instruction definition not found"), "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
                          definition_id + " reason=definition_not_found");
                 return;
@@ -3684,7 +3870,7 @@ void RestApiV1::register_routes(
             int chart_count = VisualizationEngine::count(def->visualization_spec);
             if (chart_count == 0) {
                 res.status = 404;
-                res.set_content(error_json("no visualization configured for this definition"),
+                res.set_content(detail::a4_error(res, "no visualization configured for this definition"),
                                 "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
                          definition_id + " reason=no_visualization");
@@ -3692,7 +3878,7 @@ void RestApiV1::register_routes(
             }
             if (chart_index >= chart_count) {
                 res.status = 404;
-                res.set_content(error_json("visualization index out of range (have " +
+                res.set_content(detail::a4_error(res, "visualization index out of range (have " +
                                            std::to_string(chart_count) + " chart(s))"),
                                 "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
@@ -3754,7 +3940,7 @@ void RestApiV1::register_routes(
                 auto parsed = nlohmann::json::parse(result.json, nullptr, false);
                 auto msg = parsed.is_discarded() ? std::string("invalid spec")
                                                  : parsed.value("error", "invalid spec");
-                res.set_content(error_json(msg), "application/json");
+                res.set_content(detail::a4_error(res, msg), "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
                          definition_id + " err=" + msg);
                 return;
@@ -3794,7 +3980,7 @@ void RestApiV1::register_routes(
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded()) {
                           res.status = 400;
-                          res.set_content(error_json("invalid JSON"), "application/json");
+                          res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                           return;
                       }
 
@@ -3875,9 +4061,12 @@ void RestApiV1::register_routes(
 
         // Emit an A4 error with a fresh correlation id.
         auto rs_err = [](httplib::Response& res, int status, std::string_view msg) {
-            auto cid = detail::make_correlation_id();
             res.status = status;
-            res.set_content(detail::error_json_a4(status, msg, cid), "application/json");
+            // Route through a4_error so the X-Correlation-Id RESPONSE HEADER is set
+            // (via ensure_correlation_id) — error_json_a4 alone builds only the body,
+            // leaving the header absent on all 26 result-set error paths (S1,
+            // adversarial review). a4_error derives the body `code` from res.status.
+            res.set_content(detail::a4_error(res, msg), "application/json");
         };
 
         // Load a row and enforce the owner check. Returns nullopt and writes a
@@ -4570,7 +4759,7 @@ void RestApiV1::register_routes(
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded()) {
                 res.status = 400;
-                res.set_content(error_json("invalid JSON"), "application/json");
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                 return;
             }
             auto name = body.value("name", "");
@@ -4587,19 +4776,19 @@ void RestApiV1::register_routes(
             // but name and definition_id ride the same SQLite bind path.
             if (name.size() > 256) {
                 res.status = 400;
-                res.set_content(error_json("invalid_input_length: name exceeds 256 chars"),
+                res.set_content(detail::a4_error(res, "invalid_input_length: name exceeds 256 chars"),
                                 "application/json");
                 return;
             }
             if (device_id.size() > 256) {
                 res.status = 400;
-                res.set_content(error_json("invalid_input_length: device_id exceeds 256 chars"),
+                res.set_content(detail::a4_error(res, "invalid_input_length: device_id exceeds 256 chars"),
                                 "application/json");
                 return;
             }
             if (definition_id.size() > 256) {
                 res.status = 400;
-                res.set_content(error_json("invalid_input_length: definition_id exceeds 256 chars"),
+                res.set_content(detail::a4_error(res, "invalid_input_length: definition_id exceeds 256 chars"),
                                 "application/json");
                 return;
             }
@@ -4676,7 +4865,7 @@ void RestApiV1::register_routes(
                     res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
                 } else {
                     res.status = 404;
-                    res.set_content(error_json("token not found"), "application/json");
+                    res.set_content(detail::a4_error(res, "token not found"), "application/json");
                 }
             });
     }
@@ -4722,7 +4911,7 @@ void RestApiV1::register_routes(
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded()) {
                 res.status = 400;
-                res.set_content(error_json("invalid JSON"), "application/json");
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                 return;
             }
 
@@ -4744,7 +4933,7 @@ void RestApiV1::register_routes(
                 auto pkg_version = body.value("version", "");
                 if (pkg_name.empty() || pkg_version.empty()) {
                     res.status = 400;
-                    res.set_content(error_json("name and version are required"),
+                    res.set_content(detail::a4_error(res, "name and version are required"),
                                     "application/json");
                     return;
                 }
@@ -4765,7 +4954,7 @@ void RestApiV1::register_routes(
                 // returns 500 with no audit trail. Audit + 400 instead.
                 emit_denial("payload field has wrong JSON type — string expected");
                 res.status = 400;
-                res.set_content(error_json(std::string{"invalid field type: "} + e.what()),
+                res.set_content(detail::a4_error(res, std::string{"invalid field type: "} + e.what()),
                                 "application/json");
                 return;
             }
@@ -4786,7 +4975,7 @@ void RestApiV1::register_routes(
                 emit_denial("verify_command contains shell metacharacters / control chars or "
                             "exceeds length cap");
                 res.status = 400;
-                res.set_content(error_json(std::string{"verify_command"} + kInputErr),
+                res.set_content(detail::a4_error(res, std::string{"verify_command"} + kInputErr),
                                 "application/json");
                 return;
             }
@@ -4794,7 +4983,7 @@ void RestApiV1::register_routes(
                 emit_denial("rollback_command contains shell metacharacters / control chars or "
                             "exceeds length cap");
                 res.status = 400;
-                res.set_content(error_json(std::string{"rollback_command"} + kInputErr),
+                res.set_content(detail::a4_error(res, std::string{"rollback_command"} + kInputErr),
                                 "application/json");
                 return;
             }
@@ -4806,7 +4995,7 @@ void RestApiV1::register_routes(
                 emit_denial("silent_args contains shell metacharacters / control chars or "
                             "exceeds length cap");
                 res.status = 400;
-                res.set_content(error_json(std::string{"silent_args"} + kInputErr),
+                res.set_content(detail::a4_error(res, std::string{"silent_args"} + kInputErr),
                                 "application/json");
                 return;
             }
@@ -4814,7 +5003,7 @@ void RestApiV1::register_routes(
             auto result = sw_deploy_store->create_package(pkg);
             if (!result) {
                 res.status = 400;
-                res.set_content(error_json(result.error()), "application/json");
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }
             audit_fn(req, "software_package.create", "success", "SoftwarePackage", *result,
@@ -4859,7 +5048,7 @@ void RestApiV1::register_routes(
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded()) {
                           res.status = 400;
-                          res.set_content(error_json("invalid JSON"), "application/json");
+                          res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                           return;
                       }
                       SoftwareDeployment dep;
@@ -4869,7 +5058,7 @@ void RestApiV1::register_routes(
                       auto result = sw_deploy_store->create_deployment(dep);
                       if (!result) {
                           res.status = 400;
-                          res.set_content(error_json(result.error()), "application/json");
+                          res.set_content(detail::a4_error(res, result.error()), "application/json");
                           return;
                       }
                       audit_fn(req, "software_deployment.create", "success", "SoftwareDeployment",
@@ -4899,7 +5088,7 @@ void RestApiV1::register_routes(
                     res.set_content(ok_json(JObj().add("started", true).str()), "application/json");
                 } else {
                     res.status = 400;
-                    res.set_content(error_json("cannot start deployment"), "application/json");
+                    res.set_content(detail::a4_error(res, "cannot start deployment"), "application/json");
                 }
             });
 
@@ -4919,7 +5108,7 @@ void RestApiV1::register_routes(
                                           "application/json");
                       } else {
                           res.status = 400;
-                          res.set_content(error_json("cannot rollback deployment"),
+                          res.set_content(detail::a4_error(res, "cannot rollback deployment"),
                                           "application/json");
                       }
                   });
@@ -4940,7 +5129,7 @@ void RestApiV1::register_routes(
                                           "application/json");
                       } else {
                           res.status = 400;
-                          res.set_content(error_json("cannot cancel deployment"),
+                          res.set_content(detail::a4_error(res, "cannot cancel deployment"),
                                           "application/json");
                       }
                   });
@@ -4982,7 +5171,7 @@ void RestApiV1::register_routes(
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded()) {
                 res.status = 400;
-                res.set_content(error_json("invalid JSON"), "application/json");
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                 return;
             }
             License lic;
@@ -4996,7 +5185,7 @@ void RestApiV1::register_routes(
             auto result = license_store->activate_license(lic, key);
             if (!result) {
                 res.status = 400;
-                res.set_content(error_json(result.error()), "application/json");
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }
             audit_fn(req, "license.activate", "success", "License", *result, lic.organization);
@@ -5018,7 +5207,7 @@ void RestApiV1::register_routes(
                 res.set_content(ok_json(JObj().add("removed", true).str()), "application/json");
             } else {
                 res.status = 404;
-                res.set_content(error_json("license not found"), "application/json");
+                res.set_content(detail::a4_error(res, "license not found"), "application/json");
             }
         });
 
@@ -5087,7 +5276,7 @@ void RestApiV1::register_routes(
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
                   if (body.is_discarded() || !body.contains("agent_id")) {
                       res.status = 400;
-                      res.set_content(error_json("invalid request body"), "application/json");
+                      res.set_content(detail::a4_error(res, "invalid request body"), "application/json");
                       return;
                   }
                   auto agent_id = body.value("agent_id", "");
@@ -5162,7 +5351,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!guaranteed_state_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  auto rows = guaranteed_state_store->list_rules();
@@ -5326,14 +5515,14 @@ void RestApiV1::register_routes(
                      return;
                  if (!guaranteed_state_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  auto id = req.matches[1].str();
                  auto row = guaranteed_state_store->get_rule(id);
                  if (!row) {
                      res.status = 404;
-                     res.set_content(error_json("rule not found"), "application/json");
+                     res.set_content(detail::a4_error(res, "rule not found"), "application/json");
                      return;
                  }
                  res.set_content(ok_json(rule_to_jobj(*row).str()), "application/json");
@@ -5514,14 +5703,14 @@ void RestApiV1::register_routes(
                         return;
                     if (!guaranteed_state_store) {
                         res.status = 503;
-                        res.set_content(error_json("service unavailable", 503), "application/json");
+                        res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                         return;
                     }
                     auto id = req.matches[1].str();
                     auto result = guaranteed_state_store->delete_rule(id);
                     if (!result) {
                         res.status = 404;
-                        res.set_content(error_json(result.error()), "application/json");
+                        res.set_content(detail::a4_error(res, result.error()), "application/json");
                         audit_fn(req, "guaranteed_state.rule.delete", "denied", "GuaranteedState",
                                  id, result.error());
                         return;
@@ -5547,13 +5736,13 @@ void RestApiV1::register_routes(
             return;
         if (!guaranteed_state_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded() || (!body.is_null() && !body.is_object())) {
             res.status = 400;
-            res.set_content(error_json("invalid JSON"), "application/json");
+            res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
             audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
                      "invalid JSON body");
             return;
@@ -5604,7 +5793,7 @@ void RestApiV1::register_routes(
             pushed = guardian_push_fn(scope, full_sync);
             if (pushed < 0) {
                 res.status = 400;
-                res.set_content(error_json("invalid scope expression"), "application/json");
+                res.set_content(detail::a4_error(res, "invalid scope expression"), "application/json");
                 audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
                          "invalid scope=\"" + sanitize_audit_string(scope) + "\"");
                 return;
@@ -5634,7 +5823,7 @@ void RestApiV1::register_routes(
             return;
         if (!guaranteed_state_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         GuaranteedStateEventQuery q;
@@ -5679,7 +5868,7 @@ void RestApiV1::register_routes(
             [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
             if (ec != std::errc{} || v < 0) {
                 res.status = 400;
-                res.set_content(error_json("invalid limit"), "application/json");
+                res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
                 return;
             }
             q.limit = std::min(v, 1000);
@@ -5690,7 +5879,7 @@ void RestApiV1::register_routes(
             [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
             if (ec != std::errc{} || v < 0) {
                 res.status = 400;
-                res.set_content(error_json("invalid offset"), "application/json");
+                res.set_content(detail::a4_error(res, "invalid offset"), "application/json");
                 return;
             }
             q.offset = v;
@@ -5745,7 +5934,7 @@ void RestApiV1::register_routes(
             return;
         if (!guaranteed_state_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
@@ -6138,7 +6327,7 @@ void RestApiV1::register_routes(
             return;
         if (!guaranteed_state_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
@@ -6171,7 +6360,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!guaranteed_state_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  const std::string obs_type = req.matches[1].str();
@@ -6185,7 +6374,7 @@ void RestApiV1::register_routes(
                          std::string::npos;
                  if (!ok) {
                      res.status = 400;
-                     res.set_content(error_json("invalid obs_type"), "application/json");
+                     res.set_content(detail::a4_error(res, "invalid obs_type"), "application/json");
                      return;
                  }
                  const std::string window =
@@ -6199,7 +6388,7 @@ void RestApiV1::register_routes(
                          std::from_chars(s.data(), s.data() + s.size(), v);
                      if (ec != std::errc{} || v < 0) {
                          res.status = 400;
-                         res.set_content(error_json("invalid limit"), "application/json");
+                         res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
                          return;
                      }
                      limit = std::min(v, 500);
@@ -7008,7 +7197,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!net_perf_fn) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  const auto now = net_perf_fleet_now(net_perf_fn(std::string{}));
@@ -7043,7 +7232,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!net_perf_fn) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  const NetPerfMetric metric = net_perf_metric_from_token(
@@ -7071,7 +7260,7 @@ void RestApiV1::register_routes(
                          std::from_chars(s.data(), s.data() + s.size(), v);
                      if (ec != std::errc{} || v <= 0) {
                          res.status = 400;
-                         res.set_content(error_json("invalid limit"), "application/json");
+                         res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
                          return;
                      }
                      limit = std::min(v, 500);

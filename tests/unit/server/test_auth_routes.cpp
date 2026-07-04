@@ -235,6 +235,17 @@ TEST_CASE("AuthRoutes::require_admin — service-scoped token from admin is reje
     CHECK(res.status == 403);
     CHECK(res.body.find("service-scoped tokens cannot perform admin operations") !=
           std::string::npos);
+    // #1470: the require_admin denial now emits the unified A4 envelope with a
+    // correlation_id echoed on the header. require_admin gates a whole route,
+    // not a securable:operation, so there is deliberately NO `permission` field.
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["code"].get<int>() == 403);
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(j["error"].contains("retry_after_ms")); // A4: always present (null here)
+    CHECK_FALSE(j["error"].contains("permission"));
+    CHECK(j["meta"]["api_version"].get<std::string>() == "v1");
+    CHECK(res.get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
 }
 
 TEST_CASE("AuthRoutes::require_admin — MCP token from admin is rejected",
@@ -290,6 +301,17 @@ TEST_CASE("AuthRoutes::require_permission — readonly MCP tier blocks Execute r
     CHECK_FALSE(ok);
     CHECK(res.status == 403);
     CHECK(res.body.find("MCP token tier does not allow Execution:Execute") != std::string::npos);
+    // #1470: require_permission's MCP-tier denial now emits the unified A4
+    // envelope — a correlation_id (echoed on the header) and the structured
+    // securable_type:operation permission field (kPermissionDenied §A4).
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["code"].get<int>() == 403);
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(j["error"]["permission"].get<std::string>() == "Execution:Execute");
+    CHECK(j["error"].contains("retry_after_ms"));
+    CHECK(j["meta"]["api_version"].get<std::string>() == "v1");
+    CHECK(res.get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
 }
 
 TEST_CASE("AuthRoutes::require_permission — readonly MCP tier allows Read without RBAC",
@@ -375,16 +397,91 @@ TEST_CASE("AuthRoutes::require_permission — supervised MCP token blocked from 
                                             now + 3600, "", "supervised");
     REQUIRE(raw.has_value());
     auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.path = "/api/v1/executions"; // a REST (non-MCP) transport
     httplib::Response res;
 
     // tier_allows("supervised", Execution, Execute) → true
     // requires_approval("supervised", Execution, Execute) → true
-    // → must be blocked at the auth layer (approval re-dispatch is Phase 2)
+    // → on a REST transport the approval gate is enforced here so an MCP token
+    //   cannot bypass the ticket flow by switching endpoints (#520).
     bool ok = fix.ar->require_permission(req, res, "Execution", "Execute");
     CHECK_FALSE(ok);
     CHECK(res.status == 403);
     CHECK(res.body.find("approval") != std::string::npos);
-    CHECK(res.body.find("not yet implemented") != std::string::npos);
+}
+
+// Complement of the above: on the MCP JSON-RPC transport (`/mcp/v1/`) the C8 gate
+// in mcp_server.cpp is the authoritative approval gate (ticket-then-recall, #289),
+// so require_permission must NOT re-deny an approval-gated op here — otherwise the
+// recall consumes the ticket then dies at the auth layer. This is the exact
+// integration bug the UAT smoke caught (the MCP unit harness mocks perm_fn).
+TEST_CASE("AuthRoutes::require_permission — approval gate is skipped on the MCP transport",
+          "[auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-sup-mcp", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.path = "/mcp/v1/"; // the MCP transport — C8 governs approval
+    httplib::Response res;
+
+    // Same (supervised, Execution:Execute) that the REST case above denies — here
+    // the approval denial must NOT fire. RBAC is permissive in this fixture (the
+    // "allows Read" case returns true), so this passes through to true.
+    bool ok = fix.ar->require_permission(req, res, "Execution", "Execute");
+    CHECK(ok);
+    CHECK(res.body.find("approval") == std::string::npos); // the approval gate did not fire
+}
+
+// PR #1796 review C2: quarantine is Security:Execute on BOTH transports. The
+// kToolSecurity mapping and requires_approval("supervised","Security","Execute")
+// move together (see the invariant note above kToolSecurity in mcp_server.cpp),
+// so the REST POST/DELETE /api/v1/quarantine routes — which gate on
+// perm_fn("Security","Execute") — are mirror-denied here for a supervised token.
+// Before the fix the mapping said Security:Write while the routes checked
+// Execute, so requires_approval() was false for the REST pair and a supervised
+// MCP token could quarantine (and release) via REST with NO approval (#520).
+TEST_CASE("AuthRoutes::require_permission — supervised token mirror-denied on REST quarantine POST",
+          "[auth_routes][scope][mcp][quarantine]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-sup-quar-post", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.method = "POST";
+    req.path = "/api/v1/quarantine"; // the exact route the REST quarantine gate runs on
+    httplib::Response res;
+
+    // tier_allows("supervised", Security, Execute) → true
+    // requires_approval("supervised", Security, Execute) → true (the C2 rule)
+    // → non-MCP transport ⇒ the approval mirror-denial fires (#520).
+    bool ok = fix.ar->require_permission(req, res, "Security", "Execute");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("approval") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_permission — supervised token mirror-denied on REST quarantine DELETE",
+          "[auth_routes][scope][mcp][quarantine]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-sup-quar-del", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.method = "DELETE";
+    req.path = "/api/v1/quarantine/agent-1"; // release route — same Security:Execute gate
+    httplib::Response res;
+
+    bool ok = fix.ar->require_permission(req, res, "Security", "Execute");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("approval") != std::string::npos);
 }
 
 TEST_CASE("AuthRoutes::require_scoped_permission — supervised MCP token blocked from approval-gated Delete",
@@ -445,4 +542,57 @@ TEST_CASE("AuthRoutes::require_auth — oversized X-Yuzu-Token is rejected (DoS 
     auto session = fix.ar->require_auth(req, res);
     CHECK_FALSE(session.has_value());
     CHECK(res.status == 401);
+}
+
+// ---------------------------------------------------------------------------
+// AuthRoutes::url_decode — malformed percent-sequence safety (H-A)
+//
+// Prior to this fix, AuthRoutes::url_decode called std::stoul on any two
+// characters that followed a '%', throwing std::invalid_argument for non-hex
+// sequences such as "%GH" or a bare "%" and causing a 500 on form-encoded
+// POST handlers (login, MFA, SAML ACS).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::url_decode — valid percent-encoded sequences decode correctly",
+          "[auth_routes][url_decode]") {
+    CHECK(AuthRoutes::url_decode("hello%20world") == "hello world");
+    CHECK(AuthRoutes::url_decode("%26")            == "&");
+    CHECK(AuthRoutes::url_decode("%3D")            == "=");
+    CHECK(AuthRoutes::url_decode("%41")            == "A"); // 0x41 = 'A'
+    CHECK(AuthRoutes::url_decode("key%3Dvalue")    == "key=value");
+}
+
+TEST_CASE("AuthRoutes::url_decode — plus sign decoded to space", "[auth_routes][url_decode]") {
+    CHECK(AuthRoutes::url_decode("hello+world") == "hello world");
+}
+
+TEST_CASE("AuthRoutes::url_decode — bare percent passed through literally (H-A)",
+          "[auth_routes][url_decode]") {
+    // A bare '%' at end of string — no two chars follow → emit literally.
+    CHECK(AuthRoutes::url_decode("%")        == "%");
+    CHECK(AuthRoutes::url_decode("test%")    == "test%");
+}
+
+TEST_CASE("AuthRoutes::url_decode — single hex digit after percent passed through (H-A)",
+          "[auth_routes][url_decode]") {
+    // '%' followed by exactly one char (truncated) → emit literally.
+    CHECK(AuthRoutes::url_decode("%2")       == "%2");
+    CHECK(AuthRoutes::url_decode("abc%2")    == "abc%2");
+}
+
+TEST_CASE("AuthRoutes::url_decode — non-hex chars after percent passed through (H-A)",
+          "[auth_routes][url_decode]") {
+    // '%GH' — 'G' is not a hex digit in the first nibble → emit '%' literally.
+    CHECK(AuthRoutes::url_decode("%GH")      == "%GH");
+    // '%1G' — second nibble non-hex.
+    CHECK(AuthRoutes::url_decode("%1G")      == "%1G");
+    // Mid-string malformed, rest is plain text.
+    CHECK(AuthRoutes::url_decode("a%GHb")    == "a%GHb");
+}
+
+TEST_CASE("AuthRoutes::url_decode — mixed valid and malformed sequences (H-A)",
+          "[auth_routes][url_decode]") {
+    // The malformed '%GH' is passed through; the valid '%41' decodes to 'A'.
+    CHECK(AuthRoutes::url_decode("%GH%41")   == "%GHA");
+    CHECK(AuthRoutes::url_decode("ok%41")    == "okA");
 }

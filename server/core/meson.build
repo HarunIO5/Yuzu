@@ -49,6 +49,41 @@ if not re2_dep.found()
   re2_dep = cxx.find_library('re2')
 endif
 
+# SAML 2.0 SP — libxml2 (XML parser), xmlsec with the openssl backend
+# (XML-DSig enveloped signature verification), and zlib (HTTP-Redirect binding
+# DEFLATE decompression). Linux/macOS only; SAML is deferred on Windows and
+# the server fails closed (saml_deps is an empty list on Windows so no symbols
+# from these libraries are required at link time). A future saml_provider.cpp
+# must guard its platform-specific #include blocks with #if !defined(_WIN32).
+# Do NOT add Windows wiring here — the grpc/abseil/libpq Windows static-link
+# block in the root meson.build is load-bearing and must not be disturbed
+# (see CLAUDE.md "Windows grpc/protobuf/abseil is load-bearing").
+if host_machine.system() != 'windows'
+  libxml2_dep = dependency('LibXml2', method: 'cmake',
+    modules: ['LibXml2::LibXml2'],
+    required: false, include_type: 'system')
+  if not libxml2_dep.found()
+    libxml2_dep = dependency('libxml-2.0', required: true, include_type: 'system')
+  endif
+
+  xmlsec_dep = dependency('unofficial-xmlsec', method: 'cmake',
+    modules: ['unofficial::xmlsec::xmlsec1-openssl'],
+    required: false, include_type: 'system')
+  if not xmlsec_dep.found()
+    xmlsec_dep = dependency('xmlsec1-openssl', required: true, include_type: 'system')
+  endif
+
+  zlib_dep = dependency('ZLIB', method: 'cmake', modules: ['ZLIB::ZLIB'],
+    required: false, include_type: 'system')
+  if not zlib_dep.found()
+    zlib_dep = dependency('zlib', required: true, include_type: 'system')
+  endif
+
+  saml_deps = [libxml2_dep, xmlsec_dep, zlib_dep]
+else
+  saml_deps = []
+endif
+
 # Build-time embed of vendored ECharts into a generated .cpp containing
 # chunked raw string literals (sliced to fit MSVC's 16,380-byte limit on
 # raw string literals — error C2026). Symbol: kEChartsJs.
@@ -303,12 +338,15 @@ yuzu_server_core_lib = static_library(
     'src/heartbeat_ingestion.cpp',
     'src/approval_manager.cpp',
     'src/schedule_engine.cpp',
+    'src/schedule_routes.cpp',
+    'src/schedule_runner.cpp',
     'src/help_ui.cpp',
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
     'src/result_sets_ui.cpp',
     'src/rbac_store.cpp',
     'src/oidc_provider.cpp',
+    'src/saml_provider.cpp',
     'src/error_codes.cpp',
     'src/result_envelope.cpp',
     'src/concurrency_manager.cpp',
@@ -370,6 +408,7 @@ yuzu_server_core_lib = static_library(
     'src/webhook_routes.cpp',
     'src/offload_routes.cpp',
     'src/discovery_routes.cpp',
+    'src/discover_routes.cpp', # A2 discovery surface: /api/v1/discover/* (Issue 17.1)
     'src/viz_routes.cpp',
     'src/viz_page_ui.cpp',
     'src/viz_host_page_ui.cpp',
@@ -438,7 +477,8 @@ yuzu_server_core_lib = static_library(
   cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
                  sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
-                 libpq_dep, yuzu_key_provider_dep] + auth_crypto_deps + https_deps,
+                 libpq_dep, yuzu_key_provider_dep] + auth_crypto_deps + https_deps
+               + saml_deps,
 )
 
 yuzu_server_core_dep = declare_dependency(
@@ -446,7 +486,8 @@ yuzu_server_core_dep = declare_dependency(
   include_directories: include_directories('include'),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
                  sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
-                 libpq_dep, yuzu_key_provider_dep] + auth_crypto_deps + https_deps,
+                 libpq_dep, yuzu_key_provider_dep] + auth_crypto_deps + https_deps
+               + saml_deps,
 )
 
 executable(

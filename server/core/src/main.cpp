@@ -353,6 +353,16 @@ int main(int argc, char* argv[]) {
         ->check(CLI::Range(1, 86400))
         ->envname("YUZU_JIT_MAX_ELEVATION_SECS");
 
+    app.add_flag("--jit-oidc-amr-elevation,!--no-jit-oidc-amr-elevation",
+                 cfg.jit_oidc_amr_elevation,
+                 "Allow an OIDC session whose IdP login attested MFA (the `amr` claim) to "
+                 "satisfy POST /api/v1/elevate's mandatory second-factor requirement without "
+                 "local TOTP enrollment (default: true). A no-amr (single-factor) OIDC session "
+                 "is still denied regardless. Pass --no-jit-oidc-amr-elevation to disable it — "
+                 "OIDC sessions then cannot use JIT elevation at all (an operator must elevate "
+                 "from a local session with local TOTP).")
+        ->envname("YUZU_JIT_OIDC_AMR_ELEVATION");
+
     // Operator dashboard idle (inactivity) session timeout — SOC 2 CC6.3.
     app.add_option("--session-inactivity-secs", cfg.session_inactivity_secs,
                    "Seconds of inactivity after which an operator dashboard session is invalidated "
@@ -502,6 +512,23 @@ int main(int argc, char* argv[]) {
                  "Disable TLS certificate verification for OIDC endpoints (INSECURE, dev only)")
         ->envname("YUZU_OIDC_SKIP_TLS_VERIFY");
 
+    // SAML 2.0 SSO options (not supported on Windows — fail-closed)
+    app.add_option("--saml-idp-entity-id", cfg.saml_idp_entity_id,
+                   "SAML IdP entityID (must match Issuer element in assertions)")
+        ->envname("YUZU_SAML_IDP_ENTITY_ID");
+    app.add_option("--saml-idp-sso-url", cfg.saml_idp_sso_url,
+                   "SAML IdP SSO URL (HTTP-Redirect binding endpoint)")
+        ->envname("YUZU_SAML_IDP_SSO_URL");
+    app.add_option("--saml-idp-cert", cfg.saml_idp_cert,
+                   "Filesystem path to IdP signing certificate PEM (pinned key)")
+        ->envname("YUZU_SAML_IDP_CERT");
+    app.add_option("--saml-sp-entity-id", cfg.saml_sp_entity_id,
+                   "SAML SP entityID (used as AudienceRestriction in assertions)")
+        ->envname("YUZU_SAML_SP_ENTITY_ID");
+    app.add_option("--saml-sp-acs-url", cfg.saml_sp_acs_url,
+                   "SAML SP Assertion Consumer Service URL (POST binding endpoint)")
+        ->envname("YUZU_SAML_SP_ACS_URL");
+
     // Data infrastructure options
     app.add_option("--response-retention-days", cfg.response_retention_days,
                    "Response retention period in days (default: 90)")
@@ -563,6 +590,20 @@ int main(int argc, char* argv[]) {
                      "enrollment at login before a session is issued.",
                      cfg.mfa_enforcement,
                      cfg.mfa_enforcement == "required" ? "users" : "admins");
+    }
+    // ── JIT elevation OIDC-amr posture advisory (SRE SHOULD) ──
+    // Surface once at boot, alongside the other auth-posture lines, so an
+    // incident responder can discover this without reading source or an
+    // individual audit row's `mfa=` detail. Gated on the SAME predicate
+    // `oidc::Config::is_enabled()` uses (issuer AND client-id both set — see
+    // the --auth-mode=sso-only guard below) so a local-only deployment never
+    // sees an OIDC-flavoured log line.
+    if (!cfg.oidc_issuer.empty() && !cfg.oidc_client_id.empty() &&
+        cfg.jit_oidc_amr_elevation) {
+        spdlog::info("OIDC MFA (amr) may satisfy the elevation second-factor without local TOTP "
+                     "enrollment — pass --no-jit-oidc-amr-elevation to disable it, in which case "
+                     "OIDC sessions cannot use JIT elevation at all (an operator must elevate from "
+                     "a local session with local TOTP).");
     }
     // NOTE: the --auth-mode=sso-only fail-closed guard + posture log live just
     // before the server starts to SERVE (below), NOT here — so the host-CLI
