@@ -71,6 +71,7 @@ Yuzu has strong product depth (agent/server/gateway architecture, RBAC, policy e
 - Add **2FA/TOTP for high-risk approvals** (aligned with roadmap hardening).
 - Session management controls: revocation **shipped** (`DELETE /api/v1/sessions` admin force-logout, `DELETE /api/v1/sessions/me` self-revoke including API tokens; audit actions `session.revoke_all` / `session.revoke_all.self`; Prometheus counter `yuzu_auth_sessions_revoked_total`). Expiration in place via the existing 8-hour cookie max-age. Inactivity timeout and explicit secure-cookie-attribute review remain open.
 - API token governance: scoped permissions, expiration defaults, rotation process, token inventory.
+- **Residual (#1836):** OIDC IdP-group→RBAC deprovisioning (#1832) propagates on the user's **next SSO login**, not immediately on IdP-side group removal — a live session/cookie or an already-issued token retains its prior roles until re-authentication. Session revocation (above) is the operator's manual mitigation in the interim; automatic mid-session role re-check is tracked in #1836.
 
 ### Evidence
 
