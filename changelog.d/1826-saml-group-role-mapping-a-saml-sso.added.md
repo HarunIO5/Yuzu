@@ -23,19 +23,3 @@
   now trimmed of leading/trailing whitespace at load (closing the same silent-lockout bug already
   fixed for `--saml-admin-group`), and the OIDC admin audit detail now names the granting group
   (`admin_group=<value>`), mirroring the SAML audit detail.
-
-- **SAML 2.0 SP — thin first slice.** SP-initiated login against a single, statically-pinned IdP.
-  HTTP-Redirect binding for the `AuthnRequest`; HTTP-POST binding at the Assertion Consumer Service
-  (`POST /saml/acs`). Assertion signature is validated against the pinned IdP cert (in-document
-  `<KeyInfo>` ignored); XML signature-wrapping attacks are defended; audience, recipient, and
-  expiry are validated; `InResponseTo` is solicited-only and single-use (replay-protected). Sessions
-  are ephemeral (`auth_source="saml"`; `role=user` unless promoted to admin by group mapping — see
-  above). **Linux and macOS only** — Windows fails closed at startup. Five new flags / env vars:
-  `--saml-idp-entity-id` (`YUZU_SAML_IDP_ENTITY_ID`), `--saml-idp-sso-url`
-  (`YUZU_SAML_IDP_SSO_URL`), `--saml-idp-cert` (`YUZU_SAML_IDP_CERT`), `--saml-sp-entity-id`
-  (`YUZU_SAML_SP_ENTITY_ID`), `--saml-sp-acs-url` (`YUZU_SAML_SP_ACS_URL`). Audit:
-  `auth.saml_login` (result=ok) / `auth.saml_login_failed` (result=error). Partially closes
-  `/auth-and-authz` gap-matrix P1 #6. Fast-follow work (observability, proxy-TLS/HA, IdP metadata,
-  AuthnRequest signing, hardening) is tracked in #1789. See `docs/auth-architecture.md`
-  "SAML 2.0 SP", `docs/user-manual/authentication.md` "SAML 2.0 SSO", and the security review
-  `docs/security-reviews/saml-sp-2026-07-01.md`.
