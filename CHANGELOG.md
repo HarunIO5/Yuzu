@@ -7,8 +7,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Do not add entries to this section directly** — including you, AI coding
+> agent reading this. Unreleased changes are recorded as one-file-per-change
+> fragments under [`changelog.d/`](changelog.d/README.md) and assembled here at
+> release time by `scripts/assemble-changelog.py` (direct edits fail the
+> `Changelog fragments` CI check). Entries below predate the fragment
+> convention and will be promoted normally at the next release.
+
 ### Added
 
+- **Recurring instruction schedules now actually fire (#1191).** `ScheduleEngine::evaluate_due`/`advance_schedule` had no production caller — schedules persisted and listed but never dispatched. A new `ScheduleRunner` poller (the `PolicyEvaluator`/`PreflightRunner` shape, 30s tick, joined before the stores) closes the gap: due schedules fire through the same tracked dispatch path as operator-initiated commands, the approval gate is never bypassed (`requires_approval` OR definition `approval_mode != "auto"`, one ticket per occurrence, one-approval == one-run via the occurrence anchor), and every outcome is audited (`instruction.schedule_fired`, `instruction.approval_required`) and counted (`yuzu_schedule_{fires,fire_failures,approvals_submitted,tick_errors}_total`). Hardened against adversarial review before merge: `POST /api/schedules` requires BOTH `Schedule:Write` and `Execution:Execute` — a created schedule is a fleet-wide command-dispatch primitive with no further permission check at fire time — and re-enabling a disabled schedule requires `Execution:Execute` too (disabling never does, so a runaway schedule can always be stopped); delete and enable/disable are owner-scoped (`created_by`); one approval ticket is now scoped to the single schedule occurrence that requested it (`approvals.schedule_id`), so two schedules sharing the same (creator, definition, scope) can no longer settle on each other's ticket.
+- **MCP agentic write surface + approval tickets (#289, R2).** Five MCP write tools
+  are now dispatched: `set_tag`, `delete_tag`, `approve_request`, `reject_request`,
+  and `quarantine_device` (records the quarantine and dispatches live isolation).
+  Approval-gated tools use a ticket-then-recall flow: the first call returns
+  `kApprovalRequired` (-32006) with `approval_id` + `status_url`; after a second
+  principal approves, the caller re-invokes with the `approval_id` and the ticket is
+  consumed exactly once (args-bound, replay-rejected). Approval ids are CSPRNG-drawn;
+  the mint is deduplicated so a token cannot flood the shared pending-approval queue.
+  Review-round hardening (PR #1796): `quarantine_device` is `Security:Execute` on BOTH
+  transports and the supervised approval-policy rule moved with it — closing a mismatch
+  that let a supervised token quarantine via REST `POST /api/v1/quarantine` with no
+  approval (the REST POST/DELETE routes now mirror-deny, #520); the three
+  device-targeted write tools (`set_tag`/`delete_tag`/`quarantine_device`) authorize
+  through the per-device management-group scope gate (`require_scoped_permission`), so
+  a group-confined operator cannot tag or isolate out-of-scope devices;
+  approved-but-unconsumed tickets expire after 7 days (a forgotten approval is no
+  longer a forever-valid capability); the approvals store records `consumed_by`
+  (SOC 2 CC7.2 evidence chain: submitted_by → reviewed_by → consumed_by); and the
+  device-targeted ticket-mint audit rows carry `agent_id=` so SIEM can filter pending
+  isolation requests by endpoint.
+- **A2 discovery surface (Issue 17.1, #1794).** `GET /api/v1/discover/{permissions,
+  instructions,routes,scope-kinds,plugins}` plus five mirrored read-only MCP tools let
+  an agentic worker enumerate RBAC permissions, instruction schemas, REST routes,
+  scope-DSL kinds, and plugin actions from the live server (ETag + 304, A4-shaped
+  degraded paths). REST and MCP share one builder per catalog (cannot drift).
+- **Agentic-worker self-orientation (R2 follow-up).** `discover_plugins` (REST + MCP,
+  now catalog `version: 2`) enriches each action with its `parameter_schema` inline
+  when the action has a published InstructionDefinition (joined on plugin+action), and
+  reports `actions_enriched_with_schema` — so a worker learns *how* to call an action,
+  not just that it exists, from one request. The `execute_instruction` and
+  `discover_plugins` tool descriptions now spell out the async dispatch→poll pattern and
+  point at the `yuzu://operating-model` resource. Measured effect: an LLM operator
+  driving the fleet with no hand-fed action list made zero blind parameter guesses.
+- **A4 error-envelope completion (R2).** `GET /api/v1/approvals/{id}` (the approval
+  `status_url` target); the `auth_routes` denial shapes are unified into one A4
+  envelope carrying `correlation_id` and the missing `securable_type:operation`; the
+  ~156 legacy `error_json` sites in `rest_api_v1.cpp` now emit the A4 envelope.
+  **Breaking —** many of those `/api/v1` errors were previously `{"error":"<string>"}`
+  and are now the nested A4 object `{"error":{"code","message","correlation_id",…}}`;
+  a client that read `error` as a string will break. Migrate to `error.code`/
+  `error.message`. See `docs/user-manual/upgrading.md`.
+- **Installed-software inventory gains package-manager fields (blob contract v2, ADR-0016).**
+  Every row in `GET /api/v1/inventory/software` and the `query_installed_software` MCP tool
+  now carries `kind` (package|app), `ecosystem` (rpm|deb|apk|pacman|windows|macos|homebrew),
+  `epoch`, `release`, `arch`, `signature_status` (rpm only, from stored rpm header tags —
+  never a live `rpm -K` verification), `distro_id`, and `distro_version`, alongside the
+  original name/version/publisher/install_date. A field the ecosystem does not store is
+  `""`, never synthesised — see `docs/user-manual/inventory.md` for the full per-ecosystem
+  matrix. Collection is a new `installed_apps` plugin action, `list_inventory`; the
+  operator-facing `list`/`query`/`list_per_user` actions are unchanged. New `apk`
+  (Alpine) package enumeration on the sync path. **Breaking — data shift on Linux
+  rpm fleets:** `publisher` now reflects the rpm PACKAGER tag (was VENDOR), and `version`
+  is upstream-only with the release moved to its own column (was fused
+  `VERSION-RELEASE`). A saved query/dashboard filter against the old `publisher` or
+  fused `version` shape on rpm hosts will silently stop matching post-upgrade — see
+  `docs/user-manual/inventory.md` before relying on either field in existing
+  automation. No wire-protocol or gateway change (the fields ride inside the
+  existing opaque sync blob). **Upgrade note:** deploy the server before agents; each
+  agent's first post-upgrade sync triggers one expected full resend (`need_full`),
+  phase-spread across the daily sync window, self-healing.
+- **JIT elevation: OIDC amr-asserted MFA satisfies the second-factor
+  requirement.** An OIDC operator can now activate `POST /api/v1/elevate`
+  when their SSO session was authenticated with IdP MFA — asserted via the
+  OIDC `amr` claim and seeded into `Session::mfa_verified_at` at
+  `/auth/callback` (the same mechanism OIDC login step-up already used).
+  Closes the v1 limitation tracked in
+  `docs/security-reviews/jit-elevation-2026-06-30.md`. Eligibility and MFA
+  status are both keyed on a `users` table row, which OIDC login does not
+  create — a federated-only identity needs one provisioned first (e.g.
+  `POST /api/v1/users`). The mandatory-MFA gate branches EXPLICITLY on
+  identity source: an OIDC session's only acceptable factor is a **seeded**
+  proof (`mfa_verified_at != epoch`, never merely `auth_source == "oidc"`,
+  security-F1) with the toggle on, and it can **never** fall through to a
+  local namesake account's TOTP enrollment (a hardening-round fix — the first
+  cut's single-flag guard allowed exactly that fallthrough, mislabeling the
+  audit trail). A single-factor (no-`amr`) SSO session is hard-denied with
+  its own distinct reason; a stale seeded proof still falls through to the
+  existing step-up freshness challenge rather than a silent grant. New toggle
+  `--jit-oidc-amr-elevation` / `YUZU_JIT_OIDC_AMR_ELEVATION` (default true;
+  `--no-jit-oidc-amr-elevation` disables JIT elevation for OIDC sessions
+  entirely — they cannot fall back to a local TOTP step-up, since their
+  step-up challenge is re-SSO, not a TOTP code). A one-time INFO log line
+  announces the posture at boot when OIDC is configured. The
+  `role.elevation.granted` audit detail records the factor source
+  (`duration_secs=<n> mfa=<oidc_amr|local_totp> expires_at=<rfc3339> justification=<text>`
+  — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the
+  free-text `justification=` field so a crafted justification can't forge either).
+- **JIT admin elevation follow-ups: passive-lapse audit + absolute `expires_at` (SOC 2
+  CC6.3/CC6.6).** Closes the two residual risks tracked in
+  `docs/security-reviews/jit-elevation-2026-06-30.md`. (A) A JIT elevation window that
+  lapses PASSIVELY (no manual `POST /api/v1/elevate/revoke`) is now audited as
+  `role.elevation.expired` — emitted LAZILY (no new background thread) by
+  `AuthManager::reap_expired_elevation`, called from the `AuthRoutes::resolve_session`
+  cookie chokepoint on the operator's first authenticated request after the window
+  elapses; exactly-once, and a manual revoke never also produces a spurious `expired`
+  row. (B) `POST /api/v1/elevate`'s window is now clamped to the session's own absolute
+  expiry (`AuthManager::elevate_session`), so an elevation can never outlive its cookie
+  session; the response reports the TRUE remaining time as `expires_in` plus a new
+  wall-clock `expires_at` (RFC3339 UTC), and the `role.elevation.granted` audit detail
+  carries `expires_at` too.
+- **SAML 2.0 SP — thin first slice.** SP-initiated login against a single, statically-pinned IdP.
+  HTTP-Redirect binding for the `AuthnRequest`; HTTP-POST binding at the Assertion Consumer Service
+  (`POST /saml/acs`). Assertion signature is validated against the pinned IdP cert (in-document
+  `<KeyInfo>` ignored); XML signature-wrapping attacks are defended; audience, recipient, and
+  expiry are validated; `InResponseTo` is solicited-only and single-use (replay-protected). Sessions
+  are ephemeral (`auth_source="saml"`, `role=user`). **Linux and macOS only** — Windows fails closed
+  at startup. Five new flags / env vars: `--saml-idp-entity-id` (`YUZU_SAML_IDP_ENTITY_ID`),
+  `--saml-idp-sso-url` (`YUZU_SAML_IDP_SSO_URL`), `--saml-idp-cert` (`YUZU_SAML_IDP_CERT`),
+  `--saml-sp-entity-id` (`YUZU_SAML_SP_ENTITY_ID`), `--saml-sp-acs-url` (`YUZU_SAML_SP_ACS_URL`).
+  Audit: `auth.saml_login` (result=ok) / `auth.saml_login_failed` (result=error). Partially closes
+  `/auth-and-authz` gap-matrix P1 #6. Fast-follow work (observability, proxy-TLS/HA, IdP metadata,
+  group→role mapping, AuthnRequest signing, hardening) is tracked in #1789. See
+  `docs/auth-architecture.md` "SAML 2.0 SP", `docs/user-manual/authentication.md` "SAML 2.0 SSO",
+  and the security review `docs/security-reviews/saml-sp-2026-07-01.md`.
 - **`/inventory` Devices tab shows real device-CI data.** The Serial/Model/CPU-RAM
   columns (previously greyed placeholders) now read from `DeviceInventoryStore`, and
   the per-device drill grows a full CI-record panel (manufacturer, model, serial,
@@ -87,31 +209,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Windows agent service install was fundamentally broken (#1822).** `yuzu-agent.exe --install-service`
-  registered the process with the SCM, but the binary never implemented the SCM control protocol —
-  no `ServiceMain`/`RegisterServiceCtrlHandler`/`SetServiceStatus` anywhere — so the SCM killed the
-  process for not responding within its start timeout and `sc start YuzuAgent` always failed with
-  error 1053, regardless of config, network, or token. This affected every real install via the
-  shipped installer, not just ad-hoc `sc.exe` use. The agent now implements the real dispatcher
-  (`service_win.{hpp,cpp}`): `--install-service` appends an internal `--service` marker to the
-  registered binPath, and under that flag the process runs `ServiceMain`/a control handler instead
-  of the console path — reporting `SERVICE_RUNNING` immediately after local startup (parity with the
-  systemd unit, which has no readiness protocol either; the agent's server-reconnect loop is
-  unbounded while the network is down, so waiting for it would itself time out the SCM start), and
-  stopping cleanly on `SERVICE_CONTROL_STOP`/`SHUTDOWN` via the existing thread-safe `Agent::stop()`.
-  Also fixes an unquoted service binPath (a hazard under a spaced install path like
-  "Program Files") and adds `SERVICE_CONFIG_FAILURE_ACTIONS_FLAG` so the existing restart-on-failure
-  actions also fire on a clean exit with an error (e.g. the #1303 fail-closed TLS refusal), not just
-  a crash. Re-running `--install-service` over an existing (possibly stale/broken) registration now
-  updates it in place instead of failing with "service already exists" — note this resets binPath to
-  the bare exe + `--service` marker, so a manual re-run must be followed by `sc config` to restore any
-  previously-applied `--server`/`--data-dir`/`--log-file` args, same as the installer's own sequence.
-  The installer's `PrepareToInstall` stop-before-upgrade step now polls for `STOPPED` (skipped entirely
-  on a fresh install with no prior service, to avoid a needless wait) instead of a blind 2-second
-  delay, since `sc stop` only actually completes with this fix. The service still registers to run
-  as LocalSystem (unchanged from before this fix) — migrating it to the least-privilege
-  `NT SERVICE\YuzuAgent` virtual account is the existing, already-tracked #1442, not part of
-  this fix; see `docs/agent-privilege-model.md`.
+- **`POST /api/v1/tokens` now honors `mcp_tier`.** The handler documented (and
+  `create_token` already accepted) an `mcp_tier` field but silently dropped it, so a
+  requested MCP token was minted with the empty (RBAC-defer) tier — defeating
+  self-service MCP-token provisioning. The field is now passed through and validated
+  against the closed tier set (`readonly`/`operator`/`supervised`, or omitted); an
+  unrecognised value is a 400. A tiered/service-scoped token missing `expires_at` (or
+  over the 90-day cap) now returns a `400` instead of a misleading `503` "CSPRNG
+  unavailable" that false-paged on-call and wrote a false entropy-failure audit row.
+  The granted `mcp_tier` is recorded in the `api_token.create` audit and echoed by
+  `GET /api/v1/tokens`. **Upgrade note:** any MCP token minted before this fix was
+  stored tier-empty (RBAC-deferred = over-privileged vs intent) — rotate pre-upgrade
+  `mcp_tier` tokens (see `docs/user-manual/upgrading.md`).
 
 ## [0.13.0] - 2026-07-01
 
@@ -327,6 +436,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   degraded (pool/query failure), so a fleet vulnerability query can never read a transient backend
   hiccup as "installed nowhere". An ingest report carrying an implausibly large source map is rejected
   wholesale, and concurrent-replace serialization uses a 64-bit advisory-lock key.
+
+### Changed
+
+- **`POST /api/v1/elevate` response contract: `expires_in` now reports TRUE remaining seconds, not
+  the requested duration.** Previously `expires_in` echoed the requested/capped `duration_secs`
+  verbatim. It now reflects the actual remaining window computed after the grant (always `<=` the
+  requested duration — the window is clamped both to `--jit-max-elevation-secs` and to the calling
+  session's own absolute expiry) and is accompanied by a new `expires_at` (RFC3339 UTC) field.
+  Integrators comparing `expires_in` for exact equality against their requested `duration_secs` should
+  switch to a `<=` comparison. A session already at/past its own absolute lifetime is now rejected
+  `401` rather than granted a zero-length window (governance hardening round, UP-1/UP-4).
 
 ### Security
 
