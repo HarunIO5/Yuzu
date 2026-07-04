@@ -252,7 +252,7 @@ Navigate to **Settings > Directory Integration / OIDC SSO** in the dashboard. En
 | `--oidc-client-id` | Application (client) ID from the IdP |
 | `--oidc-client-secret` | Client secret (required for Entra/Azure AD web apps) |
 | `--oidc-redirect-uri` | Callback URL (auto-computed from the request `Host` header if omitted; must match IdP registration if set explicitly) |
-| `--oidc-admin-group` | Entra group object ID that maps to the admin role |
+| `--oidc-admin-group` | Entra group object ID that maps to the admin role (the value is trimmed automatically, same as `--saml-admin-group` — #1830) |
 | `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC endpoints (insecure, dev only) |
 
 Example startup:
@@ -312,7 +312,7 @@ Yuzu supports SAML 2.0 SP-initiated single sign-on against a single, statically-
 
 > **Platform note:** SAML is supported on Linux and macOS only. A Windows server logs an error at startup and does not enable SAML regardless of flag values. If you need SSO on Windows, use OIDC.
 
-> **Role note:** All SAML users sign in as `role=user`. There is no group-to-role mapping in this release. **SAML-authenticated users are permanently `role=user` — there is no admin path for them in this release.** JIT elevation is non-functional for SAML users (the elevation check requires a local `users` row in auth.db, which SAML users do not have). For admin access, use OIDC or a local account.
+> **Role note:** SAML sessions default to `role=user`. Configure `--saml-group-attribute` + `--saml-admin-group` to promote users in a specific IdP-attested group to `role=admin` — see [SAML Group-to-Role Mapping](#saml-group-to-role-mapping) below. Leave both flags unset (the default) and every SAML session lands as `role=user`, same as prior releases. JIT elevation is still non-functional for SAML users regardless of role (the elevation check requires a local `users` row in auth.db, which SAML users do not have) — a SAML admin gets `role=admin` directly at login via group mapping, not via the elevation endpoint.
 
 > **HTTPS required:** SAML uses a `Secure` browser-binding cookie (`__Host-yuzu_saml_bind`). Browsers silently drop `Secure` cookies over plain HTTP. SAML fails closed at startup when `--https-cert`/`--https-key` are not configured. Do not run SAML over HTTP.
 
@@ -353,6 +353,62 @@ Example startup:
   --saml-sp-acs-url    "https://yuzu.example.com/saml/acs"
 ```
 
+### SAML Group-to-Role Mapping
+
+Two additional flags, both optional and independent of the five required
+SAML flags above, let you grant admin access via IdP-attested group
+membership:
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--saml-group-attribute` | `YUZU_SAML_GROUP_ATTRIBUTE` | Name of the `<Attribute Name="...">` in the assertion's `<AttributeStatement>` whose `<AttributeValue>`s are group identifiers (e.g. Entra's `http://schemas.microsoft.com/ws/2008/06/identity/claims/groups`) |
+| `--saml-admin-group` | `YUZU_SAML_ADMIN_GROUP` | The single group value (from `--saml-group-attribute`) that grants `role=admin` |
+
+When both flags are configured and the assertion's group list contains the
+value in `--saml-admin-group`, the resulting session is `role=admin`.
+Otherwise (including when either flag is left empty) the session is
+`role=user` — the same default as prior releases.
+
+Matching is **exact string equality only** — no wildcard, prefix, or regex
+matching, and only a single admin group is supported (no multi-group /
+multi-role mapping, same limitation as OIDC's `--oidc-admin-group`).
+
+Admin via SAML is granted **only** through explicit membership in the
+configured group. `NameID`, email, and display name are **never** used to
+elevate privileges — mirrors the OIDC guard described above
+(`create_oidc_session`) — and group values are read from the same
+signature-verified assertion as `NameID`, so a forged or wrapped assertion
+element cannot inject group membership that the IdP didn't attest to.
+
+> **Configuring `--saml-admin-group` against a real IdP:**
+>
+> - The value must be the **exact identifier your IdP puts in the assertion**
+>   — not a human-friendly display name. Entra ID, for example, sends group
+>   **object ID GUIDs** (e.g. `4fb5b234-...`) in the group claim, not the
+>   group's display name; configure the GUID, not "Admins".
+> - Matching is **case-sensitive** — a value that differs only in case (or
+>   has stray leading/trailing whitespace copy-pasted from a portal — the
+>   admin-group value is trimmed automatically, but the group values inside
+>   the assertion itself are compared as the IdP sent them) will not match.
+> - **Entra ID "groups overage"**: a user who is a member of more than ~150
+>   groups gets **no `groups` claim at all** in the assertion — Entra
+>   substitutes a Graph API link instead. Such a user's assertion carries zero
+>   group values, so `--saml-admin-group` can never resolve them to admin
+>   regardless of actual group membership. Either keep the target admin's
+>   group count under the overage threshold or use a dedicated,
+>   low-membership group for the admin mapping.
+> - At most **64 group values** from the configured attribute are considered
+>   (a DoS guard); a value beyond the 64th is never evaluated.
+
+Changing either flag requires a server restart to take effect (no hot-reload,
+same as the other SAML flags).
+
+> **Unlike OIDC, SAML group values are not synced into `rbac_store`:**
+> SAML group values feed the admin/user role decision only; they are NOT
+> synced into `rbac_store` (group-scoped RBAC role assignments do not apply
+> to SAML principals) — deferred pending source-aware group resolution, see
+> issue #1832.
+
 ### SAML Login Flow
 
 1. The operator navigates directly to `GET /auth/saml/start`. There is no "Sign in with SAML" button on the login page in this release — the login-page SSO button for SAML is deferred.
@@ -383,14 +439,14 @@ The resulting session behaves identically to an OIDC session — it is subject t
 | Signed assertion validation (pinned IdP cert) | Supported |
 | Audience / recipient / expiry validation | Supported |
 | Replay protection (`InResponseTo` single-use) | Supported |
-| Group-to-role mapping | Not in this release — all SAML users are permanently `role=user` |
-| Admin access for SAML users | Not supported — JIT elevation is non-functional for SAML users; use OIDC or local accounts for admin |
+| Group-to-role mapping | Supported — `--saml-group-attribute` + `--saml-admin-group`, exact-match only; both unset ⇒ all SAML users are `role=user` (see [SAML Group-to-Role Mapping](#saml-group-to-role-mapping)) |
+| Admin access for SAML users | Supported via group mapping above; JIT elevation itself is still non-functional for SAML users (no local `users` row) — an admin session is granted directly at login, not via the elevation endpoint |
 | Login-page SSO button | Not in this release — navigate directly to `GET /auth/saml/start` |
 | MFA step-up at high-risk endpoints | Not supported — SAML sessions receive 403 at all step-up-gated endpoints regardless of `--mfa-enforcement`; rely on IdP MFA |
 | `--auth-mode=sso-only` with SAML-only | Not supported — `sso-only` requires OIDC configuration; local-password login cannot be disabled with SAML alone |
 | Multi-replica / HA without sticky sessions | Not supported — pending AuthnRequest state is in-process; configure load-balancer session affinity on `/auth/saml/start` and `/saml/acs` |
 | AuthnRequest signing | Not in this release — the IdP must accept unsigned requests; use OIDC if the IdP requires signed requests |
-| AttributeStatement parsing | Not in this release — only `NameID` is read |
+| AttributeStatement parsing | Only the configured `--saml-group-attribute` is read (for group-to-role mapping); no other assertion attributes are stored or surfaced beyond `NameID` |
 | IdP-metadata auto-fetch | Not in this release — cert and SSO URL are configured statically |
 | IdP cert hot-reload | Not supported — update `--saml-idp-cert` and restart the server |
 | Runtime reconfigure via dashboard | Not in this release — a server restart is required to change SAML flags |
