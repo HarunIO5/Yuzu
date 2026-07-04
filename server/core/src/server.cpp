@@ -1104,7 +1104,12 @@ public:
         if (cfg_.nvd_sync_enabled && nvd_db_->is_open()) {
             nvd_sync_ = std::make_unique<NvdSyncManager>(nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy,
                                                          cfg_.nvd_sync_interval);
-            nvd_sync_->start();
+            // #1867: do NOT start the background thread here. Its first action is
+            // an uncancellable NVD fetch; if a LATER ctor step fails closed (e.g.
+            // the Postgres substrate probe below sets startup_failed_), ~ServerImpl
+            // would have to join a thread wedged mid-fetch and hang the process
+            // forever, defeating any restart policy. The thread is started in run()
+            // only after every fail-closed check and the listeners are up.
         }
 
         // Initialize OTA update registry
@@ -2657,6 +2662,14 @@ public:
                      cfg_.listen_address, cfg_.management_address);
         if (gateway_service_) {
             spdlog::info("Gateway upstream listening on {}", cfg_.gateway_upstream_address);
+        }
+
+        // #1867: start NVD background sync only now — past every fail-closed
+        // check and with the listeners up. A construction failure returns above
+        // without ever starting the thread, so ~ServerImpl never has to join a
+        // thread wedged in an uncancellable fetch.
+        if (nvd_sync_) {
+            nvd_sync_->start();
         }
 
         // Create AuthRoutes — must precede start_web_server which uses it

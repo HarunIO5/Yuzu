@@ -51,6 +51,10 @@ private:
     mutable std::mutex mu_;
     std::condition_variable cv_;
     SyncStatus status_;
+    // Set true when sync_loop() actually returns. stop() waits on this so a
+    // thread wedged in an uncancellable fetch (#1867) is detached rather than
+    // joined-forever, letting the process exit instead of hanging shutdown.
+    std::atomic<bool> finished_{false};
 
 #ifdef __cpp_lib_jthread
     void sync_loop(std::stop_token stop);

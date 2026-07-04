@@ -36,6 +36,7 @@ void NvdSyncManager::start() {
     if (sync_thread_.joinable()) {
         return; // already running
     }
+    finished_.store(false);
 #ifdef __cpp_lib_jthread
     sync_thread_ = std::jthread([this](std::stop_token stop) { sync_loop(stop); });
 #else
@@ -51,20 +52,34 @@ void NvdSyncManager::stop() {
     }
 #ifdef __cpp_lib_jthread
     sync_thread_.request_stop();
-    {
-        std::lock_guard<std::mutex> lock{mu_};
-        cv_.notify_all();
-    }
-    sync_thread_.join();
 #else
     stop_requested_ = true;
+#endif
     {
         std::lock_guard<std::mutex> lock{mu_};
         cv_.notify_all();
     }
-    sync_thread_.join();
-#endif
-    spdlog::info("NVD sync manager stopped");
+
+    // #1867: bounded join. The sync thread may be wedged in an NVD fetch that
+    // ignores its per-request timeouts; an unconditional join() would hang the
+    // whole process on shutdown and defeat any restart policy. Wait a short
+    // grace period for the loop to exit cleanly, then detach + warn so the
+    // process can still terminate. Detach is the lesser evil (the process is
+    // going down anyway) versus a permanent hang.
+    constexpr auto kGrace = std::chrono::seconds(5);
+    const auto deadline = std::chrono::steady_clock::now() + kGrace;
+    while (!finished_.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (finished_.load()) {
+        sync_thread_.join();
+        spdlog::info("NVD sync manager stopped");
+    } else {
+        spdlog::warn("NVD sync thread did not exit within {}s (stuck in a fetch?); detaching to "
+                     "avoid wedging shutdown (see #1867)",
+                     kGrace.count());
+        sync_thread_.detach();
+    }
 }
 
 void NvdSyncManager::sync_now() {
@@ -109,6 +124,9 @@ void NvdSyncManager::sync_loop() {
         lock.unlock();
         do_sync();
     }
+
+    // Signal a clean exit so stop() can join() instead of detaching (#1867).
+    finished_.store(true);
 }
 
 void NvdSyncManager::do_sync() {
