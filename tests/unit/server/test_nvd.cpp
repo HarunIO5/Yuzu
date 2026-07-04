@@ -1135,3 +1135,19 @@ TEST_CASE("cve_match NOCASE index turns the LIKE-prefix match into a seek, not a
     REQUIRE(plan.find("idx_cve_match_product") != std::string::npos); // uses the index
     REQUIRE(plan.find("SCAN") == std::string::npos);                  // not a full scan
 }
+
+// ── PR2c: upsert dedupe-by-cve_id (#1882) ────────────────────────────────────
+
+TEST_CASE("NvdDatabase: upsert_cves merges duplicate cve_id, losing no matches", "[nvd][db]") {
+    NvdDatabase db(":memory:");
+    // A batch with TWO records sharing a cve_id but DIFFERENT products — without
+    // the merge, the second's delete-then-insert would wipe the first's match.
+    std::vector<CveRecord> batch;
+    batch.push_back(make_cve("CVE-2024-DUP", "productone", "2.0"));
+    batch.push_back(make_cve("CVE-2024-DUP", "producttwo", "3.0"));
+    db.upsert_cves(batch);
+
+    REQUIRE(db.total_cve_count() == 1);                                   // one distinct CVE
+    REQUIRE(db.match_inventory({{"productone", "1.0"}}).size() == 1);     // first product kept
+    REQUIRE(db.match_inventory({{"producttwo", "1.0"}}).size() == 1);     // second product kept
+}

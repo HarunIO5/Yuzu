@@ -8,11 +8,14 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstddef>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -355,19 +358,50 @@ void NvdDatabase::upsert_cve(const CveRecord& record) {
     upsert_cve_impl(record);
 }
 
-bool NvdDatabase::upsert_cve_impl(const CveRecord& record) {
-    if (!db_)
-        return false;
+namespace {
 
-    // Make header-upsert + match delete-then-insert ATOMIC per CVE (governance
-    // c1735cd3 UP-1). Without this, a mid-sequence failure could commit a CVE
-    // whose old match rows were deleted but new ones never inserted — a
-    // PERMANENTLY missed CVE, because incremental sync never re-sends an
-    // unmodified entry. On any failure we ROLLBACK TO the savepoint, leaving the
-    // CVE's prior (complete) match set intact. Savepoints nest safely inside the
-    // batch transaction (upsert_cves_impl) and also work standalone.
+// Prepare the three upsert statements ONCE (hoisted out of the per-CVE loop for
+// the batch path — #1881; the old code re-prepared+finalized all three per CVE,
+// ~3× hundreds of thousands of prepare/finalize on a full backfill). Caller
+// finalizes all three. Returns false on any prepare error.
+bool prepare_upsert_stmts(sqlite3* db, sqlite3_stmt*& hdr, sqlite3_stmt*& del, sqlite3_stmt*& ins) {
+    hdr = del = ins = nullptr;
+    const char* hdr_sql = R"(
+        INSERT OR REPLACE INTO cve
+            (cve_id, severity, description, published, last_modified, source)
+        VALUES (?, ?, ?, ?, ?, ?)
+    )";
+    const char* del_sql = "DELETE FROM cve_match WHERE cve_id = ?";
+    const char* ins_sql = R"(
+        INSERT INTO cve_match
+            (cve_id, cpe_vendor, cpe_product, cpe_version,
+             version_start_including, version_start_excluding,
+             version_end_including, version_end_excluding, is_vulnerable)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )";
+    if (sqlite3_prepare_v2(db, hdr_sql, -1, &hdr, nullptr) != SQLITE_OK ||
+        sqlite3_prepare_v2(db, del_sql, -1, &del, nullptr) != SQLITE_OK ||
+        sqlite3_prepare_v2(db, ins_sql, -1, &ins, nullptr) != SQLITE_OK) {
+        spdlog::error("NvdDatabase: upsert statement prepare failed: {}", sqlite3_errmsg(db));
+        sqlite3_finalize(hdr);
+        sqlite3_finalize(del);
+        sqlite3_finalize(ins);
+        hdr = del = ins = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// Bind + step the three ALREADY-PREPARED statements for one CVE, atomic per CVE
+// via a SAVEPOINT (governance UP-1). Without this, a mid-sequence failure could
+// commit a CVE whose old match rows were deleted but new ones never inserted — a
+// PERMANENTLY missed CVE. On any failure we ROLLBACK TO the savepoint, leaving
+// the CVE's prior (complete) match set intact. Savepoints nest safely inside the
+// batch transaction and also work standalone.
+bool upsert_cve_one(sqlite3* db, const CveRecord& record, sqlite3_stmt* hdr, sqlite3_stmt* del,
+                    sqlite3_stmt* ins) {
     char* serr = nullptr;
-    if (sqlite3_exec(db_, "SAVEPOINT cve_upsert;", nullptr, nullptr, &serr) != SQLITE_OK) {
+    if (sqlite3_exec(db, "SAVEPOINT cve_upsert;", nullptr, nullptr, &serr) != SQLITE_OK) {
         spdlog::error("NvdDatabase: SAVEPOINT failed for {}: {}", record.cve_id,
                       serr ? serr : "unknown");
         sqlite3_free(serr);
@@ -377,96 +411,79 @@ bool NvdDatabase::upsert_cve_impl(const CveRecord& record) {
     bool ok = true;
 
     // 1. Upsert the CVE header (keyed on cve_id — idempotent).
-    {
-        const char* sql = R"(
-            INSERT OR REPLACE INTO cve
-                (cve_id, severity, description, published, last_modified, source)
-            VALUES (?, ?, ?, ?, ?, ?)
-        )";
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-            spdlog::error("NvdDatabase: upsert_cve header prepare failed: {}",
-                          sqlite3_errmsg(db_));
-            ok = false;
-        } else {
-            sqlite3_bind_text(stmt, 1, record.cve_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(stmt, 2, record.severity.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(stmt, 3, record.description.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(stmt, 4, record.published.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(stmt, 5, record.last_modified.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(stmt, 6, record.source.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(stmt) != SQLITE_DONE) {
-                spdlog::error("NvdDatabase: upsert_cve header step failed for {}: {}",
-                              record.cve_id, sqlite3_errmsg(db_));
-                ok = false;
-            }
-            sqlite3_finalize(stmt);
-        }
+    sqlite3_reset(hdr);
+    sqlite3_bind_text(hdr, 1, record.cve_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(hdr, 2, record.severity.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(hdr, 3, record.description.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(hdr, 4, record.published.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(hdr, 5, record.last_modified.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(hdr, 6, record.source.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(hdr) != SQLITE_DONE) {
+        spdlog::error("NvdDatabase: upsert_cve header step failed for {}: {}", record.cve_id,
+                      sqlite3_errmsg(db));
+        ok = false;
     }
 
     // 2. Replace this CVE's match set (delete-then-insert) so re-syncing a CVE
     //    replaces its rows and a multi-product CVE keeps ALL its product rows.
     if (ok) {
-        const char* del = "DELETE FROM cve_match WHERE cve_id = ?";
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, del, -1, &stmt, nullptr) != SQLITE_OK) {
-            spdlog::error("NvdDatabase: cve_match delete prepare failed: {}", sqlite3_errmsg(db_));
+        sqlite3_reset(del);
+        sqlite3_bind_text(del, 1, record.cve_id.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(del) != SQLITE_DONE) {
+            spdlog::error("NvdDatabase: cve_match delete step failed for {}: {}", record.cve_id,
+                          sqlite3_errmsg(db));
             ok = false;
-        } else {
-            sqlite3_bind_text(stmt, 1, record.cve_id.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(stmt) != SQLITE_DONE) {
-                spdlog::error("NvdDatabase: cve_match delete step failed for {}: {}", record.cve_id,
-                              sqlite3_errmsg(db_));
-                ok = false;
-            }
-            sqlite3_finalize(stmt);
         }
     }
 
     // 3. Insert the new match rows.
-    if (ok && !record.matches.empty()) {
-        const char* ins = R"(
-            INSERT INTO cve_match
-                (cve_id, cpe_vendor, cpe_product, cpe_version,
-                 version_start_including, version_start_excluding,
-                 version_end_including, version_end_excluding, is_vulnerable)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        )";
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, ins, -1, &stmt, nullptr) != SQLITE_OK) {
-            spdlog::error("NvdDatabase: cve_match insert prepare failed: {}", sqlite3_errmsg(db_));
-            ok = false;
-        } else {
-            for (const auto& m : record.matches) {
-                sqlite3_reset(stmt);
-                sqlite3_bind_text(stmt, 1, record.cve_id.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 2, m.cpe_vendor.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 3, m.cpe_product.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 4, m.cpe_version.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 5, m.version_start_including.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 6, m.version_start_excluding.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 7, m.version_end_including.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 8, m.version_end_excluding.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int(stmt, 9, m.is_vulnerable ? 1 : 0);
-                if (sqlite3_step(stmt) != SQLITE_DONE) {
-                    spdlog::error("NvdDatabase: cve_match insert step failed for {}: {}",
-                                  record.cve_id, sqlite3_errmsg(db_));
-                    ok = false;
-                    break;
-                }
+    if (ok) {
+        for (const auto& m : record.matches) {
+            sqlite3_reset(ins);
+            sqlite3_bind_text(ins, 1, record.cve_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 2, m.cpe_vendor.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 3, m.cpe_product.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 4, m.cpe_version.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 5, m.version_start_including.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 6, m.version_start_excluding.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 7, m.version_end_including.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 8, m.version_end_excluding.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(ins, 9, m.is_vulnerable ? 1 : 0);
+            if (sqlite3_step(ins) != SQLITE_DONE) {
+                spdlog::error("NvdDatabase: cve_match insert step failed for {}: {}", record.cve_id,
+                              sqlite3_errmsg(db));
+                ok = false;
+                break;
             }
-            sqlite3_finalize(stmt);
         }
     }
 
     if (ok) {
-        sqlite3_exec(db_, "RELEASE cve_upsert;", nullptr, nullptr, nullptr);
+        sqlite3_exec(db, "RELEASE cve_upsert;", nullptr, nullptr, nullptr);
     } else {
         spdlog::error("NvdDatabase: rolling back partial upsert of {} (match set left unchanged)",
                       record.cve_id);
-        sqlite3_exec(db_, "ROLLBACK TO cve_upsert;", nullptr, nullptr, nullptr);
-        sqlite3_exec(db_, "RELEASE cve_upsert;", nullptr, nullptr, nullptr);
+        sqlite3_exec(db, "ROLLBACK TO cve_upsert;", nullptr, nullptr, nullptr);
+        sqlite3_exec(db, "RELEASE cve_upsert;", nullptr, nullptr, nullptr);
     }
+    return ok;
+}
+
+} // namespace
+
+bool NvdDatabase::upsert_cve_impl(const CveRecord& record) {
+    if (!db_)
+        return false;
+    // Standalone single-CVE path: prepare/finalize around the shared helper.
+    sqlite3_stmt* hdr = nullptr;
+    sqlite3_stmt* del = nullptr;
+    sqlite3_stmt* ins = nullptr;
+    if (!prepare_upsert_stmts(db_, hdr, del, ins))
+        return false;
+    const bool ok = upsert_cve_one(db_, record, hdr, del, ins);
+    sqlite3_finalize(hdr);
+    sqlite3_finalize(del);
+    sqlite3_finalize(ins);
     return ok;
 }
 
@@ -482,34 +499,76 @@ bool NvdDatabase::upsert_cves_impl(const std::vector<CveRecord>& records) {
         return true; // nothing to persist is not a failure
 
     char* err_msg = nullptr;
-    int rc = sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
+    if (sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, &err_msg) != SQLITE_OK) {
         spdlog::error("NvdDatabase: BEGIN failed: {}", err_msg ? err_msg : "unknown");
         sqlite3_free(err_msg);
         return false;
     }
 
-    // INVARIANT: at most one CveRecord per cve_id per batch. upsert_cve_impl
-    // does a delete-then-insert of the whole match set keyed on cve_id, so two
-    // records sharing a cve_id would have the second wipe the first's matches —
-    // reintroducing the very multi-product row-loss this reshape fixed. The
-    // reshaped parse_response folds all cpeMatch nodes of a CVE into ONE record,
-    // and builtin cve_ids are unique, so this holds today (governance N1).
-    std::size_t failed = 0;
-    for (const auto& record : records) {
-        if (!upsert_cve_impl(record))
-            ++failed; // this CVE was rolled back to its prior state; batch continues
-    }
-    if (failed > 0) {
-        spdlog::warn("NvdDatabase: {}/{} CVE upserts rolled back (prior data retained)", failed,
-                     records.size());
+    // ENFORCE (not just document) "at most one CveRecord per cve_id per batch":
+    // upsert_cve_one does a delete-then-insert of the whole match set keyed on
+    // cve_id, so two records sharing a cve_id would have the second wipe the
+    // first's matches. Fast path (the common case, and the invariant today —
+    // parse_response folds all cpeMatch nodes into ONE record): no duplicate
+    // cve_id, so upsert `records` directly with zero copy. Slow path: merge the
+    // duplicates (append matches) into owned records so no rows are lost.
+    std::vector<CveRecord> merged;
+    const std::vector<CveRecord>* to_upsert = &records;
+    {
+        std::unordered_set<std::string_view> seen;
+        seen.reserve(records.size());
+        bool has_dup = false;
+        for (const auto& r : records) {
+            if (!seen.insert(r.cve_id).second) {
+                has_dup = true;
+                break;
+            }
+        }
+        if (has_dup) {
+            std::unordered_map<std::string, std::size_t> idx;
+            for (const auto& r : records) {
+                auto it = idx.find(r.cve_id);
+                if (it == idx.end()) {
+                    idx.emplace(r.cve_id, merged.size());
+                    merged.push_back(r);
+                } else {
+                    auto& dst = merged[it->second].matches;
+                    dst.insert(dst.end(), r.matches.begin(), r.matches.end());
+                }
+            }
+            spdlog::warn("NvdDatabase: merged {} duplicate-cve_id record(s) in a batch of {}",
+                         records.size() - merged.size(), records.size());
+            to_upsert = &merged;
+        }
     }
 
-    rc = sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
+    // Prepare the three upsert statements ONCE for the whole batch (#1881).
+    sqlite3_stmt* hdr = nullptr;
+    sqlite3_stmt* del = nullptr;
+    sqlite3_stmt* ins = nullptr;
+    if (!prepare_upsert_stmts(db_, hdr, del, ins)) {
+        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        return;
+    }
+
+    std::size_t failed = 0;
+    for (const auto& record : *to_upsert) {
+        if (!upsert_cve_one(db_, record, hdr, del, ins))
+            ++failed; // this CVE rolled back to its prior state; batch continues
+    }
+
+    sqlite3_finalize(hdr);
+    sqlite3_finalize(del);
+    sqlite3_finalize(ins);
+
+    if (failed > 0) {
+        spdlog::warn("NvdDatabase: {}/{} CVE upserts rolled back (prior data retained)", failed,
+                     to_upsert->size());
+    }
+
+    if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, &err_msg) != SQLITE_OK) {
         spdlog::error("NvdDatabase: COMMIT failed: {}", err_msg ? err_msg : "unknown");
         sqlite3_free(err_msg);
-        // Attempt rollback
         sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
         return false;
     }
