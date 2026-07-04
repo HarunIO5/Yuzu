@@ -1260,6 +1260,66 @@ bool TarDatabase::insert_dns_events(const std::vector<DnsEvent>& events) {
     return true;
 }
 
+bool TarDatabase::insert_mapdrive_events(const std::vector<MapDriveEvent>& events) {
+    std::lock_guard lock(mu_);
+    if (!db_ || events.empty())
+        return events.empty();
+
+    char* err_msg = nullptr;
+    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
+    if (rc_begin != SQLITE_OK) {
+        spdlog::error("insert_mapdrive_events BEGIN: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        return false;
+    }
+    sqlite3_free(err_msg);
+
+    const char* sql = R"(
+        INSERT INTO mapdrive_live (ts, snapshot_id, action, direction, local_mount, remote_path, remote_host, username, provider, origin)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )";
+
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("insert_mapdrive_events prepare: {}", sqlite3_errmsg(db_));
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    for (const auto& ev : events) {
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
+        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
+        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 4, ev.direction.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 5, ev.local_mount.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 6, ev.remote_path.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 7, ev.remote_host.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 8, ev.username.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 9, ev.provider.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 10, ev.origin.c_str(), -1, SQLITE_STATIC);
+
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            spdlog::error("insert_mapdrive_events step: {}", sqlite3_errmsg(db_));
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return false;
+        }
+    }
+
+    err_msg = nullptr;
+    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK) {
+        spdlog::error("insert_mapdrive_events commit: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    return true;
+}
+
 bool TarDatabase::insert_perf_sample(const PerfRow& row) {
     std::lock_guard lock(mu_);
     if (!db_)

@@ -130,6 +130,26 @@ struct DnsEvent {
     std::string source;
 };
 
+/// One mapdrive_live row (capability-map §3.8 — network-share mappings, both
+/// directions). One row per appeared/removed transition of a (direction,
+/// local_mount, remote_path, remote_host, username) mapping; `provider` is a
+/// value field, not part of the diff key. `origin` ∈ {live, historical}:
+/// `live` rows come from the snapshot-diff (action appeared/removed); `historical`
+/// rows come from the one-time init backfill (action='historical', ts = the
+/// source artifact's time or 0) and bypass the diff entirely.
+struct MapDriveEvent {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    std::string action;    // appeared, removed, historical
+    std::string direction; // outbound, inbound
+    std::string local_mount;
+    std::string remote_path;
+    std::string remote_host;
+    std::string username;
+    std::string provider;
+    std::string origin;    // live, historical
+};
+
 /// One perf_live row (BRD A1 — continuous device performance sampling).
 struct PerfRow {
     int64_t ts{0};
@@ -351,6 +371,7 @@ public:
     bool insert_software_events(const std::vector<SoftwareEvent>& events);
     bool insert_arp_events(const std::vector<ArpEvent>& events);
     bool insert_dns_events(const std::vector<DnsEvent>& events);
+    bool insert_mapdrive_events(const std::vector<MapDriveEvent>& events);
     bool insert_perf_sample(const PerfRow& row);
     bool insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows);
     bool insert_netqual_samples(const std::vector<NetQualRow>& rows);

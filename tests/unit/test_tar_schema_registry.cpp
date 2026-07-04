@@ -239,6 +239,7 @@ TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
     // always-on.
     for (const auto* name :
          {"module", "procperf", "netqual", "arp", "dns", "software", "netconn"}) {
+    for (const auto* name : {"module", "procperf", "netqual", "arp", "dns", "software", "mapdrive"}) {
         INFO("opt-in source=" << name);
         CHECK_FALSE(source_default_enabled(name));
     }

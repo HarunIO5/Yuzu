@@ -183,6 +183,8 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('version')  # tar_proc_perf.cpp GetFileVersionInfoW
   tar_test_deps += cxx.find_library('wevtapi')  # tar_netconn_win.cpp EvtQuery/EvtRender
   tar_test_deps += cxx.find_library('ws2_32')   # winsock2 symbols the iphlpapi/netioapi headers in tar_netqual_boot.cpp pull in
+  tar_test_deps += cxx.find_library('mpr')      # tar_mapdrive_collector.cpp WNet outbound
+  tar_test_deps += cxx.find_library('netapi32') # tar_mapdrive_collector.cpp NetSessionEnum inbound
 elif host_machine.system() == 'darwin'
   # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
   # audit-token helpers, gated on the framework being present (full Xcode SDK).
@@ -215,6 +217,7 @@ tar_test_exe = executable(
     'unit/test_tar_proc_es.cpp',
     'unit/test_tar_module_stream.cpp',
     'unit/test_tar_module_etw.cpp',
+    'unit/test_tar_mapdrive.cpp',
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
@@ -231,6 +234,7 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_module_etw.cpp',
     '../agents/plugins/tar/src/tar_netqual_boot.cpp',
     '../agents/plugins/tar/src/tar_netconn_win.cpp',
+    '../agents/plugins/tar/src/tar_mapdrive_collector.cpp',
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [
