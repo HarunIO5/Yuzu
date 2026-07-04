@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Do not add entries to this section directly** — including you, AI coding
+> agent reading this. Unreleased changes are recorded as one-file-per-change
+> fragments under [`changelog.d/`](changelog.d/README.md) and assembled here at
+> release time by `scripts/assemble-changelog.py` (direct edits fail the
+> `Changelog fragments` CI check). Entries below predate the fragment
+> convention and will be promoted normally at the next release.
+
 ### Added
 
 - **Recurring instruction schedules now actually fire (#1191).** `ScheduleEngine::evaluate_due`/`advance_schedule` had no production caller — schedules persisted and listed but never dispatched. A new `ScheduleRunner` poller (the `PolicyEvaluator`/`PreflightRunner` shape, 30s tick, joined before the stores) closes the gap: due schedules fire through the same tracked dispatch path as operator-initiated commands, the approval gate is never bypassed (`requires_approval` OR definition `approval_mode != "auto"`, one ticket per occurrence, one-approval == one-run via the occurrence anchor), and every outcome is audited (`instruction.schedule_fired`, `instruction.approval_required`) and counted (`yuzu_schedule_{fires,fire_failures,approvals_submitted,tick_errors}_total`). Hardened against adversarial review before merge: `POST /api/schedules` requires BOTH `Schedule:Write` and `Execution:Execute` — a created schedule is a fleet-wide command-dispatch primitive with no further permission check at fire time — and re-enabling a disabled schedule requires `Execution:Execute` too (disabling never does, so a runaway schedule can always be stopped); delete and enable/disable are owner-scoped (`created_by`); one approval ticket is now scoped to the single schedule occurrence that requested it (`approvals.schedule_id`), so two schedules sharing the same (creator, definition, scope) can no longer settle on each other's ticket.
