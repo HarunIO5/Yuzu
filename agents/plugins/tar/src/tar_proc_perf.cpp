@@ -616,6 +616,9 @@ ProcSnapshot read_proc_counters() {
         while (f.read(buf, sizeof buf))
             content.append(buf, static_cast<std::size_t>(f.gcount()));
         content.append(buf, static_cast<std::size_t>(f.gcount()));
+        if (f.bad())
+            continue; // mid-read I/O error — fail closed rather than tokenize a
+                      // truncated tail (parity with read_proc in tar_perf.cpp)
         if (auto pc = parse_linux_pid_stat(pid, content, clk, page))
             snap.procs.push_back(std::move(*pc));
     }

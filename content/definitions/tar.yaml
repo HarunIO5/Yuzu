@@ -400,9 +400,13 @@ spec:
           (procperf source → $ProcPerf_*). **Off by default** — per-application
           resource usage reveals which applications run on a device, which is
           usage-class telemetry under the works-council posture; independent of
-          perf_enabled. Image names only — never command lines. Set to "true" to
-          opt in. Requires agent v0.12.0+; older agents silently ignore.
-          Valid: "true" | "false".
+          perf_enabled. Image names only — never command lines. **Enabling this
+          also sends per-app names + versions OFF-DEVICE**: the top-N is synced
+          daily to the central app_perf store (the B1 per-device and B2 fleet
+          views), so it is not local-triage-only. To keep the device fully
+          local, leave this off, or suppress the upload with --inventory-disable
+          / YUZU_AGENT_INVENTORY_DISABLE. Set to "true" to opt in. Requires
+          agent v0.12.0+; older agents silently ignore. Valid: "true" | "false".
         validation:
           pattern: "^(true|false)$"
       netqual_enabled:

@@ -1755,7 +1755,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | `tar.configure` | `tar` | Y | Y | Y | Verified |
 | `tar.collect_fast` | `tar` | Y | Y | Y | Verified |
 | `tar.collect_slow` | `tar` | Y | Y | Y | Verified |
-| `tar.collect_perf` | `tar` | Y | - | - | Verified |
+| `tar.collect_perf` | `tar` | Y | Y | - | Verified |
 | `tar.sql` | `tar` | Y | Y | Y | Verified |
 | `tar.rollup` | `tar` | Y | Y | Y | Verified |
 | `tar.compatibility` | `tar` | Y | Y | Y | Verified |
