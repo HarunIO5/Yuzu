@@ -468,9 +468,27 @@ jobs:
         # the canonical executable differs by platform: Linux runners
         # have `python3`, Windows MSYS2 runners have `python`.
         run: |
-          PYTHON=$(command -v python3 || command -v python)
+          # Pick the first interpreter that ACTUALLY RUNS, not merely the
+          # first name `command -v` resolves. On the Wee Tam Windows runner
+          # `command -v python3` SUCCEEDS but resolves to the Windows App
+          # Execution Alias stub (…\WindowsApps\python3.exe), which prints
+          # "Python was not found…" and exits non-zero instead of executing
+          # (a standard CPython Windows install ships python.exe but NO
+          # python3.exe, so the real interpreter is `python`). The old
+          # `command -v python3 || command -v python` latched onto that stub
+          # and never fell through — this broke the Windows leg after the
+          # Shulgi→Wee Tam runner cutover (#1615); it was a real miss on the
+          # old Shulgi box so the fallback used to fire. Probing by
+          # execution skips the stub. Linux still selects python3 first.
+          PYTHON=""
+          for cand in python3 python; do
+            if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "" >/dev/null 2>&1; then
+              PYTHON="$cand"
+              break
+            fi
+          done
           if [[ -z "$PYTHON" ]]; then
-            echo "::error::no python interpreter on PATH (tried python3, python)"
+            echo "::error::no working python interpreter on PATH (tried python3, python)"
             exit 1
           fi
           for f in codeql-sarif/*.sarif; do

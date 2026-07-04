@@ -14,7 +14,7 @@
 #include "mcp_policy.hpp"
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
-#include "rest_a4_envelope.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial — the unified A4 denial wrapper (#1470)
 
 #include <ctime>
 
@@ -32,28 +32,64 @@ namespace {
 // this before it reaches the audit detail.
 constexpr std::size_t kMaxJustificationLength = 1024;
 
-// A4 denial envelope for the scoped-permission gate (#1549 review MEDIUM). The
-// shared require_scoped_permission gate is the denial chokepoint for the agentic
-// per-device routes, so its 401/403 bodies must carry the A4 fields — a
-// `correlation_id` and, for permission denials, a structured
-// `securable_type:operation` permission — not the bare {"error":{"code","message"}}
-// shape the rest of the per-device surface's error branches already use. Reuses
-// the X-Correlation-Id the handler already set (so header and body agree),
-// minting one otherwise. Deliberately scoped to this gate + the require_auth 401
-// it calls; the require_admin / require_permission denials and the
-// standalone-route 401s are the tracked systemic follow-up (the whole-helper
-// A4 reshaping), not this PR.
-std::string a4_denial(httplib::Response& res, int code, const std::string& message,
-                      const std::string& permission = {}) {
-    std::string cid = res.get_header_value("X-Correlation-Id");
-    if (cid.empty()) {
-        cid = detail::make_correlation_id();
-        res.set_header("X-Correlation-Id", cid);
+// The A4 denial envelope has moved to detail::a4_denial in
+// rest_a4_envelope_http.hpp (#1470 — folded into the one unified builder so
+// require_admin / require_permission / require_scoped_permission and the
+// service-scope gates all emit the same shape with a correlation_id and, where
+// known, the structured "<securable_type>:<operation>" permission field).
+// Callers below use detail::a4_denial(res, code, msg, {.permission = ...}).
+
+// system_clock time_point → ISO-8601 UTC ("YYYY-MM-DDTHH:MM:SSZ"). Mirrors
+// guardian_ingest.cpp's ts_to_iso8601 / rest_api_v1.cpp's iso_now pattern —
+// the established per-file idiom for this codebase (no shared formatter
+// header exists yet). Used for JIT elevation's `expires_at` (follow-up B,
+// security review 2026-06-30): the wall-clock projection of an internally
+// steady_clock-tracked window.
+std::string iso8601_utc(std::chrono::system_clock::time_point tp) {
+    std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm{};
+#if defined(_WIN32)
+    // gmtime_s returns nonzero on failure — don't silently format a
+    // zero-inited tm as 1970-01-01 (L1, adversarial review).
+    if (gmtime_s(&tm, &t) != 0)
+        return "invalid-time";
+#else
+    if (gmtime_r(&t, &tm) == nullptr)
+        return "invalid-time";
+#endif
+    char buf[32] = {};
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return std::string(buf);
+}
+
+/// Boundary-aware cookie-value extractor.
+///
+/// Splits the Cookie header on ";" — tolerating both the RFC 6265 §4.2.1
+/// canonical "; " separator and a bare ";" (some clients/proxies omit the
+/// trailing space) by skipping leading whitespace in each segment — and
+/// performs an exact-name match so a cookie named "foo__Host-yuzu_saml_bind"
+/// cannot shadow "__Host-yuzu_saml_bind".  Returns the value string or empty.
+///
+/// DOES NOT alter extract_session_cookie (which has a separate legacy call
+/// site and is not affected by the SAML binding-cookie shadowing risk).
+static std::string find_cookie_value(const std::string& hdr, const std::string& name) {
+    const std::string prefix = name + "=";
+    std::size_t pos = 0;
+    while (pos < hdr.size()) {
+        // Tolerate "; " and bare ";" separators: skip optional leading whitespace.
+        while (pos < hdr.size() && (hdr[pos] == ' ' || hdr[pos] == '\t')) ++pos;
+        const auto delim   = hdr.find(';', pos);
+        const auto seg_end = (delim == std::string::npos) ? hdr.size() : delim;
+        const auto seg_len = seg_end - pos;
+        // Exact name match: segment starts with "name=" and is at least that long.
+        if (seg_len >= prefix.size() &&
+            hdr.compare(pos, prefix.size(), prefix) == 0) {
+            return hdr.substr(pos + prefix.size(), seg_len - prefix.size());
+        }
+        if (delim == std::string::npos) break;
+        pos = delim + 1; // advance past ";"
     }
-    nlohmann::json err = {{"code", code}, {"message", message}, {"correlation_id", cid}};
-    if (!permission.empty())
-        err["permission"] = permission;
-    return nlohmann::json{{"error", std::move(err)}, {"meta", {{"api_version", "v1"}}}}.dump();
+    return {};
 }
 
 } // namespace
@@ -66,10 +102,12 @@ AuthRoutes::AuthRoutes(Config& cfg, auth::AuthManager& auth_mgr, RbacStore* rbac
                        ApiTokenStore* api_token_store, AuditStore* audit_store,
                        ManagementGroupStore* mgmt_group_store, TagStore* tag_store,
                        AnalyticsEventStore* analytics_store, std::shared_mutex& oidc_mu,
-                       std::unique_ptr<oidc::OidcProvider>& oidc_provider)
+                       std::unique_ptr<oidc::OidcProvider>& oidc_provider,
+                       saml::SamlProvider* saml_provider)
     : cfg_(cfg), auth_mgr_(auth_mgr), rbac_store_(rbac_store), api_token_store_(api_token_store),
       audit_store_(audit_store), mgmt_group_store_(mgmt_group_store), tag_store_(tag_store),
-      analytics_store_(analytics_store), oidc_mu_(oidc_mu), oidc_provider_(oidc_provider) {}
+      analytics_store_(analytics_store), oidc_mu_(oidc_mu), oidc_provider_(oidc_provider),
+      saml_provider_(saml_provider) {}
 
 // ---------------------------------------------------------------------------
 // Static utilities
@@ -87,13 +125,31 @@ std::string AuthRoutes::extract_session_cookie(const httplib::Request& req) {
 }
 
 std::string AuthRoutes::url_decode(const std::string& s) {
+    // Use a hexval lookup instead of std::stoul so that malformed percent-
+    // sequences ("%GH", "%G", bare "%") never throw std::invalid_argument and
+    // 500 the request.  A malformed sequence is emitted literally — valid
+    // input behaviour (well-formed %HH + '+') is unchanged.
+    // Mirrors yuzu::server::url_decode in web_utils.hpp; kept as a static
+    // member so callers that already depend on AuthRoutes::url_decode
+    // (OIDC/login/SAML form parsing) do not need include changes.
+    auto hexval = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
     std::string out;
     out.reserve(s.size());
     for (std::size_t i = 0; i < s.size(); ++i) {
         if (s[i] == '%' && i + 2 < s.size()) {
-            auto hex = s.substr(i + 1, 2);
-            out += static_cast<char>(std::stoul(hex, nullptr, 16));
-            i += 2;
+            const int hi = hexval(s[i + 1]);
+            const int lo = hexval(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out += static_cast<char>((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+            out += s[i]; // malformed → emit literal '%'
         } else if (s[i] == '+') {
             out += ' ';
         } else {
@@ -105,13 +161,24 @@ std::string AuthRoutes::url_decode(const std::string& s) {
 
 std::string AuthRoutes::extract_form_value(const std::string& body, const std::string& key) {
     auto needle = key + "=";
-    auto pos = body.find(needle);
-    if (pos == std::string::npos)
-        return {};
-    pos += needle.size();
-    auto end = body.find('&', pos);
-    auto raw = body.substr(pos, end == std::string::npos ? end : end - pos);
-    return url_decode(raw);
+    std::size_t search_from = 0;
+    for (;;) {
+        auto pos = body.find(needle, search_from);
+        if (pos == std::string::npos)
+            return {};
+        // Boundary check: only accept a match at the very start of the body
+        // or immediately after an '&' field separator. Without this, a
+        // field name that merely ENDS in `key` (e.g. an attacker-supplied
+        // "fooSAMLResponse=attacker&SAMLResponse=real") would shadow the
+        // genuine field.
+        if (pos == 0 || body[pos - 1] == '&') {
+            pos += needle.size();
+            auto end = body.find('&', pos);
+            auto raw = body.substr(pos, end == std::string::npos ? end : end - pos);
+            return url_decode(raw);
+        }
+        search_from = pos + 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,8 +208,23 @@ std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request&
     if (token.size() > auth::kMaxSessionTokenLength)
         return std::nullopt;
     auto session = auth_mgr_.validate_session(token);
-    if (session)
+    if (session) {
+        // Lazily reap a passively-lapsed JIT elevation on the cookie chokepoint
+        // (residual-risk follow-up A, security review 2026-06-30): there is no
+        // background reaper, so the next authenticated request after a window
+        // lapses is where the `role.elevation.expired` audit row is minted.
+        // Uses audit_log_for_principal (not audit_log) because audit_log's
+        // make_audit_event() itself calls resolve_session(req) — calling that
+        // from inside resolve_session would re-enter this function. `session`
+        // already carries the base role (Session::role is never the elevated
+        // view), matching the `role.elevation.revoked` audit's principal_role.
+        if (auto expired_user = auth_mgr_.reap_expired_elevation(token)) {
+            audit_log_for_principal(req, "role.elevation.expired", "expired", *expired_user,
+                                    auth::role_to_string(session->role), "User", *expired_user,
+                                    "JIT admin elevation window lapsed");
+        }
         return session;
+    }
 
     // 2. Try Authorization: Bearer <token> (API token auth)
     auto auth_header = req.get_header_value("Authorization");
@@ -177,7 +259,7 @@ std::optional<auth::Session> AuthRoutes::require_auth(const httplib::Request& re
         return session;
 
     res.status = 401;
-    res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+    res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
     return std::nullopt;
 }
 
@@ -195,8 +277,11 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
         audit_log(req, "auth.admin_required", "denied", "", "",
                   "service-scoped token blocked from admin route");
         res.status = 403;
+        // A4 unified envelope (#1470). require_admin gates a whole route, not a
+        // single securable:operation, so no `permission` field is emitted; the
+        // correlation_id ties the 403 to the auth.admin_required audit row.
         res.set_content(
-            R"({"error":{"code":403,"message":"service-scoped tokens cannot perform admin operations"},"meta":{"api_version":"v1"}})",
+            detail::a4_denial(res, 403, "service-scoped tokens cannot perform admin operations"),
             "application/json");
         return false;
     }
@@ -204,9 +289,8 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
         audit_log(req, "auth.admin_required", "denied", "", "",
                   "MCP token blocked from admin route");
         res.status = 403;
-        res.set_content(
-            R"({"error":{"code":403,"message":"MCP tokens cannot perform admin operations"},"meta":{"api_version":"v1"}})",
-            "application/json");
+        res.set_content(detail::a4_denial(res, 403, "MCP tokens cannot perform admin operations"),
+                        "application/json");
         return false;
     }
 
@@ -222,9 +306,7 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
         // audit_fn through dozens of route registrations (governance PR4).
         audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
         res.status = 403;
-        res.set_content(
-            R"({"error":{"code":403,"message":"admin role required"},"meta":{"api_version":"v1"}})",
-            "application/json");
+        res.set_content(detail::a4_denial(res, 403, "admin role required"), "application/json");
         return false;
     }
     return true;
@@ -258,34 +340,38 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                       "MCP token tier '" + session->mcp_tier + "' does not allow " +
                           securable_type + ":" + operation);
             res.status = 403;
-            res.set_content(nlohmann::json({{"error",
-                                             {{"code", 403},
-                                              {"message", "MCP token tier does not allow " +
-                                                              securable_type + ":" + operation}}},
-                                            {"meta", {{"api_version", "v1"}}}})
-                                .dump(),
-                            "application/json");
+            // A4 unified envelope (#1470) — the kPermissionDenied specialisation
+            // names the missing grant in the structured `permission` field.
+            const std::string perm = securable_type + ":" + operation;
+            res.set_content(
+                detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
+                                  detail::A4ErrorOpts{.permission = perm}),
+                "application/json");
             return false;
         }
-        // Approval-gated operations (supervised tier on destructive ops) cannot
-        // proceed because the approval workflow re-dispatch path is Phase 2 work.
-        // mcp_server.cpp denies the same case with kTierDenied (it deliberately
-        // does NOT return kApprovalRequired — A4 reserves that for a pollable
-        // approval it cannot produce yet); mirror that denial here so the REST
-        // transport cannot bypass it (#520).
-        if (mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
+        // Approval-gated operations (supervised tier on destructive ops).
+        // On the MCP JSON-RPC transport (`/mcp/v1/`) the C8 gate in
+        // mcp_server.cpp is the AUTHORITATIVE approval gate: it mints a ticket,
+        // and on a recall it verifies + consumes a valid approval before the
+        // per-tool handler ever calls this function (#289 ticket-then-recall).
+        // Re-denying here would break that recall (consume-then-deny) — so skip
+        // it on the MCP endpoint. Keep the denial for EVERY OTHER transport: a
+        // REST route hit by an MCP token must not bypass the ticket flow (#520).
+        if (req.path != "/mcp/v1/" &&
+            mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
             audit_log(req, "auth.approval_required", "denied", "", "",
                       "MCP token tier '" + session->mcp_tier + "' requires approval for " +
-                          securable_type + ":" + operation + " (Phase 2 not implemented)");
+                          securable_type + ":" + operation + " on a non-MCP transport");
             res.status = 403;
+            const std::string perm = securable_type + ":" + operation;
             res.set_content(
-                nlohmann::json(
-                    {{"error",
-                      {{"code", 403},
-                       {"message", "operation requires approval; "
-                                   "approval-gated MCP execution is not yet implemented"}}},
-                     {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
+                detail::a4_denial(
+                    res, 403,
+                    "operation requires approval for this MCP tier on this transport",
+                    detail::A4ErrorOpts{.remediation = "this operation is approval-gated for the "
+                                               "supervised MCP tier; use the MCP ticket-then-recall "
+                                               "flow (POST /mcp/v1/) or the dashboard",
+                                .permission = perm}),
                 "application/json");
             return false;
         }
@@ -294,24 +380,24 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // Service-scoped tokens: check if the ITServiceOwner role grants this permission.
     // Scoped tokens cannot be used when RBAC is disabled.
     if (!session->token_scope_service.empty()) {
+        const std::string perm = securable_type + ":" + operation;
         if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
-            res.set_content(
-                R"({"error":{"code":403,"message":"service-scoped tokens require RBAC to be enabled"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_denial(res, 403,
+                                              "service-scoped tokens require RBAC to be enabled",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
             return false;
         }
         if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation)) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
-            std::string msg = "service-scoped token does not grant " + securable_type + ":" +
-                              operation + " (ITServiceOwner permission required)";
-            res.set_content(nlohmann::json({{"error", {{"code", 403}, {"message", msg}}},
-                                            {"meta", {{"api_version", "v1"}}}})
-                                .dump(),
+            std::string msg = "service-scoped token does not grant " + perm +
+                              " (ITServiceOwner permission required)";
+            res.set_content(detail::a4_denial(res, 403, msg, detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
             return false;
         }
@@ -323,12 +409,9 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "RBAC denied " + securable_type + ":" + operation);
             res.status = 403;
-            res.set_content(nlohmann::json({{"error",
-                                             {{"code", 403},
-                                              {"message", "permission denied: " + securable_type +
-                                                              ":" + operation}}},
-                                            {"meta", {{"api_version", "v1"}}}})
-                                .dump(),
+            const std::string perm = securable_type + ":" + operation;
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                              detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
             return false;
         }
@@ -343,9 +426,10 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                   "non-admin role denied " + securable_type + ":" + operation +
                       (session->mcp_tier.empty() ? "" : " (mcp_tier=" + session->mcp_tier + ")"));
         res.status = 403;
-        res.set_content(
-            R"({"error":{"code":403,"message":"admin role required"},"meta":{"api_version":"v1"}})",
-            "application/json");
+        res.set_content(detail::a4_denial(res, 403, "admin role required",
+                                          detail::A4ErrorOpts{.permission = securable_type + ":" +
+                                                                    operation}),
+                        "application/json");
         return false;
     }
     return true;
@@ -366,31 +450,46 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
 
     // MCP-tier tokens: enforce the tier policy then fall through to the standard
     // RBAC/role check using the creator's actual role. Approval-gated operations
-    // (supervised tier on destructive ops) are blocked here because Phase 2
-    // re-dispatch is not built — same contract as mcp_server.cpp (#520).
+    // on a non-MCP transport are denied here; on `/mcp/v1/` the ticket-then-recall
+    // flow in mcp_server.cpp is the authoritative approval gate (see guard below,
+    // #289/#520).
     if (!session->mcp_tier.empty()) {
+        const std::string perm = securable_type + ":" + operation;
         if (!mcp::tier_allows(session->mcp_tier, securable_type, operation)) {
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "MCP token tier '" + session->mcp_tier + "' does not allow " +
                           securable_type + ":" + operation);
             res.status = 403;
-            res.set_content(a4_denial(res, 403,
-                                      "MCP token tier does not allow " + securable_type + ":" +
-                                          operation,
-                                      securable_type + ":" + operation),
+            res.set_content(detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
+                                              detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
             return false;
         }
-        if (mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
+        // On the MCP JSON-RPC transport (`/mcp/v1/`) the C8 gate in
+        // mcp_server.cpp is the authoritative approval gate (ticket-then-recall,
+        // #289) — skip the denial there so a recall isn't consume-then-denied.
+        // Enforced on every other transport so a REST route hit by an MCP token
+        // cannot bypass the ticket flow (#520). NOTE: no MCP write tool is wired
+        // to require_scoped_permission today (they all use require_permission),
+        // so there is no live double-gate here — this guard + the aligned message
+        // are defense-in-depth so a future scoped-auth MCP tool (e.g. an ADR-0017
+        // agent-confined one) can't silently reintroduce consume-then-deny.
+        // Mirrors require_permission exactly (gov: architect/consistency/security).
+        if (req.path != "/mcp/v1/" &&
+            mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
             audit_log(req, "auth.approval_required", "denied", "", "",
                       "MCP token tier '" + session->mcp_tier + "' requires approval for " +
-                          securable_type + ":" + operation + " (Phase 2 not implemented)");
+                          securable_type + ":" + operation + " on a non-MCP transport");
             res.status = 403;
-            res.set_content(a4_denial(res, 403,
-                                      "operation requires approval; approval-gated MCP "
-                                      "execution is not yet implemented",
-                                      securable_type + ":" + operation),
-                            "application/json");
+            res.set_content(
+                detail::a4_denial(
+                    res, 403,
+                    "operation requires approval for this MCP tier on this transport",
+                    detail::A4ErrorOpts{.remediation = "this operation is approval-gated for the "
+                                               "supervised MCP tier; use the MCP ticket-then-recall "
+                                               "flow (POST /mcp/v1/) or the dashboard",
+                                .permission = perm}),
+                "application/json");
             return false;
         }
     }
@@ -398,13 +497,15 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // Service-scoped tokens: verify the target agent belongs to the token's service,
     // and that the ITServiceOwner role grants the required permission.
     if (!session->token_scope_service.empty()) {
+        const std::string perm = securable_type + ":" + operation;
         if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
-            res.set_content(
-                R"({"error":{"code":403,"message":"service-scoped tokens require RBAC to be enabled"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_denial(res, 403,
+                                              "service-scoped tokens require RBAC to be enabled",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
             return false;
         }
         // Check that the ITServiceOwner role grants this permission type
@@ -412,11 +513,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
-            std::string msg = "service-scoped token does not grant " + securable_type + ":" +
-                              operation + " (ITServiceOwner permission required)";
-            res.set_content(nlohmann::json({{"error", {{"code", 403}, {"message", msg}}},
-                                            {"meta", {{"api_version", "v1"}}}})
-                                .dump(),
+            std::string msg =
+                "service-scoped token does not grant " + perm + " (ITServiceOwner permission required)";
+            res.set_content(detail::a4_denial(res, 403, msg, detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
             return false;
         }
@@ -425,9 +524,10 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: tag store unavailable");
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"tag store unavailable, cannot verify scope"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            // Transient store outage → retryable; no permission field on a 503.
+            res.set_content(detail::a4_denial(res, 503, "tag store unavailable, cannot verify scope",
+                                              detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                            "application/json");
             return false;
         }
         if (!agent_id.empty()) {
@@ -437,10 +537,12 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                           "agent service '" + agent_service + "' does not match token scope '" +
                               session->token_scope_service + "'");
                 res.status = 403;
-                res.set_content(nlohmann::json({{"error", "forbidden"},
-                                                {"detail", "agent is not in service '" +
-                                                               session->token_scope_service + "'"}})
-                                    .dump(),
+                // Was the third denial shape ({"error":"forbidden","detail":...});
+                // now the unified A4 envelope like every other gate (#1470).
+                res.set_content(detail::a4_denial(res, 403,
+                                                  "agent is not in service '" +
+                                                      session->token_scope_service + "'",
+                                                  detail::A4ErrorOpts{.permission = perm}),
                                 "application/json");
                 return false;
             }
@@ -454,9 +556,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
                       "RBAC denied " + securable_type + ":" + operation);
             res.status = 403;
-            res.set_content(a4_denial(res, 403,
-                                      "permission denied: " + securable_type + ":" + operation,
-                                      securable_type + ":" + operation),
+            const std::string perm = securable_type + ":" + operation;
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                              detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
             return false;
         }
@@ -471,7 +573,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                   "non-admin role denied " + securable_type + ":" + operation +
                       (session->mcp_tier.empty() ? "" : " (mcp_tier=" + session->mcp_tier + ")"));
         res.status = 403;
-        res.set_content(a4_denial(res, 403, "admin role required", securable_type + ":" + operation),
+        res.set_content(detail::a4_denial(res, 403, "admin role required",
+                                          detail::A4ErrorOpts{.permission = securable_type + ":" +
+                                                                    operation}),
                         "application/json");
         return false;
     }
@@ -1515,7 +1619,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
 
         // Only LOCAL sessions can step up here: this endpoint verifies a
-        // TOTP / recovery code against a local `users` row. Two other
+        // TOTP / recovery code against a local `users` row. Three other
         // principal kinds reach this code and must be rejected with a
         // precise remediation rather than a misleading 401:
         //   - bearer (api_token/mcp_token): no session to step up; re-issue
@@ -1526,29 +1630,39 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         //     /auth/oidc/start; this 400 keeps the endpoint contract honest
         //     instead of silently dead-ending them on a 401 (governance
         //     cons-B1). Audit + correlation_id keep both branches traceable.
+        //   - SAML: no local secret exists (create_saml_session never
+        //     writes a users row); MFA attestation for SAML is deferred to
+        //     a future release. Return a clear denial rather than the
+        //     misleading API-token message (governance R12).
         if (session->auth_source != "local") {
             const bool is_oidc = session->auth_source == "oidc";
+            const bool is_saml = session->auth_source == "saml";
             const auto cid = detail::make_correlation_id();
             res.status = 400;
+            const char* msg =
+                is_oidc ? "OIDC sessions re-prove MFA by re-authenticating with the "
+                          "identity provider — start a new SSO sign-in at /auth/oidc/start, "
+                          "not local step-up"
+                : is_saml ? "MFA step-up is not available for SAML sessions in this release — "
+                            "re-authenticate via SAML at /auth/saml/start"
+                : "step-up is for session-cookie callers only — re-issue the API "
+                  "token to refresh MFA proof";
             nlohmann::json envelope = {
                 {"error",
                  {{"code", 400},
-                  {"message",
-                   is_oidc ? "OIDC sessions re-prove MFA by re-authenticating with the "
-                             "identity provider — start a new SSO sign-in at /auth/oidc/start, "
-                             "not local step-up"
-                           : "step-up is for session-cookie callers only — re-issue the API "
-                             "token to refresh MFA proof"},
+                  {"message", msg},
                   {"correlation_id", cid}}},
                 {"meta", {{"api_version", "v1"}}}};
             res.set_content(envelope.dump(), "application/json");
+            const char* audit_detail =
+                is_oidc ? "oidc session cannot local step up (re-SSO)"
+                : is_saml ? "saml session cannot local step up (no mfa this release)"
+                : "bearer credential cannot step up";
             audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
                                     auth::role_to_string(session->role), "User",
                                     session->username,
-                                    (is_oidc ? "oidc session cannot local step up (re-SSO)"
-                                             : "bearer credential cannot step up") +
-                                        std::string(" (auth_source=") + session->auth_source +
-                                        ")");
+                                    std::string(audit_detail) +
+                                        " (auth_source=" + session->auth_source + ")");
             return;
         }
 
@@ -1822,6 +1936,239 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         res.set_redirect("/");
     });
 
+    // -- SAML 2.0 SSO endpoints ------------------------------------------------
+    //
+    // N4 safety: SamlProvider::is_enabled() returns false on Windows and whenever
+    // the required config is incomplete — both routes fail-closed to 404.
+    //
+    // RelayState open-redirect safety: only same-origin relative paths are
+    // accepted (starts with '/' but NOT '//').  All other values fall back to '/'.
+
+    sink.Get("/auth/saml/start", [this](const httplib::Request& req, httplib::Response& res) {
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
+        if (!saml_provider_ || !saml_provider_->is_enabled()) {
+            res.status = 404;
+            res.set_content(detail::error_json_a4(404, "SAML not configured", cid),
+                            "application/json");
+            return;
+        }
+
+        // Optional RelayState (return-to path passed through the IdP round-trip).
+        // The redirect target is validated in /saml/acs — here we pass it verbatim
+        // to the AuthnRequest and it bounces back as the POST body RelayState.
+        auto relay_state = req.get_param_value("RelayState");
+        // build_authn_request can throw under crypto/allocation failure (deflate,
+        // RNG, SHA-256); catch so we return a clean A4 500 rather than an
+        // uncaught exception that httplib would surface as a non-A4 500.
+        std::string authn_url;
+        std::string authn_cookie_secret;
+        try {
+            auto authn = saml_provider_->build_authn_request(relay_state);
+            authn_url           = authn.url;
+            authn_cookie_secret = authn.cookie_secret;
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(detail::error_json_a4(500, "Failed to build SAML AuthnRequest", cid),
+                            "application/json");
+            spdlog::error("SAML /auth/saml/start: build_authn_request threw: {}", e.what());
+            return;
+        }
+        if (authn_url.empty()) {
+            res.status = 500;
+            res.set_content(detail::error_json_a4(500, "Failed to build SAML AuthnRequest", cid),
+                            "application/json");
+            spdlog::error("SAML /auth/saml/start: build_authn_request returned empty URL");
+            return;
+        }
+        // Set the browser-binding cookie so the ACS can verify this browser
+        // initiated the login.  __Host- prefix enforces host-lock + Secure +
+        // Path=/ (cannot be set with a Domain attribute).  SameSite=None is
+        // REQUIRED because the IdP delivers the assertion via a cross-site POST
+        // directly to /saml/acs; Lax would suppress the cookie on that POST.
+        // Max-Age=600 matches kRequestTtl (10 minutes) so the cookie expires
+        // when the pending request does.
+        res.set_header("Set-Cookie",
+            "__Host-yuzu_saml_bind=" + authn_cookie_secret +
+            "; Path=/; Secure; HttpOnly; SameSite=None; Max-Age=600");
+        res.set_redirect(authn_url);
+    });
+
+    sink.Post("/saml/acs", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!saml_provider_ || !saml_provider_->is_enabled()) {
+            res.status = 404;
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            res.set_content(detail::error_json_a4(404, "SAML not configured", cid),
+                            "application/json");
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
+            return;
+        }
+
+        // Clear-cookie string used on both success and failure paths.
+        // Expiring the __Host- cookie immediately after use is defence-in-depth:
+        // even if an attacker extracts it, it is single-use (validated_response
+        // erases the pending entry on any match or mismatch).
+        static const std::string kBindCookieClear =
+            "__Host-yuzu_saml_bind=; Path=/; Secure; HttpOnly; SameSite=None; Max-Age=0";
+
+        // ── Forced-login CSRF guard: browser-binding cookie must be present ────
+        // The binding cookie is set by GET /auth/saml/start and is HttpOnly +
+        // SameSite=None + __Host-.  A CSRF-injected ACS POST from a victim's
+        // browser will NOT carry this cookie (the victim never initiated a login),
+        // so absence is an unambiguous forced-login attempt.
+        // Use find_cookie_value (boundary-aware) so a cookie named
+        // "foo__Host-yuzu_saml_bind" cannot shadow our binding cookie.
+        std::string binding_cookie;
+        {
+            const auto cookie_hdr = req.get_header_value("Cookie");
+            binding_cookie = find_cookie_value(cookie_hdr, "__Host-yuzu_saml_bind");
+        }
+        if (binding_cookie.empty()) {
+            spdlog::warn("SAML ACS: missing binding cookie — forced-login attempt rejected");
+            audit_log(req, "auth.saml_login_failed", "error", {}, {},
+                      "missing binding cookie");
+            emit_event("auth.saml_login_failed", req,
+                       {{"source_ip", req.remote_addr},
+                        {"error", "missing binding cookie"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
+            // Clear any stale binding cookie (belt-and-suspenders: may be absent,
+            // but Max-Age=0 on a non-existent cookie is a harmless no-op per RFC 6265).
+            res.set_header("Set-Cookie", kBindCookieClear);
+            res.set_redirect("/login?error=saml");
+            return;
+        }
+
+        // Reject oversized POST bodies before any parsing — 1 MiB cap (N5: DoS guard).
+        // A legitimate SAML Response with a signed assertion is well under 64 KiB;
+        // 1 MiB gives generous headroom while preventing a plaintext amplification attack
+        // via an enormous fake SAMLResponse field.
+        static constexpr std::size_t kSamlMaxBodyBytes = 1048576; // 1 MiB
+        if (req.body.size() > kSamlMaxBodyBytes) {
+            spdlog::warn("SAML ACS: oversized POST body ({} bytes) rejected", req.body.size());
+            audit_log(req, "auth.saml_login_failed", "error", {}, {}, "oversize");
+            emit_event("auth.saml_login_failed", req,
+                       {{"source_ip", req.remote_addr}, {"error", "oversize"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
+            res.set_header("Set-Cookie", kBindCookieClear);
+            res.set_redirect("/login?error=saml");
+            return;
+        }
+
+        // HTTP-POST binding: SAMLResponse and RelayState are form fields.
+        auto saml_response_b64 = extract_form_value(req.body, "SAMLResponse");
+        auto relay_state       = extract_form_value(req.body, "RelayState");
+
+        if (saml_response_b64.empty()) {
+            audit_log(req, "auth.saml_login_failed", "error", {}, {}, "missing SAMLResponse");
+            emit_event("auth.saml_login_failed", req,
+                       {{"source_ip", req.remote_addr}, {"error", "missing SAMLResponse"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
+            res.set_header("Set-Cookie", kBindCookieClear);
+            res.set_redirect("/login?error=saml");
+            return;
+        }
+
+        // validate_response verifies cryptographic signature + conditions +
+        // InResponseTo + browser-binding (SHA-256(cookie) == stored hash).
+        // Both validate_response and create_saml_session can throw under
+        // crypto/allocation/DB failure; catch so an exception yields the same
+        // clean redirect-to-login as an ordinary validation failure rather than
+        // an uncaught exception surfacing as a non-A4 500.
+        std::string saml_name_id;
+        std::string session_token;
+        try {
+            auto result = saml_provider_->validate_response(saml_response_b64, binding_cookie);
+            if (!result) {
+                spdlog::warn("SAML ACS validation failed: {}", result.error());
+                audit_log(req, "auth.saml_login_failed", "error", {}, {}, result.error());
+                emit_event("auth.saml_login_failed", req,
+                           {{"source_ip", req.remote_addr}, {"error", result.error()}}, {},
+                           Severity::kWarn);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+                }
+                res.set_header("Set-Cookie", kBindCookieClear);
+                res.set_redirect("/login?error=saml");
+                return;
+            }
+            saml_name_id  = result.value().name_id;
+            session_token = auth_mgr_.create_saml_session(saml_name_id);
+        } catch (const std::exception& e) {
+            spdlog::error("SAML ACS: internal error during validation/session: {}", e.what());
+            audit_log(req, "auth.saml_login_failed", "error", {}, {}, "internal error");
+            emit_event("auth.saml_login_failed", req,
+                       {{"source_ip", req.remote_addr}, {"error", "internal error"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
+            res.set_header("Set-Cookie", kBindCookieClear);
+            res.set_redirect("/login?error=saml");
+            return;
+        }
+
+        // Clear the binding cookie now that the round-trip is complete.
+        res.set_header("Set-Cookie", kBindCookieClear);
+        res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
+
+        // Explicit-principal audit row — request lands at /saml/acs with no session
+        // cookie yet, so the default resolve_session path would leave principal empty
+        // (same rationale as the OIDC /auth/callback audit, Gate 4 consistency B3).
+        audit_log_for_principal(req, "auth.saml_login", "ok", saml_name_id, "user",
+                                "User", saml_name_id, "auth_source=saml");
+        emit_event("auth.saml_login", req,
+                   {{"source_ip", req.remote_addr},
+                    {"username", saml_name_id},
+                    {"auth_method", "saml"}});
+        if (auto* m = auth_mgr_.metrics_registry()) {
+            m->counter("yuzu_auth_saml_login_total", {{"result", "ok"}}).increment();
+        }
+
+        // RelayState open-redirect safety: only accept same-origin relative paths.
+        // Reject:
+        //   - protocol-relative paths  ("//evil.com")
+        //   - backslash-second-char    ("/\evil.com" — browsers normalize '\' → '/')
+        //   - values containing '\'    (anywhere — same normalization risk)
+        //   - values containing control characters (tab, newline, CR, <0x20 — header injection)
+        //   - any byte ≥ 0x80 (non-ASCII — kills fullwidth/Unicode slash lookalikes
+        //     such as U+FF0F FULLWIDTH SOLIDUS which browsers may canonicalize to '/')
+        //   - any ".." path segment (H-D: url_decode runs before this check, so
+        //     "/%2e%2e/admin" → "/../admin" → rejected here)
+        auto is_safe_relay_state = [](const std::string& rs) -> bool {
+            if (rs.empty() || rs[0] != '/') return false;
+            if (rs.size() >= 2 && (rs[1] == '/' || rs[1] == '\\')) return false;
+            for (unsigned char c : rs) {
+                if (c < 0x20 || c >= 0x80 || c == '\\') return false;
+            }
+            // Reject any ".." path segment (prevents path traversal after url_decode).
+            {
+                std::size_t p = 1; // skip leading '/'
+                while (p <= rs.size()) {
+                    const auto slash = rs.find('/', p);
+                    const auto seg_end = (slash == std::string::npos) ? rs.size() : slash;
+                    if (rs.compare(p, seg_end - p, "..") == 0) return false;
+                    if (slash == std::string::npos) break;
+                    p = slash + 1;
+                }
+            }
+            return true;
+        };
+        auto target = is_safe_relay_state(relay_state) ? relay_state : std::string{"/"};
+        res.set_redirect(target);
+    });
+
     // ── JIT admin elevation (SOC 2 CC6.3/CC6.6) — /auth-and-authz P1 #9 ───────
     // A pre-authorized (users.elevation_eligible) operator activates a
     // time-boxed, justified, MFA-gated admin elevation on their COOKIE session;
@@ -1868,7 +2215,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                   auto session = resolve_session(req);
                   if (!session) {
                       res.status = 401;
-                      res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+                      res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
                       return;
                   }
                   if (!session->token_scope_service.empty() || !session->mcp_tier.empty()) {
@@ -1983,7 +2330,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto session = auth_mgr_.validate_session(token);
         if (!session) {
             res.status = 401;
-            res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+            res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
             return;
         }
         auto* db = auth_mgr_.auth_db_ptr();
@@ -2011,19 +2358,68 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // MFA is MANDATORY to elevate (review #JIT security-F1). Elevation is the
         // privilege-crossing boundary (non-admin → full admin), so — UNLIKE the
         // other step-up sites where the actor is already admin — a second factor
-        // is required unconditionally, NOT gated on --mfa-enforcement. An eligible
-        // operator with no TOTP enrolled is refused here (require_mfa_step_up
-        // would otherwise pass them through under the default optional mode).
-        if (auto st = db->mfa_status(session->username); !st || !st->enrolled) {
-            audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
-                                    auth::role_to_string(session->role), "User", session->username,
-                                    "no MFA enrolled (a second factor is required to elevate)");
-            res.status = 403;
-            res.set_content(detail::error_json_a4(403, "elevation requires an enrolled second factor",
-                                                  cid, "enroll MFA (Settings -> Multi-Factor "
-                                                       "Authentication) before you can elevate"),
-                            "application/json");
-            return;
+        // is required unconditionally, NOT gated on --mfa-enforcement.
+        //
+        // OIDC-amr follow-up (docs/security-reviews/jit-elevation-2026-06-30.md):
+        // an OIDC session whose IdP login attested MFA via the `amr` claim
+        // already carries a seeded `Session::mfa_verified_at` (set at
+        // /auth/callback via amr_asserts_mfa). That proof satisfies "a second
+        // factor" in place of local TOTP enrollment.
+        //
+        // LOAD-BEARING: the two identity sources are handled by DISJOINT
+        // branches, not a single "skip the local check" flag. An OIDC session
+        // must NEVER fall through to the local `mfa_status` lookup — a local
+        // *namesake* account (same username, different identity) might be
+        // TOTP-enrolled, and passing that check for an OIDC caller would grant
+        // elevation on a factor the OIDC caller never actually presented
+        // (security-F1 / hardening-round S-2). This seam is the ONLY place
+        // that unconditionally blocks a single-factor (no-amr) OIDC session
+        // from elevating — require_mfa_step_up's own no-proof-OIDC branch can
+        // PASS a request through when --mfa-enforcement doesn't protect the
+        // role (e.g. "optional"), so the decision must not be deferred there.
+        const bool oidc_amr_proof = session->auth_source == "oidc" &&
+                                    session->mfa_verified_at.time_since_epoch().count() != 0;
+        const bool oidc_amr_elevation = cfg_.jit_oidc_amr_elevation && oidc_amr_proof;
+        if (session->auth_source == "oidc") {
+            // An OIDC session's ONLY acceptable second factor is a seeded amr
+            // proof (IdP-attested MFA) with the toggle on. There is no way for
+            // an OIDC session to present a local TOTP step-up (its step-up is
+            // re-SSO, not a TOTP code), so toggle-off means OIDC sessions
+            // cannot elevate at all, not "fall back to local TOTP".
+            if (!oidc_amr_elevation) {
+                const char* reason =
+                    cfg_.jit_oidc_amr_elevation
+                        ? "no MFA in SSO login (the IdP did not assert amr MFA) — "
+                          "re-authenticate via your IdP with MFA"
+                        : "OIDC-amr elevation is disabled (--no-jit-oidc-amr-elevation); "
+                          "elevate from a local session with TOTP";
+                audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                        auth::role_to_string(session->role), "User", session->username,
+                                        reason);
+                res.status = 403;
+                res.set_content(detail::error_json_a4(403, "elevation requires a second factor", cid,
+                                                      reason),
+                                "application/json");
+                return;
+            }
+            // Fall through to elevation_step_up below (freshness check on the
+            // amr-seeded proof).
+        } else {
+            // Local session: mandatory local TOTP enrollment (unchanged). An
+            // eligible operator with no TOTP enrolled is refused here
+            // (require_mfa_step_up would otherwise pass them through under the
+            // default optional mode).
+            if (auto st = db->mfa_status(session->username); !st || !st->enrolled) {
+                audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                        auth::role_to_string(session->role), "User", session->username,
+                                        "no MFA enrolled (a second factor is required to elevate)");
+                res.status = 403;
+                res.set_content(detail::error_json_a4(403, "elevation requires an enrolled second factor",
+                                                      cid, "enroll MFA (Settings -> Multi-Factor "
+                                                           "Authentication) before you can elevate"),
+                                "application/json");
+                return;
+            }
         }
         // High-risk: require a fresh MFA proof (step-up) before granting admin.
         // window floored to kElevationStepUpWindow so a globally-disabled gate
@@ -2115,17 +2511,51 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto until = auth_mgr_.elevate_session(token, std::chrono::seconds(duration));
         if (!until) {
             res.status = 401; // session vanished between validate and elevate
-            res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+            res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
             return;
         }
+        // `until` may be CLAMPED to the session's own absolute expiry
+        // (follow-up B, security review 2026-06-30) — report the TRUE
+        // remaining time, not the requested/capped `duration`. A live window
+        // is CEIL'd (never floor/truncated) — duration_cast truncates toward
+        // zero, so a genuinely-live sub-second remainder (e.g. duration_secs:1
+        // re-sampled a moment later) would falsely report 0 across all three
+        // channels (HIGH, adversarial review). Only a non-live/edge window
+        // (until <= now) floors to 0.
+        const auto elevate_now = std::chrono::steady_clock::now();
+        auto remaining = (*until > elevate_now)
+                              ? std::chrono::ceil<std::chrono::seconds>(*until - elevate_now)
+                              : std::chrono::seconds(0);
+        // steady_clock has no wall-clock meaning across a restart/off-process,
+        // so the absolute `expires_at` is a system_clock projection of the
+        // steady remaining duration, taken at essentially the same instant.
+        const std::string expires_at_str =
+            iso8601_utc(std::chrono::system_clock::now() + remaining);
         // FAIL-CLOSED on the mandatory grant audit (review UP-3): a privileged
         // activation must never stand without a durable record. If the audit row
         // can't persist, ROLL BACK the elevation (compensating revoke, mirrors
         // the break-glass arm) and 500 with Sec-Audit-Failed — rather than leave
         // a silent admin window.
+        // Stamp the factor source (oidc_amr vs local_totp, PR #1799) so access
+        // reviews can tell an IdP-MFA'd elevation apart from a locally-enrolled
+        // one, and carry the TRUE post-clamp window + absolute expires_at (PR
+        // #1792). duration_secs is remaining.count() — the post-clamp value the
+        // analytics event and JSON response also use — NOT the requested/capped
+        // `duration`, so all three channels agree even when the window was
+        // clamped to the session's own absolute expiry (evidence integrity,
+        // docs/auth-architecture.md:238-240).
+        //
+        // Field ordering is load-bearing: BOTH machine-parsed tokens (`mfa=` and
+        // `expires_at=`) precede the operator free-text `justification=` (only
+        // control-bytes sanitised), so a crafted justification (e.g.
+        // "x mfa=local_totp") cannot forge either token that access reviews and
+        // tests grep for (hardening-round consistency S-3).
+        const char* mfa_factor_label = oidc_amr_elevation ? "oidc_amr" : "local_totp";
         if (!audit_log_for_principal(req, "role.elevation.granted", "ok", session->username, "admin",
                                      "User", session->username,
-                                     "duration_secs=" + std::to_string(duration) +
+                                     "duration_secs=" + std::to_string(remaining.count()) +
+                                         " mfa=" + mfa_factor_label +
+                                         " expires_at=" + expires_at_str +
                                          " justification=" + justification)) {
             auth_mgr_.revoke_elevation(token); // un-elevate — no record, no grant
             spdlog::error("role.elevation.granted audit FAILED for '{}' — elevation rolled back",
@@ -2137,10 +2567,20 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                             "application/json");
             return;
         }
+        // duration_secs here is remaining.count() (the true post-clamp value),
+        // not the requested/capped `duration` — matches the audit row and the
+        // JSON response so all three channels agree (governance hardening
+        // round, consistency). With the ceil above, a live window is always
+        // >= 1 (never truncated to 0); only the dead-window edge case is 0.
+        // expires_at is carried too (L2, adversarial review) so this channel
+        // matches the audit row and the JSON response (docs/auth-architecture.md:238-240).
         emit_event("role.elevation.granted", req,
-                   {{"username", session->username}, {"duration_secs", std::to_string(duration)}}, {},
-                   Severity::kWarn);
-        nlohmann::json out = {{"status", "ok"}, {"expires_in", duration}};
+                   {{"username", session->username},
+                    {"duration_secs", std::to_string(remaining.count())},
+                    {"expires_at", expires_at_str}},
+                   {}, Severity::kWarn);
+        nlohmann::json out = {
+            {"status", "ok"}, {"expires_in", remaining.count()}, {"expires_at", expires_at_str}};
         res.set_content(out.dump(), "application/json");
     });
 
@@ -2151,13 +2591,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                   auto token = extract_session_cookie(req);
                   if (token.empty()) {
                       res.status = 401;
-                      res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+                      res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
                       return;
                   }
                   auto session = auth_mgr_.validate_session(token);
                   if (!session) {
                       res.status = 401;
-                      res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+                      res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
                       return;
                   }
                   const bool was_elevated = auth_mgr_.revoke_elevation(token);

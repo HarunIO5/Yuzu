@@ -31,6 +31,7 @@
 #include "custom_properties_store.hpp"
 #include "data_export.hpp"
 #include "deployment_store.hpp"
+#include "discover_routes.hpp" // A2 discovery surface: /api/v1/discover/* (roadmap Issue 17.1)
 #include "discovery_store.hpp"
 #include "execution_event_bus.hpp"
 #include "execution_tracker.hpp"
@@ -61,6 +62,7 @@
 #include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
+#include "saml_provider.hpp"
 #include "quarantine_store.hpp"
 #include "result_set_matcher.hpp"
 #include "result_set_store.hpp"
@@ -91,6 +93,8 @@
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
+#include "schedule_routes.hpp"
+#include "schedule_runner.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
 #include "fleet_topology_store.hpp"
@@ -960,6 +964,91 @@ public:
 
             oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         }
+
+        // Initialize SAML 2.0 SP provider if configured.
+        // SAML is not supported on Windows (N4 — xmlsec1 is not available on the
+        // Windows build): log an ERROR if any SAML flag is set so operators learn
+        // immediately that the feature is disabled (fail-closed, never silently half-on).
+#ifdef _WIN32
+        if (!cfg_.saml_idp_sso_url.empty() || !cfg_.saml_idp_cert.empty() ||
+            !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty()) {
+            spdlog::error("SAML is not supported on Windows builds; SAML login disabled"
+                          " — fail-closed");
+        }
+        // saml_provider_ stays null on Windows — routes 404 via is_enabled() check.
+#else
+        {
+            const bool saml_config_complete = !cfg_.saml_idp_sso_url.empty() &&
+                                              !cfg_.saml_idp_cert.empty() &&
+                                              !cfg_.saml_sp_entity_id.empty() &&
+                                              !cfg_.saml_sp_acs_url.empty() &&
+                                              !cfg_.saml_idp_entity_id.empty();
+            if (saml_config_complete) {
+                // HTTPS gate: SAML ACS is delivered over the browser's back-channel
+                // POST.  The __Host-yuzu_saml_bind binding cookie requires Secure
+                // attribute (baked into the cookie string) which browsers only send
+                // on HTTPS.  Running SAML over plain HTTP would silently strip the
+                // binding cookie on every ACS POST, making the CSRF guard inert —
+                // effectively leaving the server open to forced-login attacks.
+                // Fail-closed: if HTTPS is not enabled, leave saml_provider_ null.
+                if (!cfg_.https_enabled) {
+                    spdlog::error("SAML requires HTTPS (--https-cert / --https-key must be "
+                                  "configured) — SAML login disabled (fail-closed). The "
+                                  "browser-binding cookie is Secure-only and would be "
+                                  "silently dropped over plain HTTP.");
+                } else {
+                // Read the IdP signing cert PEM from disk. Fail closed: if the file
+                // is unreadable or oversized the provider is not constructed (routes 404).
+                // Cap at 64 KiB — a PEM-encoded X.509 cert is at most ~8 KiB; 64 KiB
+                // gives generous headroom while preventing a misconfigured path from
+                // reading an unbounded file into memory at startup.
+                static constexpr std::streamsize kSamlCertMaxBytes = 65536;
+                std::ifstream cert_file(cfg_.saml_idp_cert);
+                if (!cert_file.is_open()) {
+                    spdlog::error("SAML: cannot read IdP cert PEM from '{}' — SAML login"
+                                  " disabled (fail-closed)", cfg_.saml_idp_cert);
+                } else {
+                    // Read one extra byte to detect files that exceed the cap.
+                    std::string cert_pem(static_cast<std::size_t>(kSamlCertMaxBytes) + 1, '\0');
+                    cert_file.read(cert_pem.data(), kSamlCertMaxBytes + 1);
+                    if (!cert_file.eof()) {
+                        spdlog::error("SAML: IdP cert PEM '{}' exceeds {} bytes — SAML login"
+                                      " disabled (fail-closed)",
+                                      cfg_.saml_idp_cert, kSamlCertMaxBytes);
+                    } else {
+                        cert_pem.resize(static_cast<std::size_t>(cert_file.gcount()));
+                        saml::SamlConfig saml_cfg;
+                        saml_cfg.idp_entity_id  = cfg_.saml_idp_entity_id;
+                        saml_cfg.idp_sso_url    = cfg_.saml_idp_sso_url;
+                        saml_cfg.sp_entity_id   = cfg_.saml_sp_entity_id;
+                        saml_cfg.sp_acs_url     = cfg_.saml_sp_acs_url;
+                        saml_cfg.idp_cert_pem   = std::move(cert_pem);
+                        saml_cfg.enabled        = true;
+                        // Construct in the single-threaded startup phase — xmlsec global init
+                        // is not thread-safe; the std::call_once guard in saml_provider.cpp
+                        // makes repeated construction safe thereafter.
+                        saml_provider_ = std::make_unique<saml::SamlProvider>(std::move(saml_cfg));
+                        if (saml_provider_ && saml_provider_->is_enabled()) {
+                            spdlog::info("SAML SP initialized (idp_sso_url={}, sp_entity_id={})",
+                                         cfg_.saml_idp_sso_url, cfg_.saml_sp_entity_id);
+                        } else {
+                            spdlog::error("SAML: provider constructed but is_enabled() returned "
+                                          "false — SAML login disabled (fail-closed)");
+                            saml_provider_.reset();
+                        }
+                    }
+                } // end cert_file.is_open() else
+                } // end cfg_.https_enabled else
+            } else if (!cfg_.saml_idp_sso_url.empty() || !cfg_.saml_idp_cert.empty() ||
+                       !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty() ||
+                       !cfg_.saml_idp_entity_id.empty()) {
+                // Partial config — warn so the operator knows which flags are missing.
+                spdlog::warn("SAML: incomplete configuration (need --saml-idp-sso-url, "
+                             "--saml-idp-cert, --saml-sp-entity-id, --saml-sp-acs-url, "
+                             "--saml-idp-entity-id) — SAML login disabled");
+            }
+        }
+#endif
 
         // Setup file logger.
         //
@@ -2574,7 +2663,7 @@ public:
         auth_routes_ = std::make_unique<AuthRoutes>(
             cfg_, auth_mgr_, rbac_store_.get(), api_token_store_.get(), audit_store_.get(),
             mgmt_group_store_.get(), tag_store_.get(), analytics_store_.get(), oidc_mu_,
-            oidc_provider_);
+            oidc_provider_, saml_provider_.get());
 
         start_web_server();
 
@@ -2974,6 +3063,15 @@ public:
             preflight_runner_thread_.join();
         }
         preflight_runner_.reset();
+
+        // Join the schedule tick thread (borrows schedule_engine_ + the
+        // instruction/execution/approval/audit stores via schedule_runner_ —
+        // must stop before any of them are torn down), then drop the runner
+        // so its borrowed pointers can't be ticked again.
+        if (schedule_tick_thread_.joinable()) {
+            schedule_tick_thread_.join();
+        }
+        schedule_runner_.reset();
 
         // Join the result-set maintenance thread (borrows result_set_store_,
         // execution_tracker_, response_store_ — must stop before teardown)
@@ -4428,10 +4526,20 @@ private:
             // code against a provisional TOTP secret during enforced
             // enrollment, so it is the same online-guessing surface and
             // must not fall through to the looser bucket.
+            // SAML 2.0 SSO start (GET /auth/saml/start) is the auth-flow entry
+            // point: flooding it fills pending_requests_ (cap 1000, oldest
+            // evicted), which lets an attacker evict legitimate users' in-flight
+            // login requests.  Apply the tighter login bucket — same reasoning
+            // as POST /login (H-C, Hermes round-2 2026-07-01).
+            // POST /saml/acs is also an auth-completion endpoint; include it
+            // for consistency so a flood of fake assertions is rate-limited too.
             bool is_login = (req.path == "/login" || req.path == "/login/mfa" ||
                              req.path == "/login/mfa/stepup" ||
                              req.path == "/login/mfa/enroll") &&
                             req.method == "POST";
+            is_login = is_login ||
+                       (req.path == "/auth/saml/start" && req.method == "GET") ||
+                       (req.path == "/saml/acs"        && req.method == "POST");
             auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
             if (!limiter.allow(req.remote_addr)) {
                 res.status = 429;
@@ -4462,10 +4570,15 @@ private:
             // an enforced login for an un-enrolled user who has only the
             // enrollment-pending token, not a cookie. (`/login/mfa/stepup`
             // is deliberately NOT here — it requires an existing session.)
+            // SAML 2.0 auth-flow routes are pre-session by design (identical
+            // rationale to /auth/oidc/start + /auth/callback).  Without these
+            // exemptions, a non-authenticated user trying to start SSO would be
+            // redirected to /login before the SAML flow handler runs.
             if (req.path == "/login" || req.path == "/login/mfa" ||
                 req.path == "/login/mfa/enroll" || req.path == "/health" ||
                 req.path == "/api/health" || req.path == "/auth/oidc/start" ||
                 req.path == "/auth/callback" || req.path == "/api/v1/openapi.json" ||
+                req.path == "/auth/saml/start" || req.path == "/saml/acs" ||
                 // PKI PR4: the CA root cert + CRL are public by design — clients
                 // and browsers need them to establish trust / check revocation
                 // before they have any session. Exact-match only; /api/v1/ca/issued
@@ -4636,12 +4749,14 @@ private:
             bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
             bool device_inventory_ok =
                 device_inventory_store_ && device_inventory_store_->is_open();
+            // Load-bearing for the MCP write surface + REST approvals (sre-BLOCKING-1).
+            bool approval_ok = approval_manager_ && approval_manager_->is_open();
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
                                  guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                                  offline_endpoint_ok && software_inventory_ok && app_perf_daily_ok &&
-                                 app_perf_fleet_ok && device_inventory_ok;
+                                 app_perf_fleet_ok && device_inventory_ok && approval_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4758,6 +4873,10 @@ private:
                 {"audit_store", audit_store_ && audit_store_->is_open()},
                 {"instruction_store", instruction_store_ && instruction_store_->is_open()},
                 {"api_token_store", api_token_store_ && api_token_store_->is_open()},
+                // Load-bearing for the MCP write surface + REST /api/approvals/*
+                // (governance sre-BLOCKING-1). is_open() is false after a failed
+                // consumed_at migration, so a broken approval schema fails readyz.
+                {"approval_manager", approval_manager_ && approval_manager_->is_open()},
                 {"policy_store", policy_store_ && policy_store_->is_open()},
                 {"rbac_store", rbac_store_ && rbac_store_->is_open()},
                 {"tag_store", tag_store_ && tag_store_->is_open()},
@@ -7559,47 +7678,10 @@ private:
 
         web_server_->Post("/api/schedules", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
-            if (!require_permission(req, res, "Schedule", "Write"))
-                return;
-            if (!schedule_engine_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            try {
-                auto j = nlohmann::json::parse(req.body);
-                InstructionSchedule sched;
-                sched.name = j.value("name", "");
-                sched.definition_id = j.value("definition_id", "");
-                sched.frequency_type = j.value("frequency_type", "once");
-                sched.interval_minutes = j.value("interval_minutes", 60);
-                sched.time_of_day = j.value("time_of_day", "00:00");
-                sched.day_of_week = j.value("day_of_week", 0);
-                sched.day_of_month = j.value("day_of_month", 1);
-                sched.scope_expression = j.value("scope_expression", "");
-                sched.requires_approval = j.value("requires_approval", false);
-
-                if (auto session = auth_routes_->resolve_session(req))
-                    sched.created_by = session->username;
-
-                auto result = schedule_engine_->create_schedule(sched);
-                if (!result) {
-                    res.status = 400;
-                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
-                                    "application/json");
-                    return;
-                }
-                (void)audit_log(req, "schedule.create", "success", "schedule", *result, sched.name);
-                res.set_header("HX-Trigger",
-                               R"({"showToast":{"message":"Schedule created","level":"success"}})");
-                res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
-            } catch (const std::exception& e) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
-            }
+            // Extracted to schedule_routes.cpp (H-01, #1806): the
+            // Schedule:Write + Execution:Execute gate ordering needs direct
+            // unit coverage that a bare inline lambda cannot get.
+            handle_create_schedule(*auth_routes_, schedule_engine_.get(), req, res);
         });
 
         web_server_->Delete(R"(/api/schedules/([^/]+))", [this](const httplib::Request& req,
@@ -7615,7 +7697,14 @@ private:
             }
 
             auto id = req.matches[1].str();
-            bool deleted = schedule_engine_->delete_schedule(id);
+            // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
+            // deletes only schedules the caller created, not the whole
+            // fleet's. auth_routes_->resolve_session, not require_permission's
+            // session (already consumed) — this call cannot fail auth since
+            // require_permission above already proved a valid session exists.
+            auto session = auth_routes_->resolve_session(req);
+            auto user = session ? session->username : std::string();
+            bool deleted = schedule_engine_->delete_schedule(id, user);
             if (deleted) {
                 (void)audit_log(req, "schedule.delete", "success", "schedule", id);
                 res.set_header("HX-Trigger",
@@ -7639,7 +7728,24 @@ private:
             auto id = req.matches[1].str();
             auto enabled_str = extract_json_string(req.body, "enabled");
             bool enabled = (enabled_str != "false");
-            schedule_engine_->set_enabled(id, enabled);
+            // H-01 (#1806): re-enabling arms the schedule to fire unattended
+            // through ScheduleRunner — the same fleet-wide-dispatch concern
+            // as create, so it needs the same Execution:Execute gate.
+            // Disabling only ever stops a schedule, so it stays gated on
+            // Schedule:Write alone — an operator must be able to kill a
+            // runaway schedule even without Execution:Execute.
+            if (enabled && !require_permission(req, res, "Execution", "Execute"))
+                return;
+
+            // M-01 (#1806): owner-scoped enable/disable, same as delete above.
+            auto session = auth_routes_->resolve_session(req);
+            auto user = session ? session->username : std::string();
+            bool changed = schedule_engine_->set_enabled(id, enabled, user);
+            if (changed) {
+                // L-04 (#1806): enable/disable had no audit trail at all.
+                (void)audit_log(req, enabled ? "schedule.enable" : "schedule.disable", "success",
+                                "schedule", id);
+            }
             res.set_content(nlohmann::json({{"enabled", enabled}}).dump(), "application/json");
         });
 
@@ -8545,6 +8651,61 @@ private:
                         spdlog::error("deployment prune threw ({}) — thread continuing", e.what());
                     } catch (...) {
                         spdlog::error("deployment prune threw unknown exception — continuing");
+                    }
+                }
+            }
+        });
+
+        // ScheduleRunner (#1191) — drives recurring-instruction schedules.
+        // ScheduleEngine::evaluate_due/advance_schedule had no production
+        // caller: schedules persisted and listed but never fired. Fires travel
+        // the same dispatch lambda as operator commands with tracked
+        // create-before-dispatch execution rows; approval-gated fires wait on
+        // the approvals queue (see schedule_runner.hpp). Joined BEFORE the
+        // stores in stop().
+        metrics_.describe("yuzu_schedule_fires_total",
+                          "Scheduled instruction occurrences dispatched successfully", "counter");
+        metrics_.describe("yuzu_schedule_fire_failures_total",
+                          "Scheduled occurrences skipped or failed (unknown/disabled definition, "
+                          "dispatch failure, no agents in scope, approval submit failure)",
+                          "counter");
+        metrics_.describe("yuzu_schedule_approvals_submitted_total",
+                          "Approval tickets submitted by the schedule runner for approval-gated "
+                          "occurrences",
+                          "counter");
+        metrics_.describe("yuzu_schedule_tick_errors_total",
+                          "Schedule runner tick() exceptions caught (alertable on sustained rate)",
+                          "counter");
+        schedule_runner_ = std::make_unique<ScheduleRunner>(ScheduleRunner::Deps{
+            .schedule_engine = schedule_engine_.get(),
+            .instruction_store = instruction_store_.get(),
+            .execution_tracker = execution_tracker_.get(),
+            .approval_manager = approval_manager_.get(),
+            .audit_store = audit_store_.get(),
+            .metrics = &metrics_,
+            .dispatch_fn = command_dispatch_fn,
+        });
+        schedule_tick_thread_ = std::thread([this]() {
+            spdlog::info("Schedule runner thread started (cadence=30s)");
+            while (!stop_requested_.load(std::memory_order_acquire)) {
+                for (int i = 0; i < 6 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
+                if (schedule_runner_) {
+                    // tick() touches SQLite and gRPC dispatch — either can
+                    // throw, and an exception escaping a std::thread entry
+                    // calls std::terminate, so one bad schedule must not take
+                    // the process. Catch, log, keep ticking.
+                    try {
+                        schedule_runner_->tick();
+                    } catch (const std::exception& e) {
+                        metrics_.counter("yuzu_schedule_tick_errors_total").increment();
+                        spdlog::error("schedule_runner: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        metrics_.counter("yuzu_schedule_tick_errors_total").increment();
+                        spdlog::error("schedule_runner: tick threw unknown exception — continuing");
                     }
                 }
             }
@@ -9724,6 +9885,17 @@ private:
                 return import_subordinate_chain(intermediate_pem, parent_chain_pem);
             });
 
+        // -- A2 discovery surface (roadmap Issue 17.1): /api/v1/discover/* --------
+        // Agentic-first (A1/A2, docs/agentic-first-principle.md) — RBAC permission
+        // catalog, published instruction definitions, REST route catalog (subset of
+        // the SAME OpenAPI document /api/v1/openapi.json serves), Scope DSL kinds +
+        // operators, and the plugin/action catalog observed across the fleet. No
+        // AuditFn: these are catalog/schema reads, not per-device PII — matches the
+        // GET /guaranteed-state/schemas precedent this module is modeled on.
+        discover_routes_ = std::make_unique<DiscoverRoutes>();
+        discover_routes_->register_routes(*web_server_, auth_fn, perm_fn, rbac_store_.get(),
+                                          instruction_store_.get(), &registry_);
+
         // DEX app-perf-over-time read providers (slice 2). One bundle of B1/B2
         // store seams shared by the REST endpoints and the MCP twins so both read
         // the SAME substrate. Each lambda null-checks the store at call time and
@@ -10129,7 +10301,38 @@ private:
                 &metrics_,
                 // DEX app-perf-over-time read providers (slice 2) — same bundle the
                 // REST endpoints use, so MCP and REST read the SAME B1/B2 substrate.
-                app_perf_providers);
+                app_perf_providers,
+                // #289 / Issue 13.5: the quarantine store backs the
+                // quarantine_device write tool (record + real isolate), and the
+                // tag-push closure fires the agent tag-push after set_tag exactly
+                // like the REST PUT /api/v1/tags path (D4). Same closure body as
+                // the REST registration above.
+                quarantine_store_.get(),
+                [this](const std::string& agent_id, const std::string& key) {
+                    std::string lower_key = key;
+                    std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                                   [](unsigned char c) { return std::tolower(c); });
+                    for (auto cat_key : kCategoryKeys) {
+                        if (cat_key == lower_key) {
+                            push_asset_tags_to_agent(agent_id);
+                            break;
+                        }
+                    }
+                },
+                // A2 discovery (roadmap Issue 17.1): backs the discover_plugins tool
+                // via the SAME AgentRegistry::help_json() the REST /discover/plugins
+                // route reads (discover_routes_ above).
+                &registry_,
+                // H1 (PR #1796): per-device scope gate for the device-targeted MCP
+                // write tools (set_tag / delete_tag / quarantine_device) — the SAME
+                // require_scoped_permission chokepoint the dashboard device routes
+                // and REST per-device endpoints use, so a management-group-confined
+                // operator cannot tag or isolate devices outside their groups.
+                [this](const httplib::Request& req, httplib::Response& res,
+                       const std::string& type, const std::string& op,
+                       const std::string& agent_id) -> bool {
+                    return require_scoped_permission(req, res, type, op, agent_id);
+                });
         }
 
         // -- Listen -----------------------------------------------------------
@@ -10345,6 +10548,11 @@ private:
     mutable std::shared_mutex oidc_mu_;
     std::unique_ptr<oidc::OidcProvider> oidc_provider_;
 
+    // SAML 2.0 SP — constructed once at startup (xmlsec global init is not
+    // thread-safe); never mutated after construction, so no mutex is needed.
+    // Null when SAML is not configured or on Windows (fail-closed).
+    std::unique_ptr<saml::SamlProvider> saml_provider_;
+
     // NVD CVE feed
     std::shared_ptr<NvdDatabase> nvd_db_;
     std::unique_ptr<NvdSyncManager> nvd_sync_;
@@ -10412,6 +10620,7 @@ private:
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;
     std::unique_ptr<PreflightRunner> preflight_runner_; // borrows run+response stores
+    std::unique_ptr<ScheduleRunner> schedule_runner_;   // borrows engine + stores (#1191)
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
     std::unique_ptr<BaselineStore> baseline_store_;
     std::unique_ptr<CaStore> ca_store_;
@@ -10503,6 +10712,7 @@ private:
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
     std::unique_ptr<CaRoutes> ca_routes_; // PKI PR4: /api/v1/ca/*
+    std::unique_ptr<DiscoverRoutes> discover_routes_; // A2: /api/v1/discover/* (Issue 17.1)
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     std::unique_ptr<FleetTopologyStore> fleet_topology_store_;
@@ -10561,6 +10771,7 @@ private:
     std::thread policy_eval_thread_;
     std::thread app_perf_rollup_thread_;
     std::thread preflight_runner_thread_; // joined before stores in stop()
+    std::thread schedule_tick_thread_;    // drives ScheduleRunner (#1191); joined before stores
     std::thread result_set_maint_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
