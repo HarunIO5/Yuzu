@@ -4,8 +4,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "local_dispatcher.hpp"
 #include "sync_scheduler.hpp"
 #include "sync_source_installed_software.hpp"
+
+#include <yuzu/plugin.h>
 
 #include <chrono>
 #include <cstdint>
@@ -25,36 +28,96 @@ using yuzu::agent::SyncScheduler;
 using yuzu::agent::SyncSource;
 
 namespace {
-// THE cross-side pin (ADR-0016 §4): the server computes the SAME hash for the
-// SAME input (tests/unit/server/test_software_inventory_store.cpp — identical
-// constant). A one-byte drift in either canonicalisation fails one assertion.
+// THE cross-side pin (ADR-0016 §4, blob contract v2 — 12 fields): the server
+// computes the SAME hash for the SAME input
+// (tests/unit/server/test_software_inventory_store.cpp — identical constant).
+// A one-byte drift in either canonicalisation fails one assertion.
 constexpr const char* kCrossPinHash =
-    "d7a11c1cc4987d05049f7d3226b23b9324f5fa703c8474ba0c36b4807ee5f9b8";
+    "430dc97e02b5d217276a9558393d702366bcd3b5415d5867c9efd4e95a02c848";
+
+// Fully-populated v2 entry — the identical fixture the server pin test uses.
+SwEntry full_v2_entry() {
+    SwEntry e;
+    e.name = "bash";
+    e.version = "5.2.21";
+    e.publisher = "Fedora Project";
+    e.install_date = "Mon 01 Jan 2026";
+    e.kind = "package";
+    e.ecosystem = "rpm";
+    e.epoch = "0";
+    e.release = "3.fc40";
+    e.arch = "x86_64";
+    e.signature_status = "signed";
+    e.distro_id = "fedora";
+    e.distro_version = "40";
+    return e;
+}
 } // namespace
 
 TEST_CASE("installed_software canonical hash matches the cross-pin", "[sync][hash]") {
-    // Unsorted + duplicate: canonical_blob must sort + dedup to the exact bytes
-    // the constant was computed from.
+    // Unsorted + duplicate + one entry populating ALL 12 v2 fields:
+    // canonical_blob must sort + dedup to the exact bytes the constant was
+    // computed from.
     std::vector<SwEntry> e = {
         {"Zeta", "9", "", ""},
+        full_v2_entry(),
         {"Acme Reader", "1.2", "Acme", "2026-01-02"},
         {"Acme Reader", "1.2", "Acme", "2026-01-02"},
     };
     CHECK(sha256_hex(installed_software_canonical_blob(e)) == kCrossPinHash);
 }
 
-TEST_CASE("parse_installed_apps_output keeps machine-scope app rows only", "[sync][parse]") {
-    const std::string out = "app|Chrome|119|Google|2026-01-01\n"
-                            "user_app|bob|UserThing|1|Acme|2026-01-01\n" // per-user → dropped
-                            "app|No applications found|-|-|-\n"          // sentinel → dropped
-                            "error|something failed\n"                   // error → dropped
-                            "app|Firefox|120|Mozilla|-\n";
+TEST_CASE("parse_installed_apps_output keeps inv| rows only (blob v2)", "[sync][parse]") {
+    const std::string out =
+        "inv|bash|5.2.21|Fedora Project|Mon 01 Jan 2026|package|rpm|0|3.fc40|x86_64|signed|"
+        "fedora|40\n"
+        "app|Chrome|119|Google|2026-01-01\n"            // legacy list row → dropped
+        "user_app|bob|UserThing|1|Acme|2026-01-01\n"    // per-user → dropped
+        "error|something failed\n"                      // error → dropped
+        "inv|Google Chrome|126.0|Google LLC||app|windows||||||\n";
     auto entries = parse_installed_apps_output(out);
     REQUIRE(entries.size() == 2);
-    CHECK(entries[0].name == "Chrome");
-    CHECK(entries[0].version == "119");
-    CHECK(entries[1].name == "Firefox");
-    CHECK(entries[1].install_date == "-");
+    CHECK(entries[0].name == "bash");
+    CHECK(entries[0].version == "5.2.21");
+    CHECK(entries[0].publisher == "Fedora Project");
+    CHECK(entries[0].kind == "package");
+    CHECK(entries[0].ecosystem == "rpm");
+    CHECK(entries[0].epoch == "0");
+    CHECK(entries[0].release == "3.fc40");
+    CHECK(entries[0].arch == "x86_64");
+    CHECK(entries[0].signature_status == "signed");
+    CHECK(entries[0].distro_id == "fedora");
+    CHECK(entries[0].distro_version == "40");
+    CHECK(entries[1].name == "Google Chrome");
+    CHECK(entries[1].kind == "app");
+    CHECK(entries[1].ecosystem == "windows");
+    CHECK(entries[1].install_date.empty()); // honest-empty, no "-" placeholder
+    CHECK(entries[1].signature_status.empty());
+}
+
+TEST_CASE("parse_installed_apps_output tolerates short and over-long inv rows",
+          "[sync][parse]") {
+    SECTION("missing trailing tokens read as empty fields") {
+        auto entries = parse_installed_apps_output("inv|OnlyName|1.0\n");
+        REQUIRE(entries.size() == 1);
+        CHECK(entries[0].name == "OnlyName");
+        CHECK(entries[0].version == "1.0");
+        CHECK(entries[0].publisher.empty());
+        CHECK(entries[0].kind.empty());
+        CHECK(entries[0].distro_version.empty());
+    }
+    SECTION("tokens past the 12th field are dropped, fields do not shift") {
+        auto entries = parse_installed_apps_output(
+            "inv|N|v|p|d|package|deb|1|2|amd64|sig|debian|12|EXTRA\n");
+        REQUIRE(entries.size() == 1);
+        CHECK(entries[0].name == "N");
+        CHECK(entries[0].distro_id == "debian");
+        CHECK(entries[0].distro_version == "12"); // EXTRA dropped — mirrors the
+                                                  // server's parse past field 12
+    }
+    SECTION("empty-name rows are dropped") {
+        CHECK(parse_installed_apps_output("inv||1.0\n").empty());
+    }
 }
 
 TEST_CASE("SyncScheduler: first-run jitter, hash-skip, change, need_full", "[sync][scheduler]") {
@@ -174,13 +237,13 @@ TEST_CASE("clamp_field strips framing separators and truncates over-long fields"
     // 0x1F (field sep) and 0x1E (record sep) embedded in a field must be stripped
     // so a value can never corrupt the canonical wire structure the server splits
     // on. (octal \037 == 0x1F, \036 == 0x1E.)
-    auto e = parse_installed_apps_output(std::string("app|na\037me|1\0362|pub|d\n"));
+    auto e = parse_installed_apps_output(std::string("inv|na\037me|1\0362|pub|d\n"));
     REQUIRE(e.size() == 1);
     CHECK(e[0].name == "name");    // 0x1F stripped
     CHECK(e[0].version == "12");   // 0x1E stripped
 
     std::string longname(2000, 'x');
-    auto e2 = parse_installed_apps_output("app|" + longname + "|1|p|d\n");
+    auto e2 = parse_installed_apps_output("inv|" + longname + "|1|p|d\n");
     REQUIRE(e2.size() == 1);
     CHECK(e2[0].name.size() == 1024); // truncated to kMaxFieldLen
 }
@@ -191,7 +254,7 @@ TEST_CASE("clamp_field truncates on a UTF-8 codepoint boundary, not mid-sequence
     // not split into a lone lead byte 0xC3 — invalid UTF-8 would make PostgreSQL's
     // TEXT column reject the row → permanent need_full loop (governance UP-10).
     std::string name = std::string(1023, 'a') + "\xc3\xa9"; // 1025 bytes; é at [1023,1024]
-    auto e = parse_installed_apps_output("app|" + name + "|1|p|d\n");
+    auto e = parse_installed_apps_output("inv|" + name + "|1|p|d\n");
     REQUIRE(e.size() == 1);
     CHECK(e[0].name == std::string(1023, 'a')); // é dropped whole; no trailing 0xC3
     CHECK(e[0].name.size() == 1023);
@@ -205,7 +268,7 @@ TEST_CASE("clamp_field scrubs invalid UTF-8 to U+FFFD before hashing (UP-IN1)",
     // invalid byte with U+FFFD (EF BF BD) so the canonical blob the agent hashes is
     // valid UTF-8 and the server stores it. This scrub MUST run before truncation
     // and match the server's parse_software_blob byte-for-byte.
-    auto e = parse_installed_apps_output(std::string("app|Caf\xe9|1|Acme|2020\n"));
+    auto e = parse_installed_apps_output(std::string("inv|Caf\xe9|1|Acme|2020\n"));
     REQUIRE(e.size() == 1);
     CHECK(e[0].name == std::string("Caf\xef\xbf\xbd")); // 0xE9 → U+FFFD
     CHECK(e[0].name.find('\xe9') == std::string::npos); // no raw byte survives
@@ -236,7 +299,7 @@ const std::string kScrubVectorExpected =
 
 TEST_CASE("clamp_field scrub: PG-strict edge-branch parity vector (UP-IN1 drift guard)",
           "[sync][parse]") {
-    auto e = parse_installed_apps_output("app|" + kScrubVectorRaw + "|1|p|d\n");
+    auto e = parse_installed_apps_output("inv|" + kScrubVectorRaw + "|1|p|d\n");
     REQUIRE(e.size() == 1);
     CHECK(e[0].name == kScrubVectorExpected);
 }
@@ -257,19 +320,21 @@ TEST_CASE("a name that becomes empty after clamping is dropped (UP-1 hash parity
     // A separator-only name clamps to "" — the server's parse_software_blob drops
     // empty-name rows, so the agent must too, or the two canonical hashes diverge
     // and the source is stuck always-full.
-    auto e = parse_installed_apps_output(std::string("app|\037|1|p|d\napp|Real|2|q|e\n"));
+    auto e = parse_installed_apps_output(std::string("inv|\037|1|p|d\ninv|Real|2|q|e\n"));
     REQUIRE(e.size() == 1);
     CHECK(e[0].name == "Real");
 }
 
 TEST_CASE("canonical blob is the exact wire format the server parses", "[sync][hash]") {
-    // Pins the byte layout (not just the hash): sorted, 0x1F between fields, 0x1E
-    // terminating each entry. The server's parse_software_blob reads this same
-    // form (tests/unit/server/test_software_inventory_store.cpp blob1()).
+    // Pins the byte layout (not just the hash): sorted, 0x1F between the 12 v2
+    // fields, 0x1E terminating each entry. The server's parse_software_blob
+    // reads this same form (tests/unit/server/test_software_inventory_store.cpp).
     std::vector<SwEntry> e = {{"B", "2", "", ""}, {"A", "1", "P", "D"}}; // unsorted
-    // A|1|P|D<rec>  B|2|<empty>|<empty><rec>  (| == 0x1F, <rec> == 0x1E) = 14 bytes.
+    // A|1|P|D|×8-empty<rec>  B|2|×10-empty<rec>  (| == 0x1F, <rec> == 0x1E);
+    // 11 separators per record regardless of how many trailing fields are empty.
     CHECK(installed_software_canonical_blob(e) ==
-          std::string("A\0371\037P\037D\036B\0372\037\037\036"));
+          std::string("A\0371\037P\037D\037\037\037\037\037\037\037\037\036"
+                      "B\0372\037\037\037\037\037\037\037\037\037\037\036"));
 }
 
 TEST_CASE("empty inventory parses to no entries and a stable empty hash",
@@ -281,6 +346,61 @@ TEST_CASE("empty inventory parses to no entries and a stable empty hash",
     CHECK(installed_software_canonical_blob({}) == "");
     CHECK(sha256_hex("") ==
           "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+}
+
+// --- LocalDispatcher capture_cap plumbing (regression: the parameter must
+//     actually reach CommandContextImpl's enforcement point, not just widen
+//     the call signature) ---
+
+namespace {
+// A minimal, statically-allocated plugin descriptor whose "bulk" action
+// writes ~3 MiB of output via the real yuzu_ctx_write_output C ABI path —
+// enough to exceed LocalDispatcher::kCaptureMaxBytes (2 MiB) but stay under
+// the 3.5 MiB cap the installed_software sync source passes for its own
+// dispatch (sync_source_installed_software.cpp).
+int bulk_execute(YuzuCommandContext* ctx, const char* /*action*/, const YuzuParam* /*params*/,
+                 std::size_t /*param_count*/) {
+    const std::string chunk(65536, 'x'); // 64 KiB
+    for (int i = 0; i < 48; ++i)         // 48 * 64 KiB = 3 MiB
+        yuzu_ctx_write_output(ctx, chunk.c_str());
+    return 0;
+}
+
+const char* const kBulkActions[] = {"bulk", nullptr};
+
+const YuzuPluginDescriptor kBulkDescriptor = {
+    /*abi_version=*/YUZU_PLUGIN_ABI_VERSION,
+    /*name=*/"bulk_test_fixture",
+    /*version=*/"1.0.0",
+    /*description=*/"test-only bulk-output fixture",
+    /*actions=*/kBulkActions,
+    /*init=*/nullptr,
+    /*shutdown=*/nullptr,
+    /*execute=*/bulk_execute,
+    /*sdk_version=*/nullptr,
+};
+} // namespace
+
+TEST_CASE("LocalDispatcher::run's capture_cap parameter actually bounds capture "
+          "(regression: dispatch_with_capture must not discard it)",
+          "[sync][local_dispatcher]") {
+    using yuzu::agent::LocalDispatcher;
+
+    SECTION("default cap (2 MiB) truncates a ~3 MiB payload") {
+        LocalDispatcher dispatcher;
+        LocalDispatcher::Result r = dispatcher.run(&kBulkDescriptor, "bulk");
+        CHECK(r.rc == 0);
+        CHECK(r.truncated);
+    }
+
+    SECTION("an explicit larger cap (3.5 MiB) accepts the same ~3 MiB payload untruncated") {
+        LocalDispatcher dispatcher;
+        constexpr std::size_t kInventoryCaptureCap = 3'670'016; // matches the sync source's cap
+        LocalDispatcher::Result r = dispatcher.run(&kBulkDescriptor, "bulk", {}, kInventoryCaptureCap);
+        CHECK(r.rc == 0);
+        CHECK_FALSE(r.truncated);
+        CHECK(r.captured.size() > 2u * 1024 * 1024); // genuinely exceeds the default cap
+    }
 }
 
 // --- Scheduler edge cases (phase spread, full-floor, collect-nothing) ---

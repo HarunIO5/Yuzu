@@ -389,8 +389,13 @@ groups:
           description: >-
             Over 20% of inventory ingest outcomes are need_full for 15m. Expected
             transiently after a server DB restore (cold cache — agents re-send full,
-            then settle); a sustained ratio suggests hash drift or agents stuck in a
-            resend cycle.
+            then settle), or for up to ~24h fleet-wide immediately after a sync
+            source's wire-blob-contract version bump (e.g. installed_software's
+            blob contract v2, 2026-07) — every agent's first post-upgrade sync is a
+            one-time need_full by design, phase-spread across the daily sync window,
+            self-healing; check release notes for a recent contract change before
+            treating this as an incident. A sustained ratio with no such change
+            suggests hash drift or agents stuck in a resend cycle.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryDroppedBlobs
         # outcome=dropped = a blob over the 3 MiB cap was rejected + nacked. UNLIKE

@@ -608,17 +608,22 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 Eligibility is the per-user `users.elevation_eligible` flag — distinct from holding standing admin, and enumerable for access reviews. An admin **cannot** grant their own eligibility (another admin must). Revoking it (`{"eligible":false}`) immediately ends any elevation the user currently holds.
 
-**2. The eligible operator elevates** when they need admin. The operator must have **MFA enrolled** (a second factor is mandatory to elevate, regardless of `--mfa-enforcement`) and will be challenged for a fresh TOTP code:
+**Prerequisite for a federated (OIDC/SSO) operator:** eligibility is keyed on a Yuzu `users` table row, and signing in via OIDC does **not** create one. A federated-only identity must already have a `users` row — provision it first (e.g. `POST /api/v1/users`) — or the eligibility call above 404s. This is a known limitation; auto-provisioning eligibility by OIDC identity is tracked as a follow-up, not yet implemented.
+
+**2. The eligible operator elevates** when they need admin. A second factor is mandatory to elevate, regardless of `--mfa-enforcement`, and satisfied one of two ways depending on how the operator is currently authenticated (their identity SOURCE, not their username — an OIDC session never consults a local namesake account's TOTP enrollment):
+
+- **Local account:** the operator must have **MFA enrolled** and will be challenged for a fresh TOTP code.
+- **OIDC/SSO account:** if the operator's *current* SSO login was authenticated with IdP MFA (asserted via the OIDC `amr` claim), that assertion satisfies the second-factor requirement — **no local TOTP enrollment needed**. A single-factor SSO login (no IdP MFA) is still denied. This is controlled by `--jit-oidc-amr-elevation` (default enabled). Disabling it (`--no-jit-oidc-amr-elevation`) means **OIDC sessions cannot use JIT elevation at all** — an OIDC session cannot present a local TOTP step-up (its step-up challenge is re-authenticating via SSO, not a TOTP code), so the operator must elevate from a local-authenticated session with local TOTP instead.
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"justification":"prod incident #42","duration_secs":600}' \
   https://yuzu.example.com/api/v1/elevate
-# -> {"status":"ok","expires_in":600}
+# -> {"status":"ok","expires_in":598,"expires_at":"2026-07-02T13:10:00Z"}
 ```
 
-The session is now admin for the window (capped by `--jit-max-elevation-secs`, default 1h). It **auto-reverts** when the window lapses, on logout, or on a server restart — the elevation is never persisted. Step down early with `POST /api/v1/elevate/revoke`. Every step (`role.elevation.granted`/`denied`/`revoked`, `user.elevation_eligibility.set`) is audited. Technical invariants: `docs/auth-architecture.md` "JIT admin elevation".
+`expires_in` is the TRUE remaining seconds computed after the grant (always `<=` the requested `duration_secs` — it is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute lifetime, so it is never an exact echo of the request), and `expires_at` is the same window as a wall-clock RFC3339 UTC timestamp. The session is now admin for the window (capped by `--jit-max-elevation-secs`, default 1h). It **auto-reverts** when the window lapses, on logout, or on a server restart — the elevation is never persisted. Step down early with `POST /api/v1/elevate/revoke`. Every step (`role.elevation.granted`/`denied`/`revoked`/`expired`, `user.elevation_eligibility.set`) is audited — the `granted` row's detail records which factor was used (`mfa=local_totp` or `mfa=oidc_amr`). Technical invariants: `docs/auth-architecture.md` "JIT admin elevation".
 
 ## MCP Tokens
 
@@ -634,7 +639,7 @@ MCP (Model Context Protocol) tokens are API tokens with an additional `mcp_tier`
 
 Tier enforcement happens *before* RBAC checks. A tier can block an operation even when RBAC would permit it; conversely, if the tier permits but RBAC denies, the request is still blocked. Both layers must allow.
 
-The `supervised` tier marks destructive operations as approval-gated. Until the Phase 2 approval re-dispatch path lands, supervised-tier writes are blocked on every transport (MCP JSON-RPC and REST API) with `auth.approval_required` audit; only Reads and trivially-allowed operations succeed.
+The `supervised` tier marks destructive operations as approval-gated, and the behaviour now depends on the transport. On the MCP `/mcp/v1/` transport these run through the **ticket-then-recall** approval flow: the first call mints a pending approval, and after an admin approves it, a recall carrying the `approval_id` executes the operation. On a non-MCP transport (the REST API) an approval-gated operation is denied with an `auth.approval_required` audit; only Reads and trivially-allowed operations succeed there.
 
 ### Creating an MCP Token
 
@@ -713,7 +718,7 @@ The following audit actions are emitted for authentication and authorization eve
 | `auth.admin_required` | `denied` | Token blocked from admin route (service-scoped, MCP, or non-admin) |
 | `auth.permission_required` | `denied` | Token blocked from permission-gated operation |
 | `auth.scoped_permission_required` | `denied` | Token blocked from agent-scoped operation |
-| `auth.approval_required` | `denied` | Supervised-tier MCP token blocked from an approval-gated operation **on the REST transport** (Phase 2 re-dispatch not yet implemented). The MCP **tool** transport audits the same denial as `mcp.<tool_name>` / `denied` (see `mcp.md`), and returns JSON-RPC `-32004` (`TierDenied`), not `-32006`. |
+| `auth.approval_required` | `denied` | Supervised-tier MCP token blocked from an approval-gated operation **on a non-MCP (REST) transport**. On the MCP `/mcp/v1/` transport there is no such denial — the operation runs through the ticket-then-recall approval flow (the first call mints JSON-RPC `-32006` `ApprovalRequired`; a recall with the approved `approval_id` executes). See `mcp.md`. |
 | `auth.login` | `success` | Successful local password login |
 | `auth.login_failed` | `failure` | Failed login attempt |
 | `auth.logout` | `success` | User-initiated logout |
@@ -726,7 +731,7 @@ All `denied` results include a `detail` field explaining the reason. Examples pe
 - `auth.admin_required` → `"MCP token blocked from admin route"`, `"service-scoped token blocked from admin route"`, `"non-admin user blocked from admin route"`
 - `auth.permission_required` → `"MCP token tier 'readonly' does not allow Execution:Execute"`, `"RBAC denied Execution:Execute"`
 - `auth.scoped_permission_required` → `"agent service 'X' does not match token scope 'Y'"`, `"MCP token tier 'readonly' does not allow Tag:Write"`
-- `auth.approval_required` → `"MCP token tier 'supervised' requires approval for Execution:Execute (Phase 2 not implemented)"` — this is the **REST path** detail (`auth_routes.cpp`). The **MCP tool path** is a *separate* audit row: verb `mcp.<tool_name>`, result `denied`, with the distinct detail string `"approval-gated execution not implemented"` (`mcp_server.cpp`).
+- `auth.approval_required` → audit detail `"MCP token tier 'supervised' requires approval for Execution:Execute on a non-MCP transport"`, client-facing message `"operation requires approval for this MCP tier on this transport"` — this is the **non-MCP (REST) path** (`auth_routes.cpp`). On the MCP `/mcp/v1/` transport there is no `auth.approval_required` denial: the ticket-then-recall approval flow handles the operation (`mcp_server.cpp`), so the MCP tool call mints `-32006` `ApprovalRequired` and a recall with the approved `approval_id` executes.
 
 ### JSON Error Envelope
 

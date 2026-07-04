@@ -51,11 +51,27 @@ namespace yuzu::server {
 
 /// One installed-software entry. **Machine-wide scope only** — no per-user /
 /// username / SID / user-path (ADR-0016: no PII, no works-council trigger).
+///
+/// Blob contract v2: member order == the wire/hash field order (append-only —
+/// the canonical hash and the agent's blob builder walk this exact sequence).
+/// Fields an ecosystem does not store are EMPTY, never synthesised: NEVRA +
+/// signature populate on Linux package managers per their capability (rpm =
+/// full; deb = no signature; apk/pacman = name/EVR only); Windows/macOS rows
+/// are kind=app with name/version/publisher only; distro_id/distro_version are
+/// stamped on every Linux row from /etc/os-release.
 struct SoftwareEntry {
     std::string name;
-    std::string version;
-    std::string publisher;
+    std::string version; // upstream version, release/revision stripped (v2)
+    std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
+    std::string kind;      // "package" | "app"
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|homebrew
+    std::string epoch;
+    std::string release;   // rpm RELEASE / deb revision / apk pkgrel
+    std::string arch;
+    std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
+    std::string distro_id;        // /etc/os-release ID
+    std::string distro_version;   // /etc/os-release VERSION_ID
 };
 
 /// One fleet-query row: which agent carries which entry.
