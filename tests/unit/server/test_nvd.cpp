@@ -330,3 +330,46 @@ TEST_CASE("parse_response: multiple CPE nodes produce multiple records", "[nvd][
     REQUIRE(result.records[0].product == "producta");
     REQUIRE(result.records[1].product == "productb");
 }
+
+// ── Rate-limit wait (regression for the #1867 first-request overflow) ─────────
+
+TEST_CASE("nvd_rate_limit_wait: first request never waits (overflow regression)",
+          "[nvd][ratelimit]") {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    const auto interval = milliseconds(6000);
+    // No prior request (nullopt) — the old time_point::min() sentinel overflowed
+    // here and slept ~292 years; must be zero.
+    REQUIRE(nvd_rate_limit_wait(std::nullopt, now, interval) == steady_clock::duration::zero());
+}
+
+TEST_CASE("nvd_rate_limit_wait: throttles within the interval, not after", "[nvd][ratelimit]") {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    const auto interval = milliseconds(6000);
+
+    // A request 1s ago → wait exactly the remaining 5s (pure function, deterministic).
+    const auto w = nvd_rate_limit_wait(now - milliseconds(1000), now, interval);
+    REQUIRE(duration_cast<milliseconds>(w).count() == 5000);
+
+    // A request well outside the interval → no wait.
+    REQUIRE(nvd_rate_limit_wait(now - seconds(30), now, interval) == steady_clock::duration::zero());
+    // Exactly at the interval boundary → no wait.
+    REQUIRE(nvd_rate_limit_wait(now - milliseconds(6000), now, interval) ==
+            steady_clock::duration::zero());
+}
+
+TEST_CASE("nvd_rate_limit_wait: non-positive elapsed never waits (overflow-class guard)",
+          "[nvd][ratelimit]") {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    const auto interval = milliseconds(6000);
+    // A `last` in the future (backwards/non-monotonic clock) must return zero, not
+    // `interval - negative` — the defence against the ~292yr overflow class.
+    REQUIRE(nvd_rate_limit_wait(now + milliseconds(10), now, interval) ==
+            steady_clock::duration::zero());
+    REQUIRE(nvd_rate_limit_wait(now + hours(1000000), now, interval) ==
+            steady_clock::duration::zero());
+    // elapsed == 0 (same instant) → no wait.
+    REQUIRE(nvd_rate_limit_wait(now, now, interval) == steady_clock::duration::zero());
+}
