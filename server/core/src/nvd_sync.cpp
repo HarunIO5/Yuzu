@@ -142,6 +142,18 @@ void NvdSyncManager::sync_loop() {
 }
 
 void NvdSyncManager::do_sync() {
+    // Reject a concurrent sync (periodic loop vs. detached "Sync now"): running
+    // two on the same client_ races last_request_time_ and doubles NVD load.
+    bool expected = false;
+    if (!sync_active_.compare_exchange_strong(expected, true)) {
+        spdlog::info("NVD sync already in progress — skipping this trigger");
+        return;
+    }
+    struct ActiveGuard {
+        std::atomic<bool>& flag;
+        ~ActiveGuard() { flag.store(false); }
+    } active_guard{sync_active_};
+
     {
         std::lock_guard<std::mutex> lock{mu_};
         status_.syncing = true;

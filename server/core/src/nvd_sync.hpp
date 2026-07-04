@@ -56,6 +56,10 @@ private:
     mutable std::mutex mu_;
     std::condition_variable cv_;
     SyncStatus status_;
+    // Serialises do_sync(): the periodic loop and the detached POST /api/nvd/sync
+    // thread both call it on the same NvdClient; running two concurrently races
+    // the client's rate-limit state and doubles NVD load (#1867 governance).
+    std::atomic<bool> sync_active_{false};
     // Set true when sync_loop() actually returns. stop() waits on this so a
     // thread wedged in an uncancellable fetch (#1867) is detached rather than
     // joined-forever, letting the process exit instead of hanging shutdown.
