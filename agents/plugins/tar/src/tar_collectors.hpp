@@ -26,9 +26,24 @@
 #include <algorithm>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::tar {
+
+// ── Operator-facing collect-status tokens ────────────────────────────────────
+// The final field of the `tar|collect_<leg>|N|<token>` output lines. These are
+// a documented operator contract (docs/yaml-dsl-spec.md `tar.collect_perf`;
+// operator dashboards parse them) and are pinned verbatim by the unit tests —
+// renaming one is a contract change, not a refactor. NOTE: on Linux,
+// `unsupported_platform` currently also covers "supported platform but the
+// core /proc reads failed" (e.g. a masked /proc); a distinct token for that
+// case is a tracked follow-up.
+inline constexpr std::string_view kCollectStatusSourceDisabled = "source_disabled";
+inline constexpr std::string_view kCollectStatusUnsupportedPlatform = "unsupported_platform";
+inline constexpr std::string_view kCollectStatusBaseline = "baseline";
+inline constexpr std::string_view kCollectStatusSampleRecorded = "sample_recorded";
+inline constexpr std::string_view kCollectStatusAppsRecorded = "apps_recorded";
 
 // ── Collector data types ─────────────────────────────────────────────────────
 
