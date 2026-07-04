@@ -245,9 +245,12 @@ TEST_CASE("NvdDatabase: v1 database with data upgrades to v2", "[nvd][db][migrat
     REQUIRE(db.total_cve_count() == 0);
     REQUIRE(db.match_inventory({{"openssl", "1.0.1f"}}).empty()); // would have matched under v1
 
-    // 4. sync_meta survives — v2 drops only `cve`, not the whole DB, so the sync
-    //    cursor is preserved and the next incremental sync resumes correctly.
-    REQUIRE(db.get_meta("last_sync_time") == "2024-01-01T00:00:00Z");
+    // 4. The sync cursor must NOT survive: v2 dropped the catalog, so a preserved
+    //    last_sync_time would make the next sync incremental and the dropped rows
+    //    would never be re-fetched (silently gone from /api/nvd/match forever). An
+    //    empty cursor routes do_sync() to the full initial sync the upgrade docs
+    //    promise ("fully reconstructable / self-healing").
+    REQUIRE(db.get_meta("last_sync_time").empty());
 
     // 5. The reshaped schema is fully functional post-upgrade.
     db.upsert_cve(make_cve("CVE-2024-0001", "nginx", "1.25.0"));

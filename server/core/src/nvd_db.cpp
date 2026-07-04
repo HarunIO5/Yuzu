@@ -289,6 +289,14 @@ void NvdDatabase::create_tables() {
             DROP INDEX IF EXISTS idx_cve_product;
             DROP TABLE IF EXISTS cve;
 
+            -- The catalog reset must also reset the sync cursor: a preserved
+            -- last_sync_time would send the next sync down the incremental path
+            -- (do_incremental_sync -> fetch_modified_since), and the dropped,
+            -- since-unmodified CVEs would never be re-fetched — silently gone
+            -- from /api/nvd/match forever. Clearing it forces the full initial
+            -- sync the "fully reconstructable / self-healing" contract promises.
+            DELETE FROM sync_meta WHERE key = 'last_sync_time';
+
             CREATE TABLE IF NOT EXISTS cve (
                 cve_id        TEXT PRIMARY KEY,
                 severity      TEXT NOT NULL,
