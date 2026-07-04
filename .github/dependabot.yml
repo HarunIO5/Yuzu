@@ -57,6 +57,29 @@ updates:
       - dependency-name: "ubuntu"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
+  # npm lockfiles: the Astro docs site, the puppeteer UAT harness, and the
+  # Cedar & Vale demo app. These were previously uncovered, and the frozen
+  # site/ lockfile silently accumulated 8 GHSA advisories (astro/esbuild/
+  # js-yaml/ws) — the main driver of the OpenSSF Scorecard Vulnerabilities
+  # check decaying to 2/10. Nothing here ships in the product; it is all
+  # docs/demo/test tooling, so one grouped weekly PR per directory is enough.
+  - package-ecosystem: "npm"
+    directories:
+      - "/site"
+      - "/tests/puppeteer"
+      - "/deploy/docker/cedar-vale/app"
+    target-branch: "dev"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+    groups:
+      npm-all:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
+
   # Python tooling consumed by CI (meson, and whatever else lands in
   # requirements-ci.txt). vcpkg and rebar3 are covered by dedicated
   # scheduled workflows — see docs/dependency-updates.md.
