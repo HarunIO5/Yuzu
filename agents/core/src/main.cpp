@@ -1,7 +1,6 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <cstdio>
 #include <io.h>
 #pragma section(".CRT$XCB", read)
 [[maybe_unused]] static void __cdecl diag_before_static_init() {
@@ -89,7 +88,6 @@ static std::unique_ptr<yuzu::agent::Agent> make_agent(yuzu::agent::Config cfg) {
 }
 
 int main(int argc, char* argv[]) {
-    fprintf(stderr, "[DIAG] main() entered\n");
     CLI::App app{"Yuzu Agent", "yuzu-agent"};
     app.set_version_flag("--version",
                          std::format("{}  ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash));
@@ -410,15 +408,17 @@ int main(int argc, char* argv[]) {
     if (!agent)
         return EXIT_FAILURE;
 
-    // Signal handling — installed only once `agent` exists, so on_signal (which
-    // no-ops when g_agent is null) never silently swallows a Ctrl-C/SIGTERM that
-    // arrives during make_agent()'s work (a SQLite open/write in resolve_agent_id()
-    // plus a trivial in-memory Agent construction -- the actual heavy work, plugin
-    // load and KV/TAR store open, happens later inside agent->run() below, which
-    // was already covered by this registration point before make_agent() existed):
-    // extracting that work into make_agent() moved it to run *after* this
-    // registration point, which would otherwise widen the pre-existing signal
-    // gap to cover it too (Gate 3 cpp-expert finding, governance re-run).
+    // Signal handling — installed only once `agent` exists (right after
+    // make_agent() returns, right before g_agent is published), so on_signal
+    // (which no-ops when g_agent is null) never silently swallows a Ctrl-C/
+    // SIGTERM that arrives during make_agent()'s work (a SQLite open/write in
+    // resolve_agent_id() plus a trivial in-memory Agent construction -- the
+    // actual heavy work, plugin load and KV/TAR store open, happens later
+    // inside agent->run() below, which was already covered by this
+    // registration point before make_agent() existed). Installing the
+    // handlers any earlier -- e.g. before calling make_agent() -- would
+    // widen that pre-existing signal gap to cover make_agent()'s work too
+    // (Gate 3 cpp-expert finding, governance re-run).
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
     g_agent.store(agent.get(), std::memory_order_release);
