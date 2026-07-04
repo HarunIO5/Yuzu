@@ -7,23 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Do not add entries to this section directly** — including you, AI coding
+> agent reading this. Unreleased changes are recorded as one-file-per-change
+> fragments under [`changelog.d/`](changelog.d/README.md) and assembled here at
+> release time by `scripts/assemble-changelog.py` (direct edits fail the
+> `Changelog fragments` CI check). Entries below predate the fragment
+> convention and will be promoted normally at the next release.
+
 ### Added
 
-- **Mapped-drive TAR capture source (`mapdrive`, capability-map §3.8).** New opt-in
-  (default-off) TAR capture source recording network-share mappings in **both**
-  directions — outbound (drives this host maps to remote shares) and inbound (remote
-  hosts mapping this host's shares, the lateral-movement signal) — distinguished by a
-  `direction` column and queryable via `$MapDrive_Live`/`$MapDrive_Hourly`. Beyond the
-  standard periodic snapshot-diff (`appeared`/`removed`), a one-time backfill at agent
-  init seeds *previously* mapped drives (`origin='historical'`) from persistent OS
-  artifacts — Windows registry `Network`/`Map Network Drive MRU`/`MountPoints2` across
-  offline profiles + Security event log 4624 network logons; Linux `/etc/fstab` + Samba
-  connect logs. Live enumeration uses `WNetEnumResourceW` + `NetSessionEnum` (Windows,
-  inbound needs local-admin/Server-Operator) and `/proc/mounts` + `smbstatus` (Linux,
-  inbound needs Samba); macOS is planned. Rows carry usernames and remote share paths
-  (identity/usage-class telemetry — enabling is audited). Enable with
-  `tar.configure {"mapdrive_enabled":"true"}`; the historical backfill materializes on
-  the first agent restart after enabling. See `docs/user-manual/tar.md`.
 - **Recurring instruction schedules now actually fire (#1191).** `ScheduleEngine::evaluate_due`/`advance_schedule` had no production caller — schedules persisted and listed but never dispatched. A new `ScheduleRunner` poller (the `PolicyEvaluator`/`PreflightRunner` shape, 30s tick, joined before the stores) closes the gap: due schedules fire through the same tracked dispatch path as operator-initiated commands, the approval gate is never bypassed (`requires_approval` OR definition `approval_mode != "auto"`, one ticket per occurrence, one-approval == one-run via the occurrence anchor), and every outcome is audited (`instruction.schedule_fired`, `instruction.approval_required`) and counted (`yuzu_schedule_{fires,fire_failures,approvals_submitted,tick_errors}_total`). Hardened against adversarial review before merge: `POST /api/schedules` requires BOTH `Schedule:Write` and `Execution:Execute` — a created schedule is a fleet-wide command-dispatch primitive with no further permission check at fire time — and re-enabling a disabled schedule requires `Execution:Execute` too (disabling never does, so a runaway schedule can always be stopped); delete and enable/disable are owner-scoped (`created_by`); one approval ticket is now scoped to the single schedule occurrence that requested it (`approvals.schedule_id`), so two schedules sharing the same (creator, definition, scope) can no longer settle on each other's ticket.
 - **MCP agentic write surface + approval tickets (#289, R2).** Five MCP write tools
   are now dispatched: `set_tag`, `delete_tag`, `approve_request`, `reject_request`,
