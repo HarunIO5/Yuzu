@@ -683,6 +683,7 @@ struct MockFetcher : INvdFetcher {
     // Per-call override: given the 1-based published-window call index, return true for a
     // data window or false for an ok+empty window. Lets a test script "data then empty".
     std::function<bool(std::size_t)> data_predicate;
+    NvdFailureReason fail_reason = NvdFailureReason::kConnection; // returned when fail==true
 
     static CveRecord one_cve(std::size_t n) {
         CveRecord rec;
@@ -696,21 +697,32 @@ struct MockFetcher : INvdFetcher {
         rec.matches.push_back(cm);
         return rec;
     }
+    NvdFetchResult make(std::size_t n) {
+        NvdFetchResult r;
+        if (fail) {
+            r.ok = false;
+            r.reason = fail_reason;
+            return r;
+        }
+        r.ok = true;
+        bool give_data = !empty_ok;
+        if (give_data && data_predicate)
+            give_data = data_predicate(n);
+        if (give_data)
+            r.records.push_back(one_cve(n));
+        return r;
+    }
     NvdFetchResult fetch_by_published_window(const std::string& s, const std::string& e) override {
         published_calls.emplace_back(s, e);
-        NvdFetchResult r;
-        r.ok = !fail;
-        bool give_data = r.ok && !empty_ok;
-        if (give_data && data_predicate)
-            give_data = data_predicate(published_calls.size());
-        if (give_data)
-            r.records.push_back(one_cve(published_calls.size()));
-        return r;
+        return make(published_calls.size());
     }
     NvdFetchResult fetch_modified_between(const std::string& s, const std::string& e) override {
         modified_calls.emplace_back(s, e);
         NvdFetchResult r;
-        r.ok = !fail;
+        if (fail) {
+            r.ok = false;
+            r.reason = fail_reason;
+        }
         return r;
     }
 };
@@ -1150,4 +1162,50 @@ TEST_CASE("NvdDatabase: upsert_cves merges duplicate cve_id, losing no matches",
     REQUIRE(db.total_cve_count() == 1);                                   // one distinct CVE
     REQUIRE(db.match_inventory({{"productone", "1.0"}}).size() == 1);     // first product kept
     REQUIRE(db.match_inventory({{"producttwo", "1.0"}}).size() == 1);     // second product kept
+}
+
+// ── PR2c: 429 backoff schedule + failure-reason callback (#1880) ─────────────
+
+TEST_CASE("nvd_backoff_delay: Retry-After honoured, else exponential with cap", "[nvd][backoff]") {
+    using namespace std::chrono;
+    // Numeric Retry-After wins (capped at 30min).
+    REQUIRE(nvd_backoff_delay(1, "45") == seconds(45));
+    REQUIRE(nvd_backoff_delay(1, "999999") == seconds(1800)); // capped
+    // Zero / non-numeric (HTTP-date) Retry-After falls through to exp backoff.
+    REQUIRE(nvd_backoff_delay(3, "0") == seconds(120));
+    REQUIRE(nvd_backoff_delay(1, "Wed, 21 Oct 2025 07:28:00 GMT") == seconds(30));
+    // Exponential by attempt (1-based): 30, 60, 120, … capped at 1800.
+    REQUIRE(nvd_backoff_delay(1, "") == seconds(30));
+    REQUIRE(nvd_backoff_delay(2, "") == seconds(60));
+    REQUIRE(nvd_backoff_delay(3, "") == seconds(120));
+    REQUIRE(nvd_backoff_delay(10, "") == seconds(1800)); // capped
+}
+
+TEST_CASE("NvdSyncManager: a sync failure fires the callback with its reason; cancel does not",
+          "[nvd][failure]") {
+    // A real failure reason reaches the callback.
+    {
+        auto db = std::make_shared<NvdDatabase>(":memory:");
+        auto mock = std::make_unique<MockFetcher>();
+        mock->fail = true;
+        mock->fail_reason = NvdFailureReason::kHttp403;
+        std::vector<NvdFailureReason> reasons;
+        NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1,
+                           [&](NvdFailureReason r) { reasons.push_back(r); });
+        mgr.sync_now();
+        REQUIRE(reasons.size() == 1);
+        REQUIRE(reasons[0] == NvdFailureReason::kHttp403);
+    }
+    // A cancellation is NOT a failure — the callback must not fire.
+    {
+        auto db = std::make_shared<NvdDatabase>(":memory:");
+        auto mock = std::make_unique<MockFetcher>();
+        mock->fail = true;
+        mock->fail_reason = NvdFailureReason::kCancelled;
+        int calls = 0;
+        NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1,
+                           [&](NvdFailureReason) { ++calls; });
+        mgr.sync_now();
+        REQUIRE(calls == 0);
+    }
 }

@@ -30,6 +30,12 @@ constexpr auto kApiKeyInterval = std::chrono::milliseconds(600);  // 50 req / 30
 constexpr time_t kConnectTimeoutSec = 30;
 constexpr time_t kReadTimeoutSec = 60;
 
+// HTTP 429 backoff (#1880): start at 30s, double per attempt, cap at 30min; give
+// up on a single window after this many consecutive 429s.
+constexpr auto kBackoffBase = std::chrono::seconds(30);
+constexpr auto kBackoffCap = std::chrono::seconds(1800);
+constexpr int kMaxBackoffRetries = 5;
+
 std::string url_encode(const std::string& value) {
     std::ostringstream escaped;
     escaped.fill('0');
@@ -90,6 +96,20 @@ void NvdClient::configure_client(httplib::Client& client) const {
     apply_proxy(client);
 }
 
+bool NvdClient::cancellable_sleep(std::chrono::steady_clock::duration d) const {
+    // Sleep in small slices so a stop() (cancel flag) wakes us within ~200ms
+    // instead of blocking shutdown for the full rate-limit/backoff interval (#1879).
+    constexpr auto kSlice = std::chrono::milliseconds(200);
+    const auto deadline = std::chrono::steady_clock::now() + d;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (cancelled())
+            return false;
+        std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(
+            kSlice, deadline - std::chrono::steady_clock::now()));
+    }
+    return !cancelled();
+}
+
 void NvdClient::rate_limit() {
     const auto interval = api_key_.empty() ? kPublicInterval : kApiKeyInterval;
     const auto now = std::chrono::steady_clock::now();
@@ -97,9 +117,27 @@ void NvdClient::rate_limit() {
     if (wait > std::chrono::steady_clock::duration::zero()) {
         spdlog::debug("NVD rate limit: sleeping {}ms",
                       std::chrono::duration_cast<std::chrono::milliseconds>(wait).count());
-        std::this_thread::sleep_for(wait);
+        cancellable_sleep(wait); // wakes early on stop() (#1879)
     }
     last_request_time_ = std::chrono::steady_clock::now();
+}
+
+std::chrono::seconds nvd_backoff_delay(int attempt, const std::string& retry_after_hdr) {
+    // Honour a numeric-seconds Retry-After if present (capped), else exponential
+    // backoff by attempt (1-based): kBackoffBase, ×2 per attempt, capped.
+    if (!retry_after_hdr.empty()) {
+        try {
+            const long long secs = std::stoll(retry_after_hdr); // NVD sends integer seconds
+            if (secs > 0)
+                return std::min(std::chrono::seconds(secs), kBackoffCap);
+        } catch (...) {
+            // fall through to exponential backoff (Retry-After may be an HTTP-date)
+        }
+    }
+    auto d = kBackoffBase;
+    for (int i = 1; i < attempt && d < kBackoffCap; ++i)
+        d *= 2;
+    return std::min(d, kBackoffCap);
 }
 
 std::chrono::steady_clock::duration
@@ -126,8 +164,16 @@ nvd_rate_limit_wait(std::optional<std::chrono::steady_clock::time_point> last,
 NvdFetchResult NvdClient::fetch_paginated(const std::string& date_params) {
     NvdFetchResult combined;
     int start_index = 0;
+    int backoff_attempts = 0;
 
     while (true) {
+        // Cooperative cancellation between pages (#1879): abort promptly on stop().
+        if (cancelled()) {
+            combined.ok = false;
+            combined.reason = NvdFailureReason::kCancelled;
+            return combined;
+        }
+
         rate_limit();
 
         httplib::Client client(std::string("https://") + kNvdHost);
@@ -149,14 +195,51 @@ NvdFetchResult NvdClient::fetch_paginated(const std::string& date_params) {
         if (!res) {
             spdlog::error("NVD API request failed: connection error");
             combined.ok = false;
+            combined.reason = NvdFailureReason::kConnection;
+            return combined;
+        }
+
+        if (res->status == 429) {
+            // Rate-limited: honour Retry-After / exponential backoff and retry the
+            // SAME page a bounded number of times (#1880), instead of failing the
+            // window and re-hammering NVD every tick. The backoff sleep is
+            // cancellable so a 30-min wait can't wedge shutdown.
+            if (++backoff_attempts > kMaxBackoffRetries) {
+                spdlog::error("NVD HTTP 429 persisted after {} retries — giving up this window",
+                              kMaxBackoffRetries);
+                combined.ok = false;
+                combined.reason = NvdFailureReason::kHttp429;
+                return combined;
+            }
+            const auto delay = nvd_backoff_delay(backoff_attempts, res->get_header_value("Retry-After"));
+            spdlog::warn("NVD HTTP 429 (rate limited) — backing off {}s (attempt {}/{})",
+                         delay.count(), backoff_attempts, kMaxBackoffRetries);
+            if (!cancellable_sleep(delay)) {
+                combined.ok = false;
+                combined.reason = NvdFailureReason::kCancelled;
+                return combined;
+            }
+            continue; // retry the same start_index
+        }
+
+        if (res->status == 403) {
+            // 403 = a CONFIG error (bad/revoked API key), not transient — do not
+            // retry; surface it distinctly so it isn't silently retried forever.
+            spdlog::error("NVD HTTP 403 (bad/revoked API key?) — not retrying: {}",
+                          res->body.substr(0, 200));
+            combined.ok = false;
+            combined.reason = NvdFailureReason::kHttp403;
             return combined;
         }
 
         if (res->status != 200) {
             spdlog::error("NVD API returned HTTP {}: {}", res->status, res->body.substr(0, 200));
             combined.ok = false;
+            combined.reason = NvdFailureReason::kHttpOther;
             return combined;
         }
+
+        backoff_attempts = 0; // reset after a successful request
 
         auto page = parse_response(res->body);
         if (!page.ok) {
@@ -164,6 +247,7 @@ NvdFetchResult NvdClient::fetch_paginated(const std::string& date_params) {
             // truncated window as success (UP-1/UP-2). Fail the whole fetch so the
             // caller keeps its cursor and retries.
             combined.ok = false;
+            combined.reason = NvdFailureReason::kParse;
             return combined;
         }
         if (page.records.empty() && page.total_results == 0) {

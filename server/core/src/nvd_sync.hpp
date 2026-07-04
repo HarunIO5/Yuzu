@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -15,13 +16,19 @@ namespace yuzu::server {
 
 class NvdSyncManager {
 public:
+    // Called (from the sync thread) when a sync fails for a non-cancel reason, so
+    // the owner can increment a metric (#1880). Never invoked on a shutdown-cancel.
+    using FailureCallback = std::function<void(NvdFailureReason)>;
+
     // Production: builds an NvdClient as the fetcher. backfill_years bounds how
     // far back the newest-first backfill walks (0 = full history to NVD's start).
     NvdSyncManager(std::shared_ptr<NvdDatabase> db, std::string api_key, std::string proxy_url,
-                   std::chrono::seconds sync_interval, int backfill_years = 8);
-    // Test: inject a mock fetcher (no network).
+                   std::chrono::seconds sync_interval, int backfill_years = 8,
+                   FailureCallback on_failure = {});
+    // Test: inject a mock fetcher (no network) + optional failure callback.
     NvdSyncManager(std::shared_ptr<NvdDatabase> db, std::unique_ptr<INvdFetcher> fetcher,
-                   std::chrono::seconds sync_interval, int backfill_years);
+                   std::chrono::seconds sync_interval, int backfill_years,
+                   FailureCallback on_failure = {});
     ~NvdSyncManager();
 
     NvdSyncManager(const NvdSyncManager&) = delete;
@@ -59,6 +66,7 @@ public:
 
 private:
     std::shared_ptr<NvdDatabase> db_;
+    FailureCallback on_sync_failure_; // optional; invoked on a non-cancel sync failure (#1880)
     std::unique_ptr<INvdFetcher> fetcher_;
     std::chrono::seconds interval_;
     int backfill_years_;
@@ -110,6 +118,9 @@ private:
     // and the completion comparison.
     std::chrono::system_clock::time_point
     backfill_floor(std::chrono::system_clock::time_point now) const;
+    // Log a failed window and fire on_sync_failure_ — UNLESS it was a shutdown
+    // cancel (stopping_ / kCancelled), which is not a failure (#1880/#1879).
+    void report_failure(NvdFailureReason reason, const char* phase);
 };
 
 } // namespace yuzu::server

@@ -297,6 +297,10 @@ public:
         metrics_.describe("yuzu_nvd_backfill_complete",
                           "1 when the newest-first NVD backfill has reached its floor, else 0",
                           "gauge");
+        metrics_.describe("yuzu_nvd_sync_failures_total",
+                          "NVD sync window failures by reason (connection/http_429/http_403/"
+                          "http_other/parse)",
+                          "counter");
         metrics_.describe("yuzu_server_default_certs_active",
                           "1 when running with built-in per-install default certificates, else 0",
                           "gauge");
@@ -1159,9 +1163,25 @@ public:
         nvd_db_ = std::make_shared<NvdDatabase>(nvd_path);
 
         if (cfg_.nvd_sync_enabled && nvd_db_->is_open()) {
-            nvd_sync_ = std::make_unique<NvdSyncManager>(nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy,
-                                                         cfg_.nvd_sync_interval,
-                                                         cfg_.nvd_backfill_years);
+            nvd_sync_ = std::make_unique<NvdSyncManager>(
+                nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy, cfg_.nvd_sync_interval,
+                cfg_.nvd_backfill_years, [this](NvdFailureReason r) {
+                    // Fires from the sync thread on a non-cancel failure (#1880).
+                    // metrics_ is thread-safe; NvdSyncManager guarantees this is
+                    // never called on the leak-on-detach shutdown path.
+                    const char* reason = "unknown";
+                    switch (r) {
+                    case NvdFailureReason::kConnection: reason = "connection"; break;
+                    case NvdFailureReason::kHttp429:    reason = "http_429"; break;
+                    case NvdFailureReason::kHttp403:    reason = "http_403"; break;
+                    case NvdFailureReason::kHttpOther:  reason = "http_other"; break;
+                    case NvdFailureReason::kParse:      reason = "parse"; break;
+                    case NvdFailureReason::kNone:
+                    case NvdFailureReason::kCancelled:  break; // never reach here
+                    }
+                    metrics_.counter("yuzu_nvd_sync_failures_total", {{"reason", reason}})
+                        .increment();
+                });
             // #1867: do NOT start the background thread here. Its first action is
             // an uncancellable NVD fetch; if a LATER ctor step fails closed (e.g.
             // the Postgres substrate probe below sets startup_failed_), ~ServerImpl

@@ -77,16 +77,23 @@ std::optional<std::chrono::system_clock::time_point> parse_cursor(const std::str
 
 NvdSyncManager::NvdSyncManager(std::shared_ptr<NvdDatabase> db, std::string api_key,
                                std::string proxy_url, std::chrono::seconds sync_interval,
-                               int backfill_years)
-    : db_{std::move(db)}, fetcher_{std::make_unique<NvdClient>(std::move(api_key),
-                                                               std::move(proxy_url))},
-      interval_{sync_interval}, backfill_years_{backfill_years} {}
+                               int backfill_years, FailureCallback on_failure)
+    : db_{std::move(db)}, on_sync_failure_{std::move(on_failure)}, interval_{sync_interval},
+      backfill_years_{backfill_years} {
+    // Build the concrete client in the body so we can wire the cancel flag before
+    // erasing to INvdFetcher (#1879). &stopping_ is a stable member address; the
+    // client only dereferences it during a fetch, long after construction.
+    auto client = std::make_unique<NvdClient>(std::move(api_key), std::move(proxy_url));
+    client->set_cancel_flag(&stopping_);
+    fetcher_ = std::move(client);
+}
 
 NvdSyncManager::NvdSyncManager(std::shared_ptr<NvdDatabase> db,
                                std::unique_ptr<INvdFetcher> fetcher,
-                               std::chrono::seconds sync_interval, int backfill_years)
-    : db_{std::move(db)}, fetcher_{std::move(fetcher)}, interval_{sync_interval},
-      backfill_years_{backfill_years} {}
+                               std::chrono::seconds sync_interval, int backfill_years,
+                               FailureCallback on_failure)
+    : db_{std::move(db)}, on_sync_failure_{std::move(on_failure)}, fetcher_{std::move(fetcher)},
+      interval_{sync_interval}, backfill_years_{backfill_years} {}
 
 NvdSyncManager::~NvdSyncManager() {
     // On the detach path stop() returns false; the owner (ServerImpl::stop())
@@ -323,6 +330,19 @@ NvdSyncManager::backfill_floor(std::chrono::system_clock::time_point now) const 
     return std::max(now - std::chrono::years(years), nvd_start);
 }
 
+void NvdSyncManager::report_failure(NvdFailureReason reason, const char* phase) {
+    // A shutdown cancel is not a failure — don't log it as one, don't count it,
+    // and (critically) don't invoke the callback, which may touch owner state
+    // that is being torn down on the leak-on-detach path (stopping_ is set before
+    // that teardown, so this guard closes the window).
+    if (stopping_.load() || reason == NvdFailureReason::kCancelled)
+        return;
+    spdlog::warn("NVD {} window failed (reason={}) — will retry next tick (cursor unchanged)", phase,
+                 static_cast<int>(reason));
+    if (on_sync_failure_)
+        on_sync_failure_(reason);
+}
+
 void NvdSyncManager::do_backfill() {
     const auto now = std::chrono::system_clock::now();
     const auto floor = backfill_floor(now);
@@ -410,11 +430,13 @@ void NvdSyncManager::do_backfill() {
         auto result = fetcher_->fetch_by_published_window(iso_of(window_start), iso_of(cursor));
         if (!result.ok) {
             // Transient error — leave the cursor so the next tick retries this window rather
-            // than skipping unfetched CVEs (#1875). Surface it so a PERSISTENT fetch failure
-            // (connection, HTTP error, or a self-contradictory totalResults>0-but-empty page
-            // forced to ok=false in parse_response) isn't silent on /api/nvd/status (#1889 r5).
-            spdlog::warn("NVD backfill window failed — will retry next tick (cursor unchanged)");
-            {
+            // than skipping unfetched CVEs (#1875). report_failure() warns with the reason and
+            // increments yuzu_nvd_sync_failures_total (no-op on a shutdown cancel, #1880); also
+            // surface it on /api/nvd/status so a PERSISTENT fetch failure (connection, HTTP
+            // error, or a self-contradictory totalResults>0-but-empty page forced to ok=false in
+            // parse_response) isn't silent (#1889 r5) — but not on a clean cancel.
+            report_failure(result.reason, "backfill");
+            if (!stopping_.load() && result.reason != NvdFailureReason::kCancelled) {
                 std::lock_guard<std::mutex> lock{mu_};
                 status_.last_error = "NVD backfill fetch failed — retrying (mirror incomplete)";
             }
@@ -534,8 +556,10 @@ void NvdSyncManager::do_freshness() {
             return;
         auto result = fetcher_->fetch_modified_between(iso_of(ws), iso_of(we));
         if (!result.ok) {
-            spdlog::warn("NVD freshness window failed — will retry (cursor unchanged)");
-            {
+            // report_failure() warns with the reason + increments the failure metric (no-op on
+            // a shutdown cancel); also surface it on /api/nvd/status unless it's a clean cancel.
+            report_failure(result.reason, "freshness");
+            if (!stopping_.load() && result.reason != NvdFailureReason::kCancelled) {
                 std::lock_guard<std::mutex> lock{mu_};
                 status_.last_error = "NVD freshness fetch failed — retrying";
             }
