@@ -431,9 +431,14 @@ Not implemented. Event emission for SIEM/compliance integration.
 
 > **Gap:** No macOS FileVault or Linux LUKS coverage.
 
-### 9.4 Vulnerability Scanning :white_check_mark: `T1`
+### 9.4 Vulnerability Scanning :large_orange_diamond: `T1`
 
-`vuln_scan` plugin + NVD database sync on server.
+`vuln_scan` plugin + NVD database sync on server. Server-side matching now uses
+real CPE version ranges (`cve`+`cve_match` schema), but **coverage is still
+partial**: the NVD sync is keyword-scoped (no full-catalog backfill yet) and
+match identity is product-name based, not vendor/CPE-precise (false positives
+from name collisions possible; vendor precision pending ADR-0018). See
+`docs/vuln-scan-roadmap.md`.
 
 ### 9.5 Event Log Collection :white_check_mark: `T1`
 

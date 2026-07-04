@@ -324,8 +324,17 @@ NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
             }
         }
 
-        // Extract CPE matches from configurations
-        bool has_cpe = false;
+        // One record per CVE; one CpeMatch per cpeMatch node. Keep the full
+        // version-range tuple (NVD already provides it) instead of collapsing
+        // to a single upper bound.
+        CveRecord record;
+        record.cve_id = cve_id;
+        record.severity = severity;
+        record.description = description;
+        record.published = published;
+        record.last_modified = last_modified;
+        record.source = "nvd";
+
         if (cve.contains("configurations") && cve["configurations"].is_array()) {
             for (const auto& config : cve["configurations"]) {
                 if (!config.contains("nodes") || !config["nodes"].is_array()) {
@@ -354,56 +363,34 @@ NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
                             continue;
                         }
 
-                        std::string vendor = parts[3];
-                        std::string product = parts[4];
+                        auto lower = [](std::string s) {
+                            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+                                return static_cast<char>(std::tolower(c));
+                            });
+                            return s;
+                        };
 
-                        // Normalize to lowercase
-                        std::transform(
-                            product.begin(), product.end(), product.begin(),
-                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                        std::transform(
-                            vendor.begin(), vendor.end(), vendor.begin(),
-                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-                        // Extract version constraint
-                        std::string affected_below;
-                        if (match.contains("versionEndExcluding")) {
-                            affected_below = match.value("versionEndExcluding", "");
-                        } else if (match.contains("versionEndIncluding")) {
-                            affected_below = match.value("versionEndIncluding", "");
+                        CpeMatch cm;
+                        cm.cpe_vendor = lower(parts[3]);
+                        cm.cpe_product = lower(parts[4]);
+                        if (parts.size() > 5) {
+                            cm.cpe_version = parts[5]; // '*'/'-' = any (handled downstream)
                         }
+                        cm.version_start_including = match.value("versionStartIncluding", "");
+                        cm.version_start_excluding = match.value("versionStartExcluding", "");
+                        cm.version_end_including = match.value("versionEndIncluding", "");
+                        cm.version_end_excluding = match.value("versionEndExcluding", "");
+                        cm.is_vulnerable = match.value("vulnerable", true);
 
-                        CveRecord record;
-                        record.cve_id = cve_id;
-                        record.product = product;
-                        record.vendor = vendor;
-                        record.affected_below = affected_below;
-                        record.severity = severity;
-                        record.description = description;
-                        record.published = published;
-                        record.last_modified = last_modified;
-                        record.source = "nvd";
-
-                        result.records.push_back(std::move(record));
-                        has_cpe = true;
+                        record.matches.push_back(std::move(cm));
                     }
                 }
             }
         }
 
-        // If no CPE configurations, still create a record with empty product/vendor
-        // so the CVE data isn't lost
-        if (!has_cpe) {
-            CveRecord record;
-            record.cve_id = cve_id;
-            record.severity = severity;
-            record.description = description;
-            record.published = published;
-            record.last_modified = last_modified;
-            record.source = "nvd";
-
-            result.records.push_back(std::move(record));
-        }
+        // Header-only records (no CPE configuration) are still kept so the CVE
+        // metadata isn't lost; they simply never match inventory.
+        result.records.push_back(std::move(record));
     }
 
     spdlog::debug("NVD parsed {} records from {} vulnerabilities", result.records.size(),
