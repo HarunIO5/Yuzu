@@ -4857,13 +4857,25 @@ Returns recent analytics events. Accepts `limit` as a query parameter (default 5
 
 Returns the status of the NVD (National Vulnerability Database) sync.
 
+Response fields: `enabled`, `syncing`, `last_sync_time`, `last_error`, and
+`total_cves`. **`total_cves` is a count of distinct CVEs** in the local store.
+(Prior to the CPE-range-matching change it counted one row per affected
+product, so a multi-product CVE inflated the figure — after upgrade the number
+reads lower even once fully synced, and reads near-zero briefly after the
+one-time schema migration until the next sync repopulates the mirror. This is
+expected, not data loss.)
+
 #### `POST /api/nvd/sync`
 
 Trigger a manual NVD database sync. Admin only. Runs asynchronously and returns immediately.
 
 #### `POST /api/nvd/match`
 
-Match installed software against known CVEs in the NVD database.
+Match installed software against known CVEs in the NVD database. Matching
+evaluates full CPE version ranges (`versionStartIncluding/Excluding`,
+`versionEndIncluding/Excluding`, exact and wildcard). Product identity is
+matched by name (case-insensitive); vendor-precise CPE identity is a planned
+enhancement (ADR-0018), so name-collision false positives are possible.
 
 ---
 
