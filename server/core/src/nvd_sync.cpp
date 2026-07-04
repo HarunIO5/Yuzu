@@ -74,6 +74,10 @@ void NvdSyncManager::start() {
     if (sync_thread_.joinable()) {
         return; // already running
     }
+    // Note: restarting after a stop() that DETACHED (returned false) would reset
+    // stopping_/finished_ while the abandoned thread still runs — but ServerImpl
+    // release()es the manager on that path and never restarts it, so this is
+    // unreachable in production.
     stopping_.store(false);
     finished_.store(false);
 #ifdef __cpp_lib_jthread
@@ -150,7 +154,17 @@ NvdSyncManager::SyncStatus NvdSyncManager::status() const {
 }
 
 bool NvdSyncManager::backfill_complete() const {
-    return db_->get_meta("backfill_complete") == "1";
+    // Defensive: this is called from the sync_loop header (outside do_sync's
+    // try/catch), so a throwing SQLite read must not escape the thread and
+    // std::terminate the process. Treat an unreadable flag as "not complete"
+    // (safe default — keeps backfilling; do_sync's catch logs the real error).
+    try {
+        return db_->get_meta("backfill_complete") == "1";
+    } catch (const std::exception& e) {
+        spdlog::warn("NVD backfill_complete() meta read failed: {} (assuming not complete)",
+                     e.what());
+        return false;
+    }
 }
 
 #ifdef __cpp_lib_jthread
