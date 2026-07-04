@@ -332,15 +332,28 @@ NvdSyncManager::backfill_floor(std::chrono::system_clock::time_point now) const 
 
 void NvdSyncManager::report_failure(NvdFailureReason reason, const char* phase) {
     // A shutdown cancel is not a failure — don't log it as one, don't count it,
-    // and (critically) don't invoke the callback, which may touch owner state
-    // that is being torn down on the leak-on-detach path (stopping_ is set before
-    // that teardown, so this guard closes the window).
+    // and don't invoke the callback, which may touch owner state (server metrics_)
+    // being torn down on the leak-on-detach path. stopping_ is set before that
+    // teardown, so this guard NARROWS the window to an implausible sliver (a
+    // multi-second stall inside the log call below, between this check and the
+    // invoke, while the 5s grace expires and the owner frees metrics_); cpp-safety
+    // + security cleared it as sound in practice. A full close is the pull-model
+    // follow-up (surface counts in SyncStatus, emit at scrape) — see PR notes.
     if (stopping_.load() || reason == NvdFailureReason::kCancelled)
         return;
     spdlog::warn("NVD {} window failed (reason={}) — will retry next tick (cursor unchanged)", phase,
-                 static_cast<int>(reason));
-    if (on_sync_failure_)
-        on_sync_failure_(reason);
+                 nvd_reason_label(reason));
+    if (on_sync_failure_) {
+        // The callback reaches into server-level metrics; never let a throw from
+        // it escape and std::terminate the sync thread (UP-6).
+        try {
+            on_sync_failure_(reason);
+        } catch (const std::exception& e) {
+            spdlog::error("NVD failure callback threw: {}", e.what());
+        } catch (...) {
+            spdlog::error("NVD failure callback threw a non-std exception");
+        }
+    }
 }
 
 void NvdSyncManager::do_backfill() {

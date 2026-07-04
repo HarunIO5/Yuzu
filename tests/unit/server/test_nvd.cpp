@@ -21,6 +21,7 @@
 #include <functional>
 #include <cstddef>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1208,4 +1209,31 @@ TEST_CASE("NvdSyncManager: a sync failure fires the callback with its reason; ca
         mgr.sync_now();
         REQUIRE(calls == 0);
     }
+}
+
+// ── PR2c governance: reason→label parity + callback-throw safety ─────────────
+
+TEST_CASE("nvd_reason_label maps every reason to its stable metric label", "[nvd][failure]") {
+    // The SINGLE source of truth for the yuzu_nvd_sync_failures_total label set —
+    // pinning the strings so they can't drift from describe()/docs/changelog.
+    REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kConnection)) == "connection");
+    REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kHttp429)) == "http_429");
+    REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kHttp403)) == "http_403");
+    REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kHttpOther)) == "http_other");
+    REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kParse)) == "parse");
+    REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kNone)) == "none");
+    REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kCancelled)) == "none");
+}
+
+TEST_CASE("NvdSyncManager: a throwing failure callback does not kill the sync thread",
+          "[nvd][failure]") {
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    auto mock = std::make_unique<MockFetcher>();
+    mock->fail = true;
+    mock->fail_reason = NvdFailureReason::kConnection;
+    // report_failure must swallow a throw from the (server-provided) callback so a
+    // metrics hiccup can't std::terminate the sync thread (UP-6).
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1,
+                       [](NvdFailureReason) { throw std::runtime_error("metrics boom"); });
+    REQUIRE_NOTHROW(mgr.sync_now());
 }

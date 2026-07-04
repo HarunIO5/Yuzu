@@ -107,4 +107,10 @@ nvd_rate_limit_wait(std::optional<std::chrono::steady_clock::time_point> last,
 /// 30s, 60s, 120s, … capped). Pure.
 std::chrono::seconds nvd_backoff_delay(int attempt, const std::string& retry_after_hdr);
 
+/// Stable Prometheus `reason` label for a failure (the SINGLE source of truth for
+/// the yuzu_nvd_sync_failures_total label set — used by the metric wiring AND a
+/// parity test so the strings can't drift). kNone/kCancelled → "none" (never
+/// counted).
+const char* nvd_reason_label(NvdFailureReason reason);
+
 } // namespace yuzu::server

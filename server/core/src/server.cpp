@@ -301,6 +301,14 @@ public:
                           "NVD sync window failures by reason (connection/http_429/http_403/"
                           "http_other/parse)",
                           "counter");
+        // Initialise every reason series to 0 so the counter (and its HELP/TYPE)
+        // is present in /metrics on a healthy server — otherwise absent()-style
+        // alerts misfire and Grafana shows "No data" until the first failure (sre).
+        for (auto r : {NvdFailureReason::kConnection, NvdFailureReason::kHttp429,
+                       NvdFailureReason::kHttp403, NvdFailureReason::kHttpOther,
+                       NvdFailureReason::kParse}) {
+            metrics_.counter("yuzu_nvd_sync_failures_total", {{"reason", nvd_reason_label(r)}});
+        }
         metrics_.describe("yuzu_server_default_certs_active",
                           "1 when running with built-in per-install default certificates, else 0",
                           "gauge");
@@ -1167,19 +1175,11 @@ public:
                 nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy, cfg_.nvd_sync_interval,
                 cfg_.nvd_backfill_years, [this](NvdFailureReason r) {
                     // Fires from the sync thread on a non-cancel failure (#1880).
-                    // metrics_ is thread-safe; NvdSyncManager guarantees this is
-                    // never called on the leak-on-detach shutdown path.
-                    const char* reason = "unknown";
-                    switch (r) {
-                    case NvdFailureReason::kConnection: reason = "connection"; break;
-                    case NvdFailureReason::kHttp429:    reason = "http_429"; break;
-                    case NvdFailureReason::kHttp403:    reason = "http_403"; break;
-                    case NvdFailureReason::kHttpOther:  reason = "http_other"; break;
-                    case NvdFailureReason::kParse:      reason = "parse"; break;
-                    case NvdFailureReason::kNone:
-                    case NvdFailureReason::kCancelled:  break; // never reach here
-                    }
-                    metrics_.counter("yuzu_nvd_sync_failures_total", {{"reason", reason}})
+                    // metrics_ is thread-safe. NvdSyncManager's stopping_ guard
+                    // makes a call after ServerImpl teardown implausible (not
+                    // provably impossible — see report_failure); acceptable per
+                    // the cpp-safety/architect review, pull-model close deferred.
+                    metrics_.counter("yuzu_nvd_sync_failures_total", {{"reason", nvd_reason_label(r)}})
                         .increment();
                 });
             // #1867: do NOT start the background thread here. Its first action is

@@ -34,7 +34,11 @@ constexpr time_t kReadTimeoutSec = 60;
 // up on a single window after this many consecutive 429s.
 constexpr auto kBackoffBase = std::chrono::seconds(30);
 constexpr auto kBackoffCap = std::chrono::seconds(1800);
-constexpr int kMaxBackoffRetries = 5;
+constexpr int kMaxBackoffRetries = 5; // consecutive 429s before giving up a window
+// Total 429s tolerated across ALL pages of one window (bounds a flaky
+// 429/200/429/200 endpoint that would otherwise reset the consecutive counter
+// every success and back off for hours — governance UP-3).
+constexpr int kMaxTotal429sPerWindow = 10;
 
 std::string url_encode(const std::string& value) {
     std::ostringstream escaped;
@@ -140,6 +144,19 @@ std::chrono::seconds nvd_backoff_delay(int attempt, const std::string& retry_aft
     return std::min(d, kBackoffCap);
 }
 
+const char* nvd_reason_label(NvdFailureReason reason) {
+    switch (reason) {
+    case NvdFailureReason::kConnection: return "connection";
+    case NvdFailureReason::kHttp429:    return "http_429";
+    case NvdFailureReason::kHttp403:    return "http_403";
+    case NvdFailureReason::kHttpOther:  return "http_other";
+    case NvdFailureReason::kParse:      return "parse";
+    case NvdFailureReason::kNone:
+    case NvdFailureReason::kCancelled:  return "none"; // never counted
+    }
+    return "none";
+}
+
 std::chrono::steady_clock::duration
 nvd_rate_limit_wait(std::optional<std::chrono::steady_clock::time_point> last,
                     std::chrono::steady_clock::time_point now,
@@ -164,7 +181,8 @@ nvd_rate_limit_wait(std::optional<std::chrono::steady_clock::time_point> last,
 NvdFetchResult NvdClient::fetch_paginated(const std::string& date_params) {
     NvdFetchResult combined;
     int start_index = 0;
-    int backoff_attempts = 0;
+    int backoff_attempts = 0; // consecutive 429s (reset on success)
+    int total_429s = 0;       // total 429s this window (never reset — UP-3 cap)
 
     while (true) {
         // Cooperative cancellation between pages (#1879): abort promptly on stop().
@@ -204,9 +222,14 @@ NvdFetchResult NvdClient::fetch_paginated(const std::string& date_params) {
             // SAME page a bounded number of times (#1880), instead of failing the
             // window and re-hammering NVD every tick. The backoff sleep is
             // cancellable so a 30-min wait can't wedge shutdown.
-            if (++backoff_attempts > kMaxBackoffRetries) {
-                spdlog::error("NVD HTTP 429 persisted after {} retries — giving up this window",
-                              kMaxBackoffRetries);
+            // Two bounds: kMaxBackoffRetries CONSECUTIVE 429s, and
+            // kMaxTotal429sPerWindow TOTAL across the window — the latter caps a
+            // flaky endpoint that 429s intermittently (resetting the consecutive
+            // counter on each intervening 200) from backing off for hours (UP-3).
+            if (++backoff_attempts > kMaxBackoffRetries ||
+                ++total_429s > kMaxTotal429sPerWindow) {
+                spdlog::error("NVD HTTP 429 gave up this window ({} consecutive / {} total)",
+                              backoff_attempts, total_429s);
                 combined.ok = false;
                 combined.reason = NvdFailureReason::kHttp429;
                 return combined;
