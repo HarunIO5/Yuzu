@@ -185,3 +185,9 @@ docs/dex-brd-coverage.md
 .lora-prefs/
 .agents/
 spike/
+
+# Local NVD/SQLite databases (large, reconstructable — never commit; a dev
+# --data-dir pointed in-tree must not commit the catalog). PR2b.
+*.db
+*.db-wal
+*.db-shm

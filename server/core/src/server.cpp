@@ -1156,7 +1156,8 @@ public:
 
         if (cfg_.nvd_sync_enabled && nvd_db_->is_open()) {
             nvd_sync_ = std::make_unique<NvdSyncManager>(nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy,
-                                                         cfg_.nvd_sync_interval);
+                                                         cfg_.nvd_sync_interval,
+                                                         cfg_.nvd_backfill_years);
             nvd_sync_->start();
         }
 
