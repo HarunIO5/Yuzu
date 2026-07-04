@@ -351,6 +351,84 @@ static std::string get_text(xmlNodePtr node) {
     return s.substr(b, e - b + 1);
 }
 
+/// Extract group identifier values from the verified assertion's
+/// <AttributeStatement>/<Attribute Name="group_attribute">/<AttributeValue>
+/// text content.
+///
+/// SECURITY (N2 parity): reads ONLY from `assertion` — the SAME XSW-verified
+/// node that name_id is read from in validate_response — never a second
+/// XPath/search over the whole document. Callers MUST pass the single
+/// verified assertion node, never `root` or any other document-wide handle.
+///
+/// SAML core permits more than one <AttributeStatement> and more than one
+/// <Attribute> with the same Name; this walks all of them but ignores any
+/// <Attribute> whose Name does not exactly equal `group_attribute`.
+///
+/// DoS guard: stops once kMaxGroupValues values have been collected, so an
+/// attacker-signed or IdP-misconfigured assertion cannot force unbounded
+/// allocation (the overall response is also already size- and depth-capped
+/// upstream in validate_response).
+///
+/// @param cap_truncated  #1828.3 out-param — set true iff at least one more
+///     non-empty group value existed past the kMax cap (detection is bounded
+///     to exactly one extra element scanned per matching Attribute; never an
+///     unbounded walk). nullptr is accepted for callers that don't care.
+static std::vector<std::string> extract_group_values(xmlNodePtr assertion,
+                                                       const std::string& group_attribute,
+                                                       bool* cap_truncated = nullptr) {
+    std::vector<std::string> groups;
+    if (cap_truncated) *cap_truncated = false;
+    if (group_attribute.empty()) return groups;
+
+    constexpr std::size_t kMax = yuzu::server::saml::kMaxGroupValues;
+
+    for (xmlNodePtr stmt = xmlFirstElementChild(assertion); stmt && groups.size() < kMax;
+         stmt = xmlNextElementSibling(stmt)) {
+        if (stmt->type != XML_ELEMENT_NODE || !stmt->name ||
+            !xmlStrEqual(stmt->name, BAD_CAST "AttributeStatement") || !stmt->ns ||
+            !stmt->ns->href || !xmlStrEqual(stmt->ns->href, BAD_CAST kSamlAssertionNs)) {
+            continue;
+        }
+        for (xmlNodePtr attr = xmlFirstElementChild(stmt); attr && groups.size() < kMax;
+             attr = xmlNextElementSibling(attr)) {
+            if (attr->type != XML_ELEMENT_NODE || !attr->name ||
+                !xmlStrEqual(attr->name, BAD_CAST "Attribute") || !attr->ns || !attr->ns->href ||
+                !xmlStrEqual(attr->ns->href, BAD_CAST kSamlAssertionNs)) {
+                continue;
+            }
+            if (get_attr(attr, "Name") != group_attribute) continue;
+            // Deliberately NOT bounded by `groups.size() < kMax` here (unlike
+            // the stmt/attr loops above) — once the cap is reached this loop
+            // still needs to look at the NEXT value to tell "exactly kMax
+            // values, no more" apart from "more values were dropped". The
+            // scan still terminates in O(1) extra work: the first non-empty
+            // value seen once the cap is already full sets cap_truncated and
+            // breaks immediately, so at most one AttributeValue past the cap
+            // is ever inspected.
+            for (xmlNodePtr val = xmlFirstElementChild(attr); val;
+                 val = xmlNextElementSibling(val)) {
+                if (val->type != XML_ELEMENT_NODE || !val->name ||
+                    !xmlStrEqual(val->name, BAD_CAST "AttributeValue") || !val->ns ||
+                    !val->ns->href || !xmlStrEqual(val->ns->href, BAD_CAST kSamlAssertionNs)) {
+                    continue;
+                }
+                // UP-8: skip empty/whitespace-only values — they can never
+                // match a non-empty admin_group and would otherwise waste a
+                // slot against the kMax DoS cap.
+                std::string text = get_text(val);
+                if (text.empty()) continue;
+                if (groups.size() < kMax) {
+                    groups.push_back(std::move(text));
+                    continue;
+                }
+                if (cap_truncated) *cap_truncated = true;
+                break;
+            }
+        }
+    }
+    return groups;
+}
+
 /// Maximum element-nesting depth we will traverse in the XSW walks. libxml2
 /// already caps parse depth (XML_PARSE_HUGE is off → default 256), but we bound
 /// our own recursion explicitly so these walks are provably stack-safe
@@ -1041,8 +1119,17 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
         return std::unexpected("no NameID found in verified assertion");
     }
 
-    spdlog::info("SamlProvider: assertion accepted (name_id={})", name_id);
-    return SamlAssertion{std::move(name_id)};
+    // ── 15. Extract group attribute values (all reads from the verified
+    // 'assertion' node — see extract_group_values' N2 parity comment). Empty
+    // config_.group_attribute (the default) yields an empty groups vector,
+    // preserving the thin slice's behaviour exactly.
+    bool group_cap_truncated = false;
+    std::vector<std::string> groups =
+        extract_group_values(assertion, config_.group_attribute, &group_cap_truncated);
+
+    spdlog::info("SamlProvider: assertion accepted (name_id={}, groups={})", name_id,
+                 groups.size());
+    return SamlAssertion{std::move(name_id), std::move(groups), group_cap_truncated};
 }
 
 // ── cleanup ───────────────────────────────────────────────────────────────────

@@ -402,11 +402,16 @@ public:
                                     std::chrono::steady_clock::time_point mfa_verified_at = {});
 
     /// Create an ephemeral session for a verified SAML assertion's NameID.
-    /// Thin slice: role defaults to `user` — no group→role mapping (deferred).
+    /// Role: admin if `groups` contains `admin_group` (exact match), user
+    /// otherwise — mirrors create_oidc_session's admin_group_id guard exactly.
+    /// Both `groups` and `admin_group` default-empty, so an unconfigured
+    /// deployment still mints `user` unconditionally (thin-slice-compatible).
     /// The session's `auth_source` is `"saml"`. `last_activity_at` is stamped
     /// per the standing invariant: any new session-creation site MUST stamp it
     /// or the idle-eviction gate will instantly expire the session (auth.hpp §78).
-    std::string create_saml_session(const std::string& name_id);
+    std::string create_saml_session(const std::string& name_id,
+                                    const std::vector<std::string>& groups = {},
+                                    const std::string& admin_group = {});
 
     const std::filesystem::path& config_path() const { return cfg_path_; }
 
@@ -587,6 +592,18 @@ std::filesystem::path default_cert_dir();
 
 std::string role_to_string(Role r);
 Role string_to_role(const std::string& s);
+
+/// Shared group→role resolution for federated (OIDC/SAML) session creation.
+/// Security-load-bearing: defaults to `Role::user`; promotes to `Role::admin`
+/// ONLY on an EXACT match between `admin_group` and one entry of `groups`.
+/// Never matches on NameID/email/display_name — those are attacker-controlled
+/// values that ride in the same assertion/claims. `admin_group` empty ⇒
+/// always `Role::user` (unconfigured deployment stays thin-slice-compatible).
+/// Extracted from create_oidc_session's original guard (byte-equivalent
+/// behaviour) and reused verbatim by create_saml_session — do not change
+/// this function's semantics without security-guardian review.
+Role resolve_role_from_groups(const std::vector<std::string>& groups,
+                              const std::string& admin_group);
 
 std::string pending_status_to_string(PendingStatus s);
 

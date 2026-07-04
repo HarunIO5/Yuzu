@@ -200,6 +200,42 @@ std::vector<yuzu::tar::DnsEntry> json_to_dns(const std::string& s) {
     return result;
 }
 
+// mapdrive snapshot baseline (capability-map §3.8): serializes the MapDriveEntry
+// fields only (no ts/action/origin — those are event, not baseline, data). The
+// baseline is implicitly `origin=live`; historical rows never touch it.
+json mapdrive_to_json(const std::vector<yuzu::tar::MapDriveEntry>& entries) {
+    json arr = json::array();
+    for (const auto& e : entries) {
+        arr.push_back({{"direction", e.direction},
+                       {"local_mount", e.local_mount},
+                       {"remote_path", e.remote_path},
+                       {"remote_host", e.remote_host},
+                       {"username", e.username},
+                       {"provider", e.provider}});
+    }
+    return arr;
+}
+
+std::vector<yuzu::tar::MapDriveEntry> json_to_mapdrive(const std::string& s) {
+    std::vector<yuzu::tar::MapDriveEntry> result;
+    if (s.empty())
+        return result;
+    try {
+        auto arr = json::parse(s);
+        for (const auto& j : arr) {
+            yuzu::tar::MapDriveEntry e;
+            e.direction = j.value("direction", "");
+            e.local_mount = j.value("local_mount", "");
+            e.remote_path = j.value("remote_path", "");
+            e.remote_host = j.value("remote_host", "");
+            e.username = j.value("username", "");
+            e.provider = j.value("provider", "");
+            result.push_back(std::move(e));
+        }
+    } catch (...) {}
+    return result;
+}
+
 json services_to_json(const std::vector<yuzu::tar::ServiceInfo>& svcs) {
     json arr = json::array();
     for (const auto& s : svcs) {
@@ -523,6 +559,12 @@ public:
         if (db_->get_config("software_enabled", "").empty()) {
             db_->set_config("software_enabled", "false");
         }
+        // §3.8: seed the opt-in mapdrive_enabled key (default-off, like module /
+        // software) so source_enabled / retention / configure all agree the source
+        // starts disabled.
+        if (db_->get_config("mapdrive_enabled", "").empty()) {
+            db_->set_config("mapdrive_enabled", "false");
+        }
 #ifdef _WIN32
         // Construct the Windows ETW image-load collector; the session is STARTED
         // LAZILY by collect_fast on the first tick where module_enabled is true (so
@@ -531,6 +573,71 @@ public:
         // non-Windows (M4/M5 add macOS Endpoint Security, M6 adds Linux auditd).
         module_stream_ = std::make_unique<yuzu::tar::ModuleEtwCollector>();
 #endif
+
+        // §3.8: one-time historical mapped-drive backfill. Seeds PAST mappings from
+        // persistent OS artifacts (Windows registry Network/MRU/MountPoints2 +
+        // Security event log; Linux fstab + Samba logs) as origin='historical' rows
+        // that bypass the live diff. Gated on the source toggle AND a one-shot
+        // dedup key so it runs at most once per data dir — the key stays UNSET on
+        // insert failure so the next restart retries (mirrors last_backfill_boot_ts).
+        // Init-time so it materializes on the first (re)start after an operator
+        // enables the source, matching the ETW boot-backfill precedent above.
+        if (source_enabled(*db_, "mapdrive")) {
+            if (!db_->get_config("mapdrive_backfill_done", "").empty()) {
+                spdlog::info("TAR: mapdrive historical backfill already done — skipped");
+            } else {
+                // enumerate_mapdrive_history touches the registry / offline hives /
+                // subprocesses and does substantial allocation; a std::bad_alloc (or
+                // any future throwing edit) must not cross the plugin C-ABI boundary
+                // out of init(). Catch here; a throw is NOT the same as "no history"
+                // — enumerated_ok gates the done-key so a throw leaves it unset and
+                // the next restart retries (only a clean empty result records done).
+                std::vector<yuzu::tar::MapDriveHistoryRow> hist;
+                bool enumerated_ok = false;
+                try {
+                    hist = yuzu::tar::enumerate_mapdrive_history();
+                    enumerated_ok = true;
+                } catch (const std::exception& e) {
+                    spdlog::warn("TAR: mapdrive historical backfill enumeration threw ({}) — "
+                                 "will retry on restart",
+                                 e.what());
+                } catch (...) {
+                    spdlog::warn("TAR: mapdrive historical backfill enumeration threw — "
+                                 "will retry on restart");
+                }
+                const auto snap = next_snapshot_id();
+                std::vector<yuzu::tar::MapDriveEvent> typed;
+                typed.reserve(hist.size());
+                for (auto& h : hist) {
+                    yuzu::tar::MapDriveEvent ev;
+                    ev.ts = h.ts;
+                    ev.snapshot_id = snap;
+                    ev.action = "historical";
+                    ev.direction = h.entry.direction;
+                    ev.local_mount = h.entry.local_mount;
+                    ev.remote_path = h.entry.remote_path;
+                    ev.remote_host = h.entry.remote_host;
+                    ev.username = h.entry.username;
+                    ev.provider = h.entry.provider;
+                    ev.origin = "historical";
+                    typed.push_back(std::move(ev));
+                }
+                if (!enumerated_ok) {
+                    // Enumeration threw (already logged) — leave the key unset so the
+                    // next restart retries rather than permanently skipping history.
+                } else if (typed.empty()) {
+                    spdlog::info("TAR: no historical mapped drives found to backfill");
+                    db_->set_config("mapdrive_backfill_done", std::to_string(now_epoch_seconds()));
+                } else if (db_->insert_mapdrive_events(typed)) {
+                    db_->set_config("mapdrive_backfill_done", std::to_string(now_epoch_seconds()));
+                    spdlog::info("TAR: backfilled {} historical mapped-drive rows", typed.size());
+                } else {
+                    // Leave the key unset so the next restart retries.
+                    spdlog::warn("TAR: mapdrive historical backfill insert failed (continuing; "
+                                 "will retry on restart)");
+                }
+            }
+        }
 
         spdlog::info("TAR plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
                      slow_interval, db_path.string());
@@ -1060,11 +1167,13 @@ private:
     int do_collect_perf(yuzu::CommandContext& ctx) {
         int rc = 0;
         if (!source_enabled(*db_, "perf")) {
-            ctx.write_output("tar|collect_perf|0|source_disabled");
+            ctx.write_output(std::format("tar|collect_perf|0|{}",
+                                         yuzu::tar::kCollectStatusSourceDisabled));
         } else {
             const auto cur = yuzu::tar::read_perf_counters(); // syscalls, no lock held
             if (!cur.valid) {
-                ctx.write_output("tar|collect_perf|0|unsupported_platform");
+                ctx.write_output(std::format("tar|collect_perf|0|{}",
+                                             yuzu::tar::kCollectStatusUnsupportedPlatform));
             } else {
                 bool perf_enabled_now = true;
                 yuzu::tar::PerfSample sample;
@@ -1082,9 +1191,11 @@ private:
                     }
                 }
                 if (!perf_enabled_now) {
-                    ctx.write_output("tar|collect_perf|0|source_disabled");
+                    ctx.write_output(std::format("tar|collect_perf|0|{}",
+                                                 yuzu::tar::kCollectStatusSourceDisabled));
                 } else if (!sample.valid) {
-                    ctx.write_output("tar|collect_perf|0|baseline");
+                    ctx.write_output(std::format("tar|collect_perf|0|{}",
+                                                 yuzu::tar::kCollectStatusBaseline));
                 } else {
                     yuzu::tar::PerfRow row;
                     row.ts = cur.ts_epoch;
@@ -1102,7 +1213,8 @@ private:
                         ctx.write_output("error|perf insert failed");
                         rc = 1;
                     } else {
-                        ctx.write_output("tar|collect_perf|1|sample_recorded");
+                        ctx.write_output(std::format("tar|collect_perf|1|{}",
+                                                     yuzu::tar::kCollectStatusSampleRecorded));
                     }
                 }
             }
@@ -1119,12 +1231,14 @@ private:
         // defaults missing keys to enabled). See docs/dex-brd-coverage.md and
         // memory project-telemetry-privacy-works-council.
         if (db_->get_config("procperf_enabled", "false") != "true") {
-            ctx.write_output("tar|collect_procperf|0|source_disabled");
+            ctx.write_output(std::format("tar|collect_procperf|0|{}",
+                                         yuzu::tar::kCollectStatusSourceDisabled));
             return rc;
         }
         auto proc_cur = yuzu::tar::read_proc_counters(); // one snapshot, no lock held
         if (!proc_cur.valid) {
-            ctx.write_output("tar|collect_procperf|0|unsupported_platform");
+            ctx.write_output(std::format("tar|collect_procperf|0|{}",
+                                         yuzu::tar::kCollectStatusUnsupportedPlatform));
             return rc;
         }
         const auto ts = proc_cur.ts_epoch; // before the move; never read prev_proc_ unlocked
@@ -1145,11 +1259,13 @@ private:
             }
         }
         if (!procperf_enabled_now) {
-            ctx.write_output("tar|collect_procperf|0|source_disabled");
+            ctx.write_output(std::format("tar|collect_procperf|0|{}",
+                                         yuzu::tar::kCollectStatusSourceDisabled));
             return rc;
         }
         if (samples.empty()) {
-            ctx.write_output("tar|collect_procperf|0|baseline");
+            ctx.write_output(std::format("tar|collect_procperf|0|{}",
+                                         yuzu::tar::kCollectStatusBaseline));
             return rc;
         }
         // Resolve each app's on-disk file version OUTSIDE collect_mu_ — the
@@ -1177,7 +1293,8 @@ private:
             ctx.write_output("error|procperf insert failed");
             return 1;
         }
-        ctx.write_output(std::format("tar|collect_procperf|{}|apps_recorded", rows.size()));
+        ctx.write_output(std::format("tar|collect_procperf|{}|{}", rows.size(),
+                                     yuzu::tar::kCollectStatusAppsRecorded));
         return rc;
     }
 
@@ -1226,6 +1343,30 @@ private:
             }
 
             db_->set_state(usr_key, users_to_json(current).dump());
+        }
+
+        // §3.8 — mapped-drive diff (both directions). Opt-in (default_enabled=false),
+        // so source_enabled returns false until an operator turns it on. NON-FATAL on
+        // insert failure — the always-on service/user legs above may have already
+        // committed, so a failure here must not misreport the tick (do NOT `return
+        // 1`); the diff baseline advances ONLY on insert success so a failed insert
+        // retries the same deltas next tick. The one-time historical backfill is
+        // separate (init, mapdrive_backfill_done) and does not touch this baseline.
+        if (source_enabled(*db_, "mapdrive")) {
+            const std::string md_key{yuzu::tar::diff_state_key("mapdrive")}; // #538
+            auto current = yuzu::tar::enumerate_mapdrive();
+            auto previous = json_to_mapdrive(db_->get_state(md_key));
+            auto typed = yuzu::tar::compute_mapdrive_events(previous, current, ts, snap_id);
+            bool ok = true;
+            if (!typed.empty()) {
+                ok = db_->insert_mapdrive_events(typed);
+                if (ok)
+                    total_events += static_cast<int>(typed.size());
+                else
+                    spdlog::error("TAR: mapdrive insert failed this tick (state not advanced)");
+            }
+            if (ok)
+                db_->set_state(md_key, mapdrive_to_json(current).dump());
         }
 
         // Legacy purge removed — retention is now handled by run_retention() in rollup action
@@ -1430,6 +1571,18 @@ private:
             (module_stream_active_ && module_stream_) ? module_stream_->method_name() : "none"));
         ctx.write_output(std::format("config|module_stream_dropped|{}",
                                      module_stream_ ? module_stream_->dropped() : 0));
+
+        // §3.8 mapdrive — the capture mechanism is fixed per-OS (no runtime/health-
+        // dependent path like process/module), so this reports the platform method
+        // for parity with the other *_capture_method keys; the full per-OS matrix is
+        // in the `compatibility` action. "none" where the source is kPlanned.
+#if defined(_WIN32)
+        ctx.write_output("config|mapdrive_capture_method|wnet");
+#elif defined(__linux__)
+        ctx.write_output("config|mapdrive_capture_method|procfs");
+#else
+        ctx.write_output("config|mapdrive_capture_method|none");
+#endif
         return 0;
     }
 
@@ -1546,10 +1699,19 @@ private:
                   "(name || ' ' || record_type || ' ' || data) AS detail_json "
                   "FROM dns_live" +
                   where + tail;
+        } else if (type_filter == "mapdrive") {
+            // §3.8. detail_json is a human summary (direction mount remote [host]
+            // user); the full row (incl. origin/provider) is via tar.sql over
+            // $MapDrive_Live. Includes historical rows (action='historical').
+            sql = "SELECT ts, 'mapdrive' AS event_type, action, snapshot_id, "
+                  "(direction || ' ' || local_mount || ' ' || remote_path || ' [' || "
+                  "remote_host || '] ' || username) AS detail_json "
+                  "FROM mapdrive_live" +
+                  where + tail;
         } else {
-            // No-filter union stays the core four-source event timeline. arp/dns
-            // are device-state caches (opt-in, dns is PII) — reachable only via an
-            // explicit type filter above or tar.sql, never the default feed.
+            // No-filter union stays the core event timeline. arp/dns/mapdrive are
+            // opt-in device-state / PII sources — reachable only via an explicit
+            // type filter above or tar.sql, never the default feed.
             sql = "SELECT * FROM ("
                   "SELECT ts, 'process' AS event_type, action, snapshot_id, '' AS detail_json FROM "
                   "process_live" +
@@ -1657,6 +1819,8 @@ private:
                 table = "arp_live";
             else if (type_filter == "dns") // ADR-0015
                 table = "dns_live";
+            else if (type_filter == "mapdrive") // §3.8
+                table = "mapdrive_live";
             else {
                 ctx.write_output(std::format("error|unknown type filter: {}", type_filter));
                 return 1;
@@ -2157,6 +2321,17 @@ private:
                 return 1;
             }
             ctx.write_output(std::format("config|{}_enabled|{}", src_name, v));
+            // Consent clarity (#1831 review): enabling procperf does more than
+            // collect on-device — the top-N per-app names + versions feed the
+            // daily app_perf sync to the central server (B1/B2). An operator
+            // opting in for local triage must see that the app identity leaves
+            // the device. Surfaced here, in the manual, and in the CHANGELOG.
+            if (src_name == "procperf" && v == "true")
+                ctx.write_output(
+                    "notice|procperf: per-app names + versions are now sampled AND "
+                    "synced off-device to the central app_perf store (daily); disable "
+                    "with procperf_enabled=false or --inventory-disable to keep the "
+                    "device fully local");
             // Echo the resulting paused_at so the dashboard sees the transition
             // timestamp without an extra status round-trip — single source of
             // truth (re-read, not re-derived).
