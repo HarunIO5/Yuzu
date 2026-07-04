@@ -518,10 +518,12 @@ regardless of flag values).
 
 ### Configuration
 
-SAML is enabled only when **all five flags** below are set; supplying any
-subset produces a startup warning (naming the missing flag) and SAML is
+SAML is enabled only when **all five** required flags below are set; supplying
+any subset produces a startup warning (naming the missing flag) and SAML is
 disabled (fail-closed). All five are validated at startup as one unit — a
-partial configuration never yields a "SAML SP initialized" log.
+partial configuration never yields a "SAML SP initialized" log. The two
+group→role flags are optional and independent of the enable gate (see Group→role
+mapping below).
 
 | Flag | Env var | Description |
 |---|---|---|
@@ -530,6 +532,8 @@ partial configuration never yields a "SAML SP initialized" log.
 | `--saml-idp-cert` | `YUZU_SAML_IDP_CERT` | Filesystem path to the IdP's signing certificate (PEM) |
 | `--saml-sp-entity-id` | `YUZU_SAML_SP_ENTITY_ID` | Entity ID URI the SP advertises to the IdP |
 | `--saml-sp-acs-url` | `YUZU_SAML_SP_ACS_URL` | Full URL of this server's Assertion Consumer Service (`POST /saml/acs`) |
+| `--saml-group-attribute` *(optional)* | `YUZU_SAML_GROUP_ATTRIBUTE` | `<Attribute Name="...">` in the assertion's `<AttributeStatement>` whose `<AttributeValue>`s are group identifiers (e.g. Entra's `http://schemas.microsoft.com/ws/2008/06/identity/claims/groups`) |
+| `--saml-admin-group` *(optional)* | `YUZU_SAML_ADMIN_GROUP` | Group value (from `--saml-group-attribute`) that grants `role=admin` |
 
 Example startup:
 
@@ -587,13 +591,46 @@ identical lifetime to OIDC sessions — 8-hour absolute, subject to
 `--session-inactivity-secs`). Session fields:
 
 - `auth_source = "saml"`
-- `role = user` for all SAML logins in this slice — **no group→role mapping is
-  implemented**. **SAML-authenticated users are permanently `role=user` in this
-  release; there is no admin path for them.** JIT elevation is non-functional
-  for SAML users: the elevation endpoint checks `is_elevation_eligible` and
+- `role = admin` when `--saml-admin-group` is configured and the assertion's
+  IdP-attested groups (see Group→role mapping below) contain it, `role = user`
+  otherwise — including every login when the two group→role flags are unset
+  (the unconfigured default). JIT elevation is non-functional for SAML users
+  regardless of role: the elevation endpoint checks `is_elevation_eligible` and
   `mfa_status` in `auth.db`, and SAML users have no row in the local `users`
-  table — both lookups fail-closed and the elevation is denied. For admin
-  access use OIDC or a local account.
+  table — both lookups fail-closed and the elevation is denied. A SAML admin
+  therefore gets `role=admin` permissions immediately at login, not via
+  elevation.
+
+### Group→role mapping
+
+SAML admin access is available via IdP-attested group membership, mirroring
+the OIDC `--oidc-admin-group` mechanism:
+
+- `--saml-group-attribute` names the `<Attribute Name="...">` element inside
+  the assertion's `<AttributeStatement>` whose `<AttributeValue>` children are
+  read as group identifiers.
+- `--saml-admin-group` is the single group value that grants `role=admin`.
+  Matching is **exact string equality only** — no wildcard, prefix, or regex
+  matching.
+- If either flag is empty (the default), no group is ever eligible for admin
+  and every SAML login is `role=user` — identical to the original thin slice.
+
+**Security:** admin is granted **only** from the configured group attribute's
+values — **never** from `NameID`, email, or display name, all of which are
+attacker-controlled fields that ride in the same assertion (mirrors the C3 fix
+in `create_oidc_session`). Group values are parsed from the **same
+XSW-verified assertion node** that `NameID` is read from — never a second,
+unverified document-wide search — so a signature-wrapping attack cannot inject
+groups the IdP didn't attest to. Parsing is capped at 64 `<AttributeValue>`
+entries (across however many `<Attribute>` elements carry the configured
+Name) as a DoS guard; values beyond the cap are silently ignored rather than
+rejecting the assertion.
+
+Because role is computed fresh at every session mint (no persisted mapping),
+there is no schema or migration involved, and changing `--saml-admin-group`
+takes effect on the next login after a server restart (see Rotating the IdP
+signing certificate below for the general "no hot-reload" caveat that also
+applies to these two flags).
 
 ### Audit actions
 
@@ -635,9 +672,10 @@ in `mfa_step_up.cpp`) exits with an honest denial before reaching the local
 row). This means:
 
 - `--mfa-enforcement=required` — SAML users are denied at every step-up gate.
-- `--mfa-enforcement=admin-only` — SAML users (always `role=user`) are not
-  required to step up by the enforcement rule, but the SAML-specific early exit
-  denies them anyway.
+- `--mfa-enforcement=admin-only` — the SAML-specific early exit fires on
+  `auth_source == "saml"` before role is even consulted, so this applies
+  equally to a `role=user` SAML session and a `role=admin` SAML session minted
+  via group→role mapping (see Group→role mapping above) — both are denied.
 - `--mfa-enforcement=optional` — same: the SAML-specific exit fires before
   enforcement mode is consulted.
 
@@ -671,9 +709,6 @@ for the IdP cert in this release.
 
 ### Deferred items (not in this slice)
 
-- **Group→role mapping.** All SAML users land as `role=user`. Admin via SAML
-  requires group→role mapping, which is not implemented. Compliance impact:
-  CC6.6 (role assignment is manual / out-of-band for SAML principals).
 - **Login-page SSO button.** There is no "Sign in with SAML" button on the
   login page; users must navigate directly to `GET /auth/saml/start`.
 - **AuthnRequest signing.** The SP does not sign its `<samlp:AuthnRequest>`; the
@@ -682,8 +717,9 @@ for the IdP cert in this release.
 - **`--auth-mode=sso-only` for SAML.** A SAML-only deployment cannot disable
   local-password login. Compliance impact: CC6.3 (local-password fallback
   remains active). OIDC is the path to `sso-only`.
-- **AttributeStatement parsing.** No user attributes from the assertion are
-  stored or surfaced beyond the `NameID` used as the session principal.
+- **AttributeStatement parsing beyond the group attribute.** Only the single
+  configured `--saml-group-attribute` is read for group→role mapping; no other
+  assertion attributes are stored or surfaced.
 - **SP metadata endpoint.** No `GET /saml/metadata` endpoint is provided; IdP
   registration uses the manual flag values.
 - **Windows support.** SAML depends on an XML processing library whose Windows
