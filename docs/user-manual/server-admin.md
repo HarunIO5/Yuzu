@@ -65,7 +65,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--oidc-client-id` | *(none)* | OIDC application (client) ID. Env: `YUZU_OIDC_CLIENT_ID`. |
 | `--oidc-client-secret` | *(none)* | OIDC client secret. Env: `YUZU_OIDC_CLIENT_SECRET`. |
 | `--oidc-redirect-uri` | *(auto)* | OIDC redirect URI. If omitted, auto-computed from the web address and port. Must match the registered redirect in your identity provider. Env: `YUZU_OIDC_REDIRECT_URI`. |
-| `--oidc-admin-group` | *(none)* | Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login. Env: `YUZU_OIDC_ADMIN_GROUP`. |
+| `--oidc-admin-group` | *(none)* | Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login. Env: `YUZU_OIDC_ADMIN_GROUP`. (Value is trimmed automatically, same as `--saml-admin-group` — #1830.) |
 | `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
 | `--saml-idp-entity-id` | *(none)* | **SAML 2.0 SP.** Entity ID URI of the IdP (must match what the IdP uses in its assertions). Required and validated at startup — omitting it (along with the other four `--saml-*` flags) leaves SAML disabled. Env: `YUZU_SAML_IDP_ENTITY_ID`. |
 | `--saml-idp-sso-url` | *(none)* | **SAML 2.0 SP.** IdP's HTTP-Redirect SSO endpoint URL. Env: `YUZU_SAML_IDP_SSO_URL`. |
@@ -855,7 +855,8 @@ local `users` row in auth.db) regardless of role — a group-mapped admin gets
 `role=admin` directly at login, not via the elevation endpoint. Unlike OIDC,
 SAML group values are **not** synced into `rbac_store` — group-scoped RBAC
 role assignments do not apply to SAML principals (they only feed the
-admin-or-user decision above).
+admin-or-user decision above) — deferred pending source-aware group
+resolution, see issue #1832.
 
 > **Configuring `--saml-admin-group` against a real IdP:** the value must be
 > the exact identifier the IdP puts in the assertion, not a display name —

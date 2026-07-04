@@ -18,10 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thin-slice behaviour (every SAML login is `role=user`). Matching is exact (case-sensitive, no
   substring/prefix match) against groups read from the SAME XSW-signature-verified assertion node
   the NameID is read from — never a document-wide search — and bounded to 64 values (DoS guard).
-  Group values are NOT synced into `rbac_store` (unlike OIDC groups) — group-scoped RBAC
-  assignments do not yet apply to SAML principals. See `docs/auth-architecture.md` "SAML 2.0 SP",
-  `docs/user-manual/authentication.md` "SAML 2.0 SSO", `docs/user-manual/server-admin.md`, and
-  the security review `docs/security-reviews/saml-sp-2026-07-01.md`.
+  Unlike OIDC, SAML group values are **not** synced into `rbac_store` — they feed the
+  admin/user role decision only (group-scoped RBAC assignments do not apply to SAML
+  principals) — deferred pending source-aware group resolution, see issue #1832 — see
+  `docs/auth-architecture.md` "SAML 2.0 SP", `docs/user-manual/authentication.md` "SAML 2.0 SSO",
+  `docs/user-manual/server-admin.md`, and the security review
+  `docs/security-reviews/saml-sp-2026-07-01.md`.
+- **SAML/OIDC SSO login observability parity (#1828–#1830).** `yuzu_auth_saml_login_total` gained a
+  `role` label (`admin`/`user`); OIDC's `/auth/callback` now emits the matching
+  `yuzu_auth_oidc_login_total{result,role}` counter (previously silent). A new
+  `yuzu_saml_group_cap_truncated_total` counter increments when an assertion's group-attribute
+  values exceed the 64-value cap. A one-shot `config.admin_group_set` startup audit row now fires
+  for either `--oidc-admin-group` or `--saml-admin-group` when configured. `--oidc-admin-group` is
+  now trimmed of leading/trailing whitespace at load (closing the same silent-lockout bug already
+  fixed for `--saml-admin-group`), and the OIDC admin audit detail now names the granting group
+  (`admin_group=<value>`), mirroring the SAML audit detail.
 - **SAML 2.0 SP — thin first slice.** SP-initiated login against a single, statically-pinned IdP.
   HTTP-Redirect binding for the `AuthnRequest`; HTTP-POST binding at the Assertion Consumer Service
   (`POST /saml/acs`). Assertion signature is validated against the pinned IdP cert (in-document

@@ -252,7 +252,7 @@ Navigate to **Settings > Directory Integration / OIDC SSO** in the dashboard. En
 | `--oidc-client-id` | Application (client) ID from the IdP |
 | `--oidc-client-secret` | Client secret (required for Entra/Azure AD web apps) |
 | `--oidc-redirect-uri` | Callback URL (auto-computed from the request `Host` header if omitted; must match IdP registration if set explicitly) |
-| `--oidc-admin-group` | Entra group object ID that maps to the admin role |
+| `--oidc-admin-group` | Entra group object ID that maps to the admin role (the value is trimmed automatically, same as `--saml-admin-group` — #1830) |
 | `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC endpoints (insecure, dev only) |
 
 Example startup:
@@ -403,16 +403,11 @@ element cannot inject group membership that the IdP didn't attest to.
 Changing either flag requires a server restart to take effect (no hot-reload,
 same as the other SAML flags).
 
-> **RBAC-sync divergence from OIDC:** unlike an OIDC login (which auto-syncs
-> every claimed group into `rbac_store` as an `"entra"`-sourced group, so
-> group-scoped RBAC role assignments apply — see [Group-to-Role
-> Mapping](#group-to-role-mapping) above), a SAML login does **not** sync any
-> assertion group into `rbac_store`. SAML groups are consulted for the
-> `--saml-admin-group` admin-or-user decision **only**, at session-mint time,
-> and are then discarded. A group-scoped RBAC role assignment (e.g. on an
-> `ApiTokenManager` securable) does **not** yet apply to SAML principals,
-> even for a group the IdP asserts. This is tracked as a follow-up, not a v1
-> gap in the admin-mapping guard itself.
+> **Unlike OIDC, SAML group values are not synced into `rbac_store`:**
+> SAML group values feed the admin/user role decision only; they are NOT
+> synced into `rbac_store` (group-scoped RBAC role assignments do not apply
+> to SAML principals) — deferred pending source-aware group resolution, see
+> issue #1832.
 
 ### SAML Login Flow
 
