@@ -252,7 +252,7 @@ Navigate to **Settings > Directory Integration / OIDC SSO** in the dashboard. En
 | `--oidc-client-id` | Application (client) ID from the IdP |
 | `--oidc-client-secret` | Client secret (required for Entra/Azure AD web apps) |
 | `--oidc-redirect-uri` | Callback URL (auto-computed from the request `Host` header if omitted; must match IdP registration if set explicitly) |
-| `--oidc-admin-group` | Entra group object ID that maps to the admin role |
+| `--oidc-admin-group` | Entra group object ID that maps to the admin role (the value is trimmed automatically, same as `--saml-admin-group` — #1830) |
 | `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC endpoints (insecure, dev only) |
 
 Example startup:
@@ -297,6 +297,22 @@ Admin via OIDC is granted **only** through explicit membership in the configured
 
 > **Note:** Only a single admin group mapping is currently supported via the `--oidc-admin-group` CLI flag. Multi-role group mapping (e.g., mapping different groups to ITServiceOwner or Operator) is planned for a future release and will use the RBAC store's group-scoped role assignments.
 
+### RBAC Group Provisioning (#1832)
+
+Independently of the `--oidc-admin-group` admin mapping above, every OIDC login reconciles the IdP's `groups` claim into the RBAC store so that group-scoped role assignments take effect for SSO users. There is no dedicated group-membership UI — a group-scoped role grant is made via the management-group role-delegation API, `POST /api/v1/management-groups/{id}/roles`, whose `principal_id` field is free text: set `"principal_type": "group"` and `"principal_id": "entra:<group-id>"` to delegate `Operator` or `Viewer` to everyone the IdP asserts is in that group. Each asserted group is written as `entra:<group-id>` — **namespaced** by identity source, never the raw IdP group id — so a locally-created RBAC group can never collide with (or be impersonated by) a same-named IdP group.
+>
+> **Do not confuse the two forms.** `--oidc-admin-group` (the admin mapping above) matches against the **raw** IdP group object id as it appears in the token's `groups` claim — configure it with the raw id (e.g. `a1b2c3d4-…`), *not* the namespaced `entra:<id>` form, or admin elevation silently fails. Only group-scoped RBAC role delegation (`principal_id`) uses the namespaced `entra:<id>` form.
+
+The reconcile also removes any of the user's `entra:`-owned memberships that the IdP no longer asserts, so a group removal on the IdP side takes effect on the user's **next SSO login** — memberships are **not** revoked mid-session; a live cookie session or already-issued API token retains its prior roles until re-authentication (residual, tracked in #1836 — the operator's manual mitigation in the interim is `DELETE /api/v1/sessions?username=<name>`, "Session lifetime" above). A malformed or oversized (`>200` groups) assertion, or a reconcile-store failure, denies the login outright rather than granting a session with stale roles.
+
+**Entra group overage.** Once a user belongs to more groups than fit in the ID token (Entra's documented threshold is 200 groups), Entra omits the `groups` claim entirely and sends a `_claim_names`/`_claim_sources` indirection pointer instead. Reconciliation is **skipped** for that login — existing memberships are left exactly as they were, and the login still succeeds — rather than reading the resulting empty claim as "this user is in zero groups" and deleting every one of their existing memberships. A heavily-grouped legitimate user simply doesn't get their SSO-driven roles updated on an overaged login until Entra can report the full set (out-of-band group lookup, e.g. via Microsoft Graph, is not implemented in this release).
+
+See the `auth.sso_group_provision` audit action (`docs/user-manual/audit-log.md`) for the full `result=ok|skipped|error` contract and detail-field shape.
+
+> **Upgrade note:** Before this fix, OIDC groups were synced under their raw (un-namespaced) id, so an operator may have assigned an RBAC role directly to a group named e.g. `8f3c...` (the raw Entra group id). Those role assignments do **not** automatically move to the new namespaced group. **Re-assign any such role to `entra:<group-id>`** via the same `POST /api/v1/management-groups/{id}/roles` API — the old raw-id group row is left in place (harmless, but no longer reachable by future logins) and can be deleted once you've confirmed the namespaced group has the role.
+
+> **Operational note (fail-closed):** a transient `rbac.db` failure during an OIDC login denies the login outright (no session minted) rather than granting one under unreconciled roles (`docs/auth-architecture.md` "RBAC group provisioning (#1832)"). This does not affect the break-glass/local-password path (`/login`, hardened-mode escape hatch): break-glass logins never call `/auth/callback` and so never touch RBAC group reconciliation.
+
 ### Entra ID Setup Checklist
 
 1. Register an application in Entra ID (Azure Portal > App registrations).
@@ -312,7 +328,7 @@ Yuzu supports SAML 2.0 SP-initiated single sign-on against a single, statically-
 
 > **Platform note:** SAML is supported on Linux and macOS only. A Windows server logs an error at startup and does not enable SAML regardless of flag values. If you need SSO on Windows, use OIDC.
 
-> **Role note:** All SAML users sign in as `role=user`. There is no group-to-role mapping in this release. **SAML-authenticated users are permanently `role=user` — there is no admin path for them in this release.** JIT elevation is non-functional for SAML users (the elevation check requires a local `users` row in auth.db, which SAML users do not have). For admin access, use OIDC or a local account.
+> **Role note:** SAML sessions default to `role=user`. Configure `--saml-group-attribute` + `--saml-admin-group` to promote users in a specific IdP-attested group to `role=admin` — see [SAML Group-to-Role Mapping](#saml-group-to-role-mapping) below. Leave both flags unset (the default) and every SAML session lands as `role=user`, same as prior releases. JIT elevation is still non-functional for SAML users regardless of role (the elevation check requires a local `users` row in auth.db, which SAML users do not have) — a SAML admin gets `role=admin` directly at login via group mapping, not via the elevation endpoint.
 
 > **HTTPS required:** SAML uses a `Secure` browser-binding cookie (`__Host-yuzu_saml_bind`). Browsers silently drop `Secure` cookies over plain HTTP. SAML fails closed at startup when `--https-cert`/`--https-key` are not configured. Do not run SAML over HTTP.
 
@@ -353,6 +369,62 @@ Example startup:
   --saml-sp-acs-url    "https://yuzu.example.com/saml/acs"
 ```
 
+### SAML Group-to-Role Mapping
+
+Two additional flags, both optional and independent of the five required
+SAML flags above, let you grant admin access via IdP-attested group
+membership:
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--saml-group-attribute` | `YUZU_SAML_GROUP_ATTRIBUTE` | Name of the `<Attribute Name="...">` in the assertion's `<AttributeStatement>` whose `<AttributeValue>`s are group identifiers (e.g. Entra's `http://schemas.microsoft.com/ws/2008/06/identity/claims/groups`) |
+| `--saml-admin-group` | `YUZU_SAML_ADMIN_GROUP` | The single group value (from `--saml-group-attribute`) that grants `role=admin` |
+
+When both flags are configured and the assertion's group list contains the
+value in `--saml-admin-group`, the resulting session is `role=admin`.
+Otherwise (including when either flag is left empty) the session is
+`role=user` — the same default as prior releases.
+
+Matching is **exact string equality only** — no wildcard, prefix, or regex
+matching, and only a single admin group is supported (no multi-group /
+multi-role mapping, same limitation as OIDC's `--oidc-admin-group`).
+
+Admin via SAML is granted **only** through explicit membership in the
+configured group. `NameID`, email, and display name are **never** used to
+elevate privileges — mirrors the OIDC guard described above
+(`create_oidc_session`) — and group values are read from the same
+signature-verified assertion as `NameID`, so a forged or wrapped assertion
+element cannot inject group membership that the IdP didn't attest to.
+
+> **Configuring `--saml-admin-group` against a real IdP:**
+>
+> - The value must be the **exact identifier your IdP puts in the assertion**
+>   — not a human-friendly display name. Entra ID, for example, sends group
+>   **object ID GUIDs** (e.g. `4fb5b234-...`) in the group claim, not the
+>   group's display name; configure the GUID, not "Admins".
+> - Matching is **case-sensitive** — a value that differs only in case (or
+>   has stray leading/trailing whitespace copy-pasted from a portal — the
+>   admin-group value is trimmed automatically, but the group values inside
+>   the assertion itself are compared as the IdP sent them) will not match.
+> - **Entra ID "groups overage"**: a user who is a member of more than ~150
+>   groups gets **no `groups` claim at all** in the assertion — Entra
+>   substitutes a Graph API link instead. Such a user's assertion carries zero
+>   group values, so `--saml-admin-group` can never resolve them to admin
+>   regardless of actual group membership. Either keep the target admin's
+>   group count under the overage threshold or use a dedicated,
+>   low-membership group for the admin mapping.
+> - At most **64 group values** from the configured attribute are considered
+>   (a DoS guard); a value beyond the 64th is never evaluated.
+
+Changing either flag requires a server restart to take effect (no hot-reload,
+same as the other SAML flags).
+
+> **Unlike OIDC, SAML group values are not synced into `rbac_store`:**
+> SAML group values feed the admin/user role decision only; they are NOT
+> synced into `rbac_store` (group-scoped RBAC role assignments do not apply
+> to SAML principals) — deferred pending source-aware group resolution, see
+> issue #1832.
+
 ### SAML Login Flow
 
 1. The operator navigates directly to `GET /auth/saml/start`. There is no "Sign in with SAML" button on the login page in this release — the login-page SSO button for SAML is deferred.
@@ -383,14 +455,14 @@ The resulting session behaves identically to an OIDC session — it is subject t
 | Signed assertion validation (pinned IdP cert) | Supported |
 | Audience / recipient / expiry validation | Supported |
 | Replay protection (`InResponseTo` single-use) | Supported |
-| Group-to-role mapping | Not in this release — all SAML users are permanently `role=user` |
-| Admin access for SAML users | Not supported — JIT elevation is non-functional for SAML users; use OIDC or local accounts for admin |
+| Group-to-role mapping | Supported — `--saml-group-attribute` + `--saml-admin-group`, exact-match only; both unset ⇒ all SAML users are `role=user` (see [SAML Group-to-Role Mapping](#saml-group-to-role-mapping)) |
+| Admin access for SAML users | Supported via group mapping above; JIT elevation itself is still non-functional for SAML users (no local `users` row) — an admin session is granted directly at login, not via the elevation endpoint |
 | Login-page SSO button | Not in this release — navigate directly to `GET /auth/saml/start` |
 | MFA step-up at high-risk endpoints | Not supported — SAML sessions receive 403 at all step-up-gated endpoints regardless of `--mfa-enforcement`; rely on IdP MFA |
 | `--auth-mode=sso-only` with SAML-only | Not supported — `sso-only` requires OIDC configuration; local-password login cannot be disabled with SAML alone |
 | Multi-replica / HA without sticky sessions | Not supported — pending AuthnRequest state is in-process; configure load-balancer session affinity on `/auth/saml/start` and `/saml/acs` |
 | AuthnRequest signing | Not in this release — the IdP must accept unsigned requests; use OIDC if the IdP requires signed requests |
-| AttributeStatement parsing | Not in this release — only `NameID` is read |
+| AttributeStatement parsing | Only the configured `--saml-group-attribute` is read (for group-to-role mapping); no other assertion attributes are stored or surfaced beyond `NameID` |
 | IdP-metadata auto-fetch | Not in this release — cert and SSO URL are configured statically |
 | IdP cert hot-reload | Not supported — update `--saml-idp-cert` and restart the server |
 | Runtime reconfigure via dashboard | Not in this release — a server restart is required to change SAML flags |

@@ -232,6 +232,13 @@ extern const std::string_view
 extern const std::vector<std::string>
     kBundledDefinitions;                            // build-time embed of content/definitions/
 extern const std::vector<std::string> kBundledSets; // build-time embed of content/packs/*sets*
+
+std::string trim_ascii_whitespace(std::string_view s) {
+    auto b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string_view::npos) return {};
+    auto e = s.find_last_not_of(" \t\r\n");
+    return std::string(s.substr(b, e - b + 1));
+}
 } // namespace yuzu::server
 
 namespace yuzu::server {
@@ -925,6 +932,15 @@ public:
 
         // Initialize OIDC provider if configured
         if (!cfg_.oidc_issuer.empty() && !cfg_.oidc_client_id.empty()) {
+            // #1830.1: trim leading/trailing ASCII whitespace from the
+            // admin-group config value — same trailing-space silent-lockout
+            // bug fixed for --saml-admin-group (UP-4, see below). Mutate
+            // cfg_ itself (not just the local oidc_cfg copy) so every other
+            // reader of cfg_.oidc_admin_group (the /auth/callback route's
+            // admin_gid lookup, the startup config-audit line) sees the
+            // trimmed value too.
+            cfg_.oidc_admin_group = trim_ascii_whitespace(cfg_.oidc_admin_group);
+
             oidc::OidcConfig oidc_cfg;
             oidc_cfg.issuer = cfg_.oidc_issuer;
             oidc_cfg.client_id = cfg_.oidc_client_id;
@@ -978,6 +994,33 @@ public:
         // saml_provider_ stays null on Windows — routes 404 via is_enabled() check.
 #else
         {
+            // UP-4: trim leading/trailing ASCII whitespace from the admin-group
+            // config value once, here — the single load point where cfg_ is
+            // assembled into SamlConfig. Without this, a trailing space in
+            // `--saml-admin-group "Admins "` compares raw against the parsed
+            // (whitespace-trimmed, see saml_provider.cpp get_text) assertion
+            // value and silently never matches — no admin is ever minted, with
+            // no error surfaced. group_attribute (the Name to match, not a
+            // value) is deliberately NOT trimmed here — IdP attribute names are
+            // exact-match XML identifiers, not free-text values susceptible to
+            // this class of operator typo. OIDC's admin_group is trimmed the
+            // same way, above at OIDC provider init (#1830.1).
+            cfg_.saml_admin_group = trim_ascii_whitespace(cfg_.saml_admin_group);
+
+            // sre-S3 / UP-1 / UP-9: half-configured group→role mapping grants
+            // no admin and fails silently otherwise — warn at boot so an
+            // operator who set one flag but not the other (a likely typo/
+            // partial-rollout mistake) finds out before wondering why no SAML
+            // login is ever admin. Both-set and both-empty are legitimate
+            // configurations and do NOT warn.
+            if (cfg_.saml_group_attribute.empty() != cfg_.saml_admin_group.empty()) {
+                spdlog::warn("SAML group→role mapping is half-configured "
+                             "(--saml-group-attribute=\"{}\", --saml-admin-group=\"{}\") — "
+                             "both flags must be set for any SAML login to be promoted to "
+                             "admin; as configured, no SAML session will ever grant admin.",
+                             cfg_.saml_group_attribute, cfg_.saml_admin_group);
+            }
+
             const bool saml_config_complete = !cfg_.saml_idp_sso_url.empty() &&
                                               !cfg_.saml_idp_cert.empty() &&
                                               !cfg_.saml_sp_entity_id.empty() &&
@@ -1023,14 +1066,24 @@ public:
                         saml_cfg.sp_entity_id   = cfg_.saml_sp_entity_id;
                         saml_cfg.sp_acs_url     = cfg_.saml_sp_acs_url;
                         saml_cfg.idp_cert_pem   = std::move(cert_pem);
+                        saml_cfg.group_attribute = cfg_.saml_group_attribute;
                         saml_cfg.enabled        = true;
                         // Construct in the single-threaded startup phase — xmlsec global init
                         // is not thread-safe; the std::call_once guard in saml_provider.cpp
                         // makes repeated construction safe thereafter.
                         saml_provider_ = std::make_unique<saml::SamlProvider>(std::move(saml_cfg));
                         if (saml_provider_ && saml_provider_->is_enabled()) {
-                            spdlog::info("SAML SP initialized (idp_sso_url={}, sp_entity_id={})",
-                                         cfg_.saml_idp_sso_url, cfg_.saml_sp_entity_id);
+                            // sre-S2: log the group→role flags alongside the
+                            // existing endpoint fields. Both values are
+                            // low-sensitivity (an attribute name and a group
+                            // identifier, not a secret), so logging them
+                            // outright — rather than just a configured/not
+                            // boolean — gives an operator a one-line way to
+                            // confirm the deployed config matches intent.
+                            spdlog::info("SAML SP initialized (idp_sso_url={}, sp_entity_id={}, "
+                                         "group_attribute=\"{}\", admin_group=\"{}\")",
+                                         cfg_.saml_idp_sso_url, cfg_.saml_sp_entity_id,
+                                         cfg_.saml_group_attribute, cfg_.saml_admin_group);
                         } else {
                             spdlog::error("SAML: provider constructed but is_enabled() returned "
                                           "false — SAML login disabled (fail-closed)");
@@ -1548,6 +1601,44 @@ public:
                 ev.detail = "instruction-definition signature enforcement disabled at startup "
                             "(--allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS) "
                             "— unsigned definitions will be accepted at import";
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+
+            // #1829 — same startup-posture audit pattern as the two rows
+            // above: an SSO admin-group mapping (--oidc-admin-group /
+            // --saml-admin-group) is a standing, security-relevant posture
+            // that a cold deployment with no logins yet would otherwise
+            // leave with zero audit evidence. Emit one row per configured
+            // flag so an auditor asking "was group X wired to admin during
+            // window Y?" can answer from the audit store. Values here are
+            // already trimmed (SAML: UP-4 above; OIDC: #1830.1 at OIDC
+            // provider init) and low-sensitivity (a group identifier, not a
+            // secret — matches the SAML admin audit-detail precedent,
+            // comp-S1/UP-5).
+            if (!cfg_.oidc_admin_group.empty() && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "config.admin_group_set";
+                ev.target_type = "AuthConfig";
+                ev.target_id = "oidc";
+                ev.detail = "provider=oidc;admin_group=" + cfg_.oidc_admin_group;
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+            if (!cfg_.saml_admin_group.empty() && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "config.admin_group_set";
+                ev.target_type = "AuthConfig";
+                ev.target_id = "saml";
+                ev.detail = "provider=saml;admin_group=" + cfg_.saml_admin_group;
                 ev.result = "success";
                 (void)audit_store_->log(ev);
             }

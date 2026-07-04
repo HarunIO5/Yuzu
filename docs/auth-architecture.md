@@ -423,6 +423,90 @@ pre-check and `verify_password`); accessors `AuthDB::break_glass_status` /
 `tests/unit/server/test_auth_break_glass.cpp` (DB accessors) +
 `test_auth_routes_hardened.cpp` (wire path).
 
+## RBAC group provisioning (#1832)
+
+Every OIDC `/auth/callback` login reconciles the IdP's `groups` claim into the
+RBAC store (`RbacStore::reconcile_idp_memberships`), so group-scoped role
+assignments made against an IdP-sourced group stay in sync with the IdP's
+current membership. Mirrors the break-glass metric/audit treatment above.
+
+- **Namespacing (confused-deputy fix).** Every IdP-asserted group is written
+  as `<source>:<group-id>` (`entra:8f3c...`, via `namespaced_group_name`) —
+  never the raw IdP id. A locally-created RBAC group can therefore never
+  collide with (or be impersonated by) a same-named IdP group; `create_group`
+  additionally rejects a `source='local'` create whose name starts with a
+  reserved IdP prefix (`local:`/`entra:`/`saml:`/`ad:`, derived from the same
+  list of recognized IdP sources `reconcile_idp_memberships` accepts — adding
+  a future IdP there automatically reserves its prefix too).
+- **Reconcile, not append-only (deprovisioning fix).** The transaction upserts
+  every asserted `{external_id, display}` AND deletes any of the user's
+  memberships in a `source`-owned group that was NOT re-asserted this login —
+  scoped to `groups.source = ?`, so it is structurally incapable of touching a
+  `source='local'` membership. An empty asserted set (the IdP now reports zero
+  groups) removes ALL of the user's `source`-owned memberships — full
+  deprovisioning takes effect on the user's next SSO login (residual: a live
+  session/token retains its prior roles until re-authentication, tracked in
+  #1836 — see the session-revocation REST surface above for the manual
+  interim mitigation).
+- **Source-verify guard.** Before joining a membership to a namespaced group
+  row, the reconcile checks that row's `source` column matches the call's
+  `source`. A pre-existing row of a DIFFERENT source occupying the same
+  namespaced name (e.g. a local group literally named `entra:<gid>`, created
+  before the `create_group` reserved-prefix guard existed) is never joined —
+  closes a residual confused-deputy path the namespacing alone doesn't cover
+  on an upgraded deployment carrying pre-guard data.
+- **Group-overage skip (UP-1).** Entra omits the `groups` claim entirely
+  (replacing it with a `_claim_names`/`_claim_sources` indirection pointer)
+  once a user belongs to more groups than fit in the token. Treating the
+  resulting empty claim as "zero groups" would delete every one of the user's
+  existing memberships on that login — a silent mass-deprovision of a
+  legitimate, heavily-grouped user. `OidcProvider::parse_id_token` sets
+  `groups_claim_present`/`groups_overage` on `IdTokenClaims`; the free
+  function `groups_claim_reconcilable(claims)` (mirrors `amr_asserts_mfa`,
+  unit-testable without a live route) gates whether `/auth/callback` calls
+  the reconcile at all. When it doesn't, existing memberships are left
+  untouched and the login still proceeds — fail-OPEN on membership, never on
+  authentication.
+- **Cap + input validation (fail-closed on abuse, fail-soft on garbage).** An
+  assertion of more than `RbacStore::kMaxIdpGroupsPerLogin` (200) groups
+  denies the login outright (no session minted) before any mutation — defends
+  against a compromised/misconfigured IdP turning one login into an unbounded
+  write storm. Within the cap, an individual asserted entry with a blank or
+  implausibly long (`>512` byte) `external_id` is silently dropped rather than
+  seeding a garbage group.
+- **Source contract.** `reconcile_idp_memberships` rejects `source == "local"`
+  or an empty source outright (`unexpected`, no mutation) — the
+  stale-membership DELETE's `source`-scoping is safe only for a real IdP
+  source; a miswired call passing `"local"` would mass-delete every local
+  group membership fleet-wide.
+- **Fail-closed on the login.** An over-cap assertion or a reconcile-store
+  failure (e.g. a locked/corrupt `rbac.db`) denies the login outright before a
+  session is minted — a heavily-loaded or unhealthy `rbac.db` degrades
+  availability (SSO logins fail) rather than integrity (a session with
+  stale/unreconciled roles). The break-glass/local-password escape hatch
+  (`/login`, hardened-mode) is unaffected — it never calls `/auth/callback`
+  and so never touches group reconciliation.
+- **Audit + metrics.** `auth.sso_group_provision` (`result=ok|skipped|error`)
+  — `ok` only when the reconcile actually changed something
+  (`detail=source=entra;added=N;removed=M`, `added+removed>0`; a no-op login
+  writes no row), `skipped` for the group-overage/absent-claim case
+  (`detail=reason=groups_overage|groups_absent;source=entra`), `error` for a
+  denied login (`detail=reason=<cause>;source=entra`). An `error` result also
+  emits the shared `auth.oidc_login_failed` audit row + analytics event (the
+  same ones the token-exchange-failure branch emits) so a SIEM query counting
+  failed OIDC logins by that action doesn't miss a provisioning-denied one.
+  Metric: `yuzu_auth_sso_group_provision_total{source, result}` (same
+  `result` vocabulary). See `docs/user-manual/audit-log.md`.
+
+Implementation: `RbacStore::reconcile_idp_memberships` /
+`namespaced_group_name` (`rbac_store.{hpp,cpp}`); the callback gate in
+`auth_routes.cpp` `/auth/callback`; the claim parsing + gating decision in
+`oidc_provider.{hpp,cpp}` (`IdTokenClaims::groups_claim_present` /
+`groups_overage`, `groups_claim_reconcilable`). Tests:
+`tests/unit/server/test_rbac_store.cpp`, `test_oidc_provider.cpp`. SAML group
+sync is out of scope here (dropped in #1827; will ride this same reconcile
+path once #1826 merges).
+
 ## SAML 2.0 SP
 
 `/auth-and-authz` skill gap matrix P1 #6. Thin first slice: SP-initiated login
@@ -434,10 +518,12 @@ regardless of flag values).
 
 ### Configuration
 
-SAML is enabled only when **all five flags** below are set; supplying any
-subset produces a startup warning (naming the missing flag) and SAML is
+SAML is enabled only when **all five** required flags below are set; supplying
+any subset produces a startup warning (naming the missing flag) and SAML is
 disabled (fail-closed). All five are validated at startup as one unit — a
-partial configuration never yields a "SAML SP initialized" log.
+partial configuration never yields a "SAML SP initialized" log. The two
+group→role flags are optional and independent of the enable gate (see Group→role
+mapping below).
 
 | Flag | Env var | Description |
 |---|---|---|
@@ -446,6 +532,8 @@ partial configuration never yields a "SAML SP initialized" log.
 | `--saml-idp-cert` | `YUZU_SAML_IDP_CERT` | Filesystem path to the IdP's signing certificate (PEM) |
 | `--saml-sp-entity-id` | `YUZU_SAML_SP_ENTITY_ID` | Entity ID URI the SP advertises to the IdP |
 | `--saml-sp-acs-url` | `YUZU_SAML_SP_ACS_URL` | Full URL of this server's Assertion Consumer Service (`POST /saml/acs`) |
+| `--saml-group-attribute` *(optional)* | `YUZU_SAML_GROUP_ATTRIBUTE` | `<Attribute Name="...">` in the assertion's `<AttributeStatement>` whose `<AttributeValue>`s are group identifiers (e.g. Entra's `http://schemas.microsoft.com/ws/2008/06/identity/claims/groups`) |
+| `--saml-admin-group` *(optional)* | `YUZU_SAML_ADMIN_GROUP` | Group value (from `--saml-group-attribute`) that grants `role=admin` |
 
 Example startup:
 
@@ -503,13 +591,46 @@ identical lifetime to OIDC sessions — 8-hour absolute, subject to
 `--session-inactivity-secs`). Session fields:
 
 - `auth_source = "saml"`
-- `role = user` for all SAML logins in this slice — **no group→role mapping is
-  implemented**. **SAML-authenticated users are permanently `role=user` in this
-  release; there is no admin path for them.** JIT elevation is non-functional
-  for SAML users: the elevation endpoint checks `is_elevation_eligible` and
+- `role = admin` when `--saml-admin-group` is configured and the assertion's
+  IdP-attested groups (see Group→role mapping below) contain it, `role = user`
+  otherwise — including every login when the two group→role flags are unset
+  (the unconfigured default). JIT elevation is non-functional for SAML users
+  regardless of role: the elevation endpoint checks `is_elevation_eligible` and
   `mfa_status` in `auth.db`, and SAML users have no row in the local `users`
-  table — both lookups fail-closed and the elevation is denied. For admin
-  access use OIDC or a local account.
+  table — both lookups fail-closed and the elevation is denied. A SAML admin
+  therefore gets `role=admin` permissions immediately at login, not via
+  elevation.
+
+### Group→role mapping
+
+SAML admin access is available via IdP-attested group membership, mirroring
+the OIDC `--oidc-admin-group` mechanism:
+
+- `--saml-group-attribute` names the `<Attribute Name="...">` element inside
+  the assertion's `<AttributeStatement>` whose `<AttributeValue>` children are
+  read as group identifiers.
+- `--saml-admin-group` is the single group value that grants `role=admin`.
+  Matching is **exact string equality only** — no wildcard, prefix, or regex
+  matching.
+- If either flag is empty (the default), no group is ever eligible for admin
+  and every SAML login is `role=user` — identical to the original thin slice.
+
+**Security:** admin is granted **only** from the configured group attribute's
+values — **never** from `NameID`, email, or display name, all of which are
+attacker-controlled fields that ride in the same assertion (mirrors the C3 fix
+in `create_oidc_session`). Group values are parsed from the **same
+XSW-verified assertion node** that `NameID` is read from — never a second,
+unverified document-wide search — so a signature-wrapping attack cannot inject
+groups the IdP didn't attest to. Parsing is capped at 64 `<AttributeValue>`
+entries (across however many `<Attribute>` elements carry the configured
+Name) as a DoS guard; values beyond the cap are silently ignored rather than
+rejecting the assertion.
+
+Because role is computed fresh at every session mint (no persisted mapping),
+there is no schema or migration involved, and changing `--saml-admin-group`
+takes effect on the next login after a server restart (see Rotating the IdP
+signing certificate below for the general "no hot-reload" caveat that also
+applies to these two flags).
 
 ### Audit actions
 
@@ -551,9 +672,10 @@ in `mfa_step_up.cpp`) exits with an honest denial before reaching the local
 row). This means:
 
 - `--mfa-enforcement=required` — SAML users are denied at every step-up gate.
-- `--mfa-enforcement=admin-only` — SAML users (always `role=user`) are not
-  required to step up by the enforcement rule, but the SAML-specific early exit
-  denies them anyway.
+- `--mfa-enforcement=admin-only` — the SAML-specific early exit fires on
+  `auth_source == "saml"` before role is even consulted, so this applies
+  equally to a `role=user` SAML session and a `role=admin` SAML session minted
+  via group→role mapping (see Group→role mapping above) — both are denied.
 - `--mfa-enforcement=optional` — same: the SAML-specific exit fires before
   enforcement mode is consulted.
 
@@ -587,9 +709,6 @@ for the IdP cert in this release.
 
 ### Deferred items (not in this slice)
 
-- **Group→role mapping.** All SAML users land as `role=user`. Admin via SAML
-  requires group→role mapping, which is not implemented. Compliance impact:
-  CC6.6 (role assignment is manual / out-of-band for SAML principals).
 - **Login-page SSO button.** There is no "Sign in with SAML" button on the
   login page; users must navigate directly to `GET /auth/saml/start`.
 - **AuthnRequest signing.** The SP does not sign its `<samlp:AuthnRequest>`; the
@@ -598,8 +717,9 @@ for the IdP cert in this release.
 - **`--auth-mode=sso-only` for SAML.** A SAML-only deployment cannot disable
   local-password login. Compliance impact: CC6.3 (local-password fallback
   remains active). OIDC is the path to `sso-only`.
-- **AttributeStatement parsing.** No user attributes from the assertion are
-  stored or surfaced beyond the `NameID` used as the session principal.
+- **AttributeStatement parsing beyond the group attribute.** Only the single
+  configured `--saml-group-attribute` is read for group→role mapping; no other
+  assertion attributes are stored or surfaced.
 - **SP metadata endpoint.** No `GET /saml/metadata` endpoint is provided; IdP
   registration uses the manual flag values.
 - **Windows support.** SAML depends on an XML processing library whose Windows

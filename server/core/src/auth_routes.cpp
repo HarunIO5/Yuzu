@@ -1820,6 +1820,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         if (!error.empty()) {
             auto desc = req.get_param_value("error_description");
             spdlog::warn("OIDC error from IdP: {} - {}", error, desc);
+            // cons-S1: mirror the SAML ACS early-error branches — emit an
+            // audit row, not just a metric bump, so an IdP-side denial shows
+            // up in Yuzu's own audit trail.
+            audit_log(req, "auth.oidc_login_failed", "error", {}, {}, "idp error: " + error);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+            }
             res.set_redirect("/login?error=sso_denied");
             return;
         }
@@ -1828,6 +1835,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto state = req.get_param_value("state");
 
         if (code.empty() || state.empty()) {
+            // cons-S1: mirror the SAML ACS early-error branches — emit an
+            // audit row, not just a metric bump.
+            audit_log(req, "auth.oidc_login_failed", "error", {}, {}, "missing code or state");
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+            }
             res.set_redirect("/login?error=sso_invalid");
             return;
         }
@@ -1839,6 +1852,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             emit_event("auth.oidc_login_failed", req,
                        {{"source_ip", req.remote_addr}, {"error", result.error()}}, {},
                        Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+            }
             res.set_redirect("/login?error=sso_failed");
             return;
         }
@@ -1846,7 +1862,123 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto& claims = result.value();
         auto email = claims.email.empty() ? claims.preferred_username : claims.email;
         auto display = claims.name.empty() ? email : claims.name;
+        auto username = display.empty() ? email : display;
         auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
+
+        // #1832 — reconcile IdP group memberships into the RBAC store BEFORE
+        // minting a session, so a provisioning failure denies the login
+        // outright (fail-closed) instead of granting a session under
+        // stale/unreconciled roles. `reconcile_idp_memberships` writes
+        // NAMESPACED group names (`entra:<gid>`, via
+        // `RbacStore::namespaced_group_name`) — the confused-deputy fix: a
+        // locally-created group can never collide with (or be impersonated
+        // by) a same-named IdP group. It also DELETEs any of this user's
+        // 'entra'-sourced memberships that were NOT re-asserted this login,
+        // which is the deprovisioning-bypass fix — IdP-side group removal
+        // now takes effect on the user's next SSO login instead of
+        // accumulating forever. Local memberships are never touched.
+        //
+        // UP-1 hardening: reconciliation only runs when
+        // `groups_claim_reconcilable(claims)` is true — i.e. the token
+        // actually carried a `groups` key AND it was not replaced by an
+        // Entra group-overage pointer. A user in >200 Entra groups gets
+        // NEITHER of those, and treating the resulting empty `claims.groups`
+        // as "this user is in zero groups" would DELETE every one of their
+        // existing entra:-owned memberships on this login — silent mass
+        // deprovisioning of a legitimate, heavily-grouped user. That case is
+        // SKIPPED entirely (existing memberships left untouched; the login
+        // itself still proceeds — this is fail-OPEN on membership, never on
+        // authentication). See `docs/user-manual/authentication.md` "RBAC
+        // Group Provisioning" (the real heading — keep this anchor in sync).
+        if (rbac_store_) {
+            if (!oidc::groups_claim_reconcilable(claims)) {
+                const std::string reason =
+                    claims.groups_overage ? "groups_overage" : "groups_absent";
+                spdlog::info("OIDC group provisioning skipped for '{}': reason={}", username,
+                            reason);
+                audit_log_for_principal(req, "auth.sso_group_provision", "skipped", username,
+                                        "user", "", "", "reason=" + reason + ";source=entra");
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_sso_group_provision_total",
+                              {{"source", "entra"}, {"result", "skipped"}})
+                        .increment();
+                }
+            } else if (claims.groups.size() > RbacStore::kMaxIdpGroupsPerLogin) {
+                spdlog::warn(
+                    "OIDC group provisioning denied for '{}': {} asserted groups exceeds cap {}",
+                    username, claims.groups.size(), RbacStore::kMaxIdpGroupsPerLogin);
+                audit_log_for_principal(
+                    req, "auth.sso_group_provision", "error", username, "user", "", "",
+                    "reason=group_count_exceeded;count=" +
+                        std::to_string(claims.groups.size()) + ";source=entra");
+                // cons-S2 — also emit the same failed-OIDC-login signal the
+                // sibling token-exchange-failure branch emits above, so a
+                // SIEM query counting failed OIDC logins by
+                // `auth.oidc_login_failed` doesn't miss a provisioning-denied
+                // login (this branch denies the login just as surely).
+                audit_log_for_principal(req, "auth.oidc_login_failed", "error", username, "user",
+                                        "", "", "reason=group_count_exceeded");
+                emit_event("auth.oidc_login_failed", req,
+                          {{"source_ip", req.remote_addr},
+                           {"username", username},
+                           {"error", "group_count_exceeded"}},
+                          {}, Severity::kWarn);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_sso_group_provision_total",
+                              {{"source", "entra"}, {"result", "error"}})
+                        .increment();
+                }
+                res.set_redirect("/login?error=sso_failed");
+                return;
+            } else {
+                std::vector<std::pair<std::string, std::string>> asserted;
+                asserted.reserve(claims.groups.size());
+                for (const auto& gid : claims.groups)
+                    asserted.emplace_back(gid, gid);
+
+                auto reconciled =
+                    rbac_store_->reconcile_idp_memberships(username, "entra", asserted);
+                if (!reconciled) {
+                    spdlog::warn("OIDC group provisioning failed for '{}': {}", username,
+                                reconciled.error());
+                    audit_log_for_principal(req, "auth.sso_group_provision", "error", username,
+                                            "user", "", "",
+                                            "reason=" + reconciled.error() + ";source=entra");
+                    // cons-S2 — see the over-cap branch above.
+                    audit_log_for_principal(req, "auth.oidc_login_failed", "error", username,
+                                            "user", "", "", "reason=" + reconciled.error());
+                    emit_event("auth.oidc_login_failed", req,
+                              {{"source_ip", req.remote_addr},
+                               {"username", username},
+                               {"error", reconciled.error()}},
+                              {}, Severity::kWarn);
+                    if (auto* m = auth_mgr_.metrics_registry()) {
+                        m->counter("yuzu_auth_sso_group_provision_total",
+                                  {{"source", "entra"}, {"result", "error"}})
+                            .increment();
+                    }
+                    res.set_redirect("/login?error=sso_failed");
+                    return;
+                }
+
+                // cons-S3 — a no-op reconcile (nothing added or removed; the
+                // asserted set exactly matched what was already on record)
+                // writes no provisioning audit row. Every login after the
+                // first steady-state one is typically a no-op; auditing each
+                // would swamp the log with rows carrying no new information.
+                if (reconciled->added + reconciled->removed > 0) {
+                    audit_log_for_principal(
+                        req, "auth.sso_group_provision", "ok", username, "user", "", "",
+                        "source=entra;added=" + std::to_string(reconciled->added) +
+                            ";removed=" + std::to_string(reconciled->removed));
+                }
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_sso_group_provision_total",
+                              {{"source", "entra"}, {"result", "ok"}})
+                        .increment();
+                }
+            }
+        }
 
         // PR3 / SOC 2 CC6.6 — seed the session's MFA-verified timestamp
         // when the IdP `amr` claim attests a multi-factor login. The
@@ -1888,19 +2020,6 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub,
                                                            claims.groups, admin_gid, mfa_at);
 
-        // Sync Entra groups into the RBAC store so that group-scoped role
-        // assignments (e.g. ApiTokenManager on an Entra group) take effect.
-        if (rbac_store_ && !claims.groups.empty()) {
-            auto username = display.empty() ? email : display;
-            for (const auto& gid : claims.groups) {
-                (void)rbac_store_->create_group({.name = gid,
-                                                 .description = "Entra ID group (auto-synced)",
-                                                 .source = "entra",
-                                                 .external_id = gid});
-                (void)rbac_store_->add_group_member(gid, username);
-            }
-        }
-
         res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
 
         // Explicit-principal audit row — request lands at /auth/callback
@@ -1920,10 +2039,20 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // audit detail so the CC6.6 "was this privileged SSO login MFA-
         // verified" question is answerable from Yuzu's own chain without
         // cross-referencing IdP logs (governance compliance-S2).
+        // #1830.2: when the login resolved to admin, also name the granting
+        // group — mirrors the SAML admin audit detail (comp-S1/UP-5 above)
+        // so a reviewer can see WHY this OIDC login is admin without
+        // cross-referencing boot flags.
+        // cons-N1: leading "auth_source=oidc;" token mirrors SAML's
+        // "auth_source=saml;" leading token (the shared ";admin_group=<value>"
+        // suffix below already matches).
+        auto oidc_audit_detail = std::string("auth_source=oidc;amr_mfa_asserted=") +
+                                 (amr_mfa_asserted ? "true" : "false");
+        if (effective_role == auth::role_to_string(auth::Role::admin)) {
+            oidc_audit_detail += ";admin_group=" + admin_gid;
+        }
         audit_log_for_principal(req, "auth.oidc_login", "ok", display, effective_role, "User",
-                                display,
-                                std::string("amr_mfa_asserted=") +
-                                    (amr_mfa_asserted ? "true" : "false"));
+                                display, oidc_audit_detail);
         emit_event("auth.oidc_login", req,
                    {{"source_ip", req.remote_addr},
                     {"username", display},
@@ -1932,6 +2061,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     {"oidc_sub", claims.sub},
                     {"email", email},
                     {"name", claims.name}});
+        if (auto* m = auth_mgr_.metrics_registry()) {
+            // #1828.2: mirror the SAML login counter — role sourced from the
+            // same effective_role already resolved for the audit row above.
+            m->counter("yuzu_auth_oidc_login_total", {{"result", "ok"}, {"role", effective_role}})
+                .increment();
+        }
 
         res.set_redirect("/");
     });
@@ -2002,7 +2137,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(detail::error_json_a4(404, "SAML not configured", cid),
                             "application/json");
             if (auto* m = auth_mgr_.metrics_registry()) {
-                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
             }
             return;
         }
@@ -2035,7 +2170,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                         {"error", "missing binding cookie"}}, {},
                        Severity::kWarn);
             if (auto* m = auth_mgr_.metrics_registry()) {
-                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
             }
             // Clear any stale binding cookie (belt-and-suspenders: may be absent,
             // but Max-Age=0 on a non-existent cookie is a harmless no-op per RFC 6265).
@@ -2056,7 +2191,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                        {{"source_ip", req.remote_addr}, {"error", "oversize"}}, {},
                        Severity::kWarn);
             if (auto* m = auth_mgr_.metrics_registry()) {
-                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
             }
             res.set_header("Set-Cookie", kBindCookieClear);
             res.set_redirect("/login?error=saml");
@@ -2073,7 +2208,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                        {{"source_ip", req.remote_addr}, {"error", "missing SAMLResponse"}}, {},
                        Severity::kWarn);
             if (auto* m = auth_mgr_.metrics_registry()) {
-                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
             }
             res.set_header("Set-Cookie", kBindCookieClear);
             res.set_redirect("/login?error=saml");
@@ -2088,6 +2223,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // an uncaught exception surfacing as a non-A4 500.
         std::string saml_name_id;
         std::string session_token;
+        // cons-NICE: mirror the OIDC call site's provider-presence ternary
+        // (defense-in-depth — saml_provider_ is always non-null on this
+        // handler's path since routes 404 without it, but this keeps the two
+        // call sites structurally identical for future refactors). Hoisted
+        // outside the try block so the post-login audit row (comp-S1 / UP-5,
+        // below) can also reference it.
+        auto saml_admin_gid = saml_provider_ ? cfg_.saml_admin_group : std::string{};
         try {
             auto result = saml_provider_->validate_response(saml_response_b64, binding_cookie);
             if (!result) {
@@ -2097,14 +2239,27 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                            {{"source_ip", req.remote_addr}, {"error", result.error()}}, {},
                            Severity::kWarn);
                 if (auto* m = auth_mgr_.metrics_registry()) {
-                    m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+                    m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
                 }
                 res.set_header("Set-Cookie", kBindCookieClear);
                 res.set_redirect("/login?error=saml");
                 return;
             }
             saml_name_id  = result.value().name_id;
-            session_token = auth_mgr_.create_saml_session(saml_name_id);
+            session_token = auth_mgr_.create_saml_session(saml_name_id, result.value().groups,
+                                                           saml_admin_gid);
+
+            // #1828.3: the verifier flags (rather than logs or increments
+            // directly — it has no metrics handle) when the assertion's
+            // group-attribute values exceeded the 64-value cap. Bump the
+            // counter here, once per login, not a per-value/per-login log
+            // line (anti-flood — same rationale as the sibling
+            // metric-only signals in docs/observability-conventions.md).
+            if (result.value().group_cap_truncated) {
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_saml_group_cap_truncated_total").increment();
+                }
+            }
         } catch (const std::exception& e) {
             spdlog::error("SAML ACS: internal error during validation/session: {}", e.what());
             audit_log(req, "auth.saml_login_failed", "error", {}, {}, "internal error");
@@ -2112,7 +2267,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                        {{"source_ip", req.remote_addr}, {"error", "internal error"}}, {},
                        Severity::kWarn);
             if (auto* m = auth_mgr_.metrics_registry()) {
-                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
             }
             res.set_header("Set-Cookie", kBindCookieClear);
             res.set_redirect("/login?error=saml");
@@ -2126,14 +2281,38 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // Explicit-principal audit row — request lands at /saml/acs with no session
         // cookie yet, so the default resolve_session path would leave principal empty
         // (same rationale as the OIDC /auth/callback audit, Gate 4 consistency B3).
-        audit_log_for_principal(req, "auth.saml_login", "ok", saml_name_id, "user",
-                                "User", saml_name_id, "auth_source=saml");
+        // Re-validate the freshly-minted session (mirrors the OIDC /auth/callback
+        // pattern) to capture the RESOLVED role — group-mapping may have made this
+        // login an admin — rather than hard-coding "user" and hiding an admin SAML
+        // login from the audit trail.
+        auto saml_effective_role = auth_mgr_.validate_session(session_token)
+                                       .transform([](const auth::Session& s) {
+                                           return auth::role_to_string(s.role);
+                                       })
+                                       .value_or(std::string{"user"});
+        // comp-S1 / UP-5: when the login resolved to admin, name the granting
+        // group in the audit detail so a reviewer can see WHY this SAML login
+        // is admin without cross-referencing boot flags. Matching is exact
+        // against the single configured saml_admin_gid, so there is exactly
+        // one candidate group to log — no ambiguity about which of possibly
+        // several assertion groups triggered the promotion.
+        auto saml_audit_detail = (saml_effective_role == auth::role_to_string(auth::Role::admin))
+                                     ? "auth_source=saml;admin_group=" + saml_admin_gid
+                                     : std::string{"auth_source=saml"};
+        audit_log_for_principal(req, "auth.saml_login", "ok", saml_name_id, saml_effective_role,
+                                "User", saml_name_id, saml_audit_detail);
         emit_event("auth.saml_login", req,
                    {{"source_ip", req.remote_addr},
                     {"username", saml_name_id},
                     {"auth_method", "saml"}});
         if (auto* m = auth_mgr_.metrics_registry()) {
-            m->counter("yuzu_auth_saml_login_total", {{"result", "ok"}}).increment();
+            // #1828.1: role label lets a SIEM/Grafana query distinguish admin
+            // vs user SSO logins without joining against the audit store —
+            // sourced from the same saml_effective_role already resolved for
+            // the audit row above, never re-derived.
+            m->counter("yuzu_auth_saml_login_total",
+                       {{"result", "ok"}, {"role", saml_effective_role}})
+                .increment();
         }
 
         // RelayState open-redirect safety: only accept same-origin relative paths.

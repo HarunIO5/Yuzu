@@ -117,10 +117,10 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | `test_migration_runner.cpp` | Schema migrations | Migration execution, version tracking |
 | `test_software_inventory_store.cpp` | `SoftwareInventoryStore` + `inventory_ingestion` seam (ADR-0016) | Canonical-hash cross-pin (blob contract v2, 12 fields), hash-skip ingest (full/touched/need_full/drift/cold-cache), atomic full-replace, invalid-UTF-8 scrub-to-U+FFFD store + agent hash coordination (UP-IN1), codepoint-boundary truncation (UP-10), oversized-blob drop+nack (UP-2/UP-4), kError→need_full nack (UP-2), fleet query (live PostgreSQL); v2 12-field round-trip through store + ingest seam; v1→v2 mixed-version compat (bounded need_full loop, not infinite); migration v5 upgrade (pre-v5 rows read `''` in new columns) |
 | `test_notification_store.cpp` | Notifications | In-app notification CRUD, read/unread status |
-| `test_oidc_provider.cpp` | OIDC SSO | PKCE flow, JWT validation, group claim parsing |
+| `test_oidc_provider.cpp` | OIDC SSO | PKCE flow, JWT validation, group claim parsing (present/empty/absent, Entra `_claim_names`/`_claim_sources` group-overage detection, `groups_claim_reconcilable` gate) |
 | `test_quarantine_store.cpp` | Quarantine | Device quarantine/release, network isolation state |
 | `test_rate_limiter.cpp` | Rate limiting | Token bucket, per-IP/per-token limits |
-| `test_rbac_store.cpp` | RBAC store | Role CRUD, permission assignment, deny-override logic |
+| `test_rbac_store.cpp` | RBAC store | Role CRUD, permission assignment, deny-override logic; IdP-group reconciliation (#1832): namespacing/confused-deputy, add/remove diff, empty-asserted full deprovisioning (incl. a local-role-grant-survives regression guard), group-count cap (boundary + over-cap), reserved-prefix guard on `create_group`, `reconcile_idp_memberships` source-verify against a pre-existing differently-sourced namespaced row, `source=="local"`/empty rejection, blank/oversized `external_id` skip, `{added,removed}` count reporting, v1→v2 schema migration (indices + no data loss) |
 | `test_result_envelope.cpp` | Result envelope | Structured response formatting |
 | `test_schedule_engine.cpp` | Scheduler | Cron scheduling, next-run calculation, scope-based targeting |
 | `test_webhook_store.cpp` | Webhooks | Subscription CRUD, HMAC-SHA256 signing, delivery |

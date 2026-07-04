@@ -39,7 +39,7 @@ Overall      [======================---------]   172/228 done (75%)
 |--------|:-----:|:----:|:-------:|:-----------:|
 | 1. Agent Lifecycle | 9 | 9 | 0 | 0 |
 | 2. Command Execution | 13 | 13 | 0 | 0 |
-| 3. Device & Endpoint Info | 10 | 8 | 0 | 2 |
+| 3. Device & Endpoint Info | 10 | 8 | 1 | 1 |
 | 4. Network Info & Discovery | 11 | 9 | 0 | 2 |
 | 5. Process & Service Mgmt | 5 | 4 | 0 | 1 |
 | 6. User & Session Mgmt | 5 | 5 | 0 | 0 |
@@ -68,7 +68,7 @@ Overall      [======================---------]   172/228 done (75%)
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
 | 30. Scope Walking & Result Sets | 4 | 3 | 1 | 0 |
 | 31. System Guardian | 10 | 1 | 2 | 7 |
-| **TOTAL** | **228** | **172** | **6** | **50** |
+| **TOTAL** | **228** | **172** | **7** | **49** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. Foundation and Advanced tiers reach 100% on the "implemented and functional" bar — they do not yet reach "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -218,9 +218,11 @@ Implemented as a special-purpose tag via the device tagging system (`TagStore`).
 
 Implemented as a special-purpose tag via the device tagging system (`TagStore`). Set/get location per device using key-value tags.
 
-### 3.8 Mapped Drive History :x: `T3`
+### 3.8 Mapped Drive History :large_orange_diamond: `T3`
 
-Not implemented. Tracks inbound mapped drive connections for lateral movement analysis. Windows-specific.
+`mapdrive` TAR capture source (`agents/plugins/tar/src/tar_mapdrive_collector.cpp`). Tracks network-share mappings in **both** directions — outbound (drives this host maps to remote shares) and inbound (remote hosts mapping this host's shares, the lateral-movement signal) — via a `direction` column. A one-time init backfill seeds **historical** mappings (`origin='historical'`) from persistent artifacts; the periodic `collect_slow` leg snapshot-diffs current state (`appeared`/`removed`). Windows: outbound `WNetEnumResourceW`; outbound history from registry `Network`/MRU/`MountPoints2` across offline profiles; inbound `NetSessionEnum` (needs local-admin/Server-Operator); inbound history from Security event log 4624/4634. Linux: outbound `/proc/mounts` + `/etc/fstab`; inbound `smbstatus` + Samba logs. Opt-in (`mapdrive_enabled`, default off) — rows carry usernames + share paths. Queryable via `$MapDrive_Live`.
+
+> **Gap:** macOS is `kPlanned` (returns empty). Linux inbound requires Samba installed; Windows inbound-history over-captures (all type-3 network logons, not only SMB).
 
 ### 3.9 Printer Inventory :x: `T3`
 
