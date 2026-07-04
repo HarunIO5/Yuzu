@@ -140,11 +140,9 @@ nvd_rate_limit_wait(std::optional<std::chrono::steady_clock::time_point> last,
     return interval - elapsed;
 }
 
-NvdFetchResult NvdClient::fetch_modified_since(const std::string& iso_timestamp) {
+NvdFetchResult NvdClient::fetch_paginated(const std::string& date_params) {
     NvdFetchResult combined;
     int start_index = 0;
-
-    std::string end_date = current_iso_timestamp();
 
     while (true) {
         rate_limit();
@@ -152,9 +150,7 @@ NvdFetchResult NvdClient::fetch_modified_since(const std::string& iso_timestamp)
         httplib::Client client(std::string("https://") + kNvdHost);
         configure_client(client);
 
-        std::string query = std::string(kNvdPath) + "?" +
-                            "lastModStartDate=" + url_encode(iso_timestamp) +
-                            "&lastModEndDate=" + url_encode(end_date) +
+        std::string query = std::string(kNvdPath) + "?" + date_params +
                             "&resultsPerPage=" + std::to_string(kResultsPerPage) +
                             "&startIndex=" + std::to_string(start_index);
 
@@ -169,17 +165,20 @@ NvdFetchResult NvdClient::fetch_modified_since(const std::string& iso_timestamp)
 
         if (!res) {
             spdlog::error("NVD API request failed: connection error");
+            combined.ok = false;
             return combined;
         }
 
         if (res->status != 200) {
             spdlog::error("NVD API returned HTTP {}: {}", res->status, res->body.substr(0, 200));
+            combined.ok = false;
             return combined;
         }
 
         auto page = parse_response(res->body);
         if (page.records.empty() && page.total_results == 0) {
-            // Parse error or no results
+            // Genuinely no results for this window (or a parse error, which
+            // parse_response already logged). Either way, nothing more to page.
             return combined;
         }
 
@@ -204,6 +203,39 @@ NvdFetchResult NvdClient::fetch_modified_since(const std::string& iso_timestamp)
     }
 
     return combined;
+}
+
+NvdFetchResult NvdClient::fetch_modified_since(const std::string& iso_timestamp) {
+    return fetch_paginated("lastModStartDate=" + url_encode(iso_timestamp) +
+                           "&lastModEndDate=" + url_encode(current_iso_timestamp()));
+}
+
+NvdFetchResult NvdClient::fetch_by_published_window(const std::string& pub_start,
+                                                    const std::string& pub_end) {
+    return fetch_paginated("pubStartDate=" + url_encode(pub_start) + "&pubEndDate=" +
+                           url_encode(pub_end));
+}
+
+std::vector<std::pair<std::chrono::system_clock::time_point, std::chrono::system_clock::time_point>>
+nvd_split_windows(std::chrono::system_clock::time_point start,
+                  std::chrono::system_clock::time_point end,
+                  std::chrono::system_clock::duration max_window) {
+    std::vector<std::pair<std::chrono::system_clock::time_point,
+                          std::chrono::system_clock::time_point>>
+        out;
+    if (start >= end || max_window <= std::chrono::system_clock::duration::zero()) {
+        return out;
+    }
+    // Partition [start, end] into consecutive windows each at most max_window
+    // long (NVD caps pub/lastMod date ranges at 120 days). Oldest-first; the
+    // backfill walks the result in reverse for newest-first coverage.
+    auto ws = start;
+    while (ws < end) {
+        const auto we = (end - ws > max_window) ? ws + max_window : end;
+        out.emplace_back(ws, we);
+        ws = we;
+    }
+    return out;
 }
 
 NvdFetchResult NvdClient::fetch_by_keyword(const std::string& keyword, int start_index) {

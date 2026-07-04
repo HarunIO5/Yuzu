@@ -634,3 +634,31 @@ TEST_CASE("NvdDatabase: match is prefix-anchored (product starts with name), not
     db.upsert_cve(make_cve("CVE-B", "openssl", "3.0.7"));
     REQUIRE(db.match_inventory({{"open_sl", "3.0.6"}}).empty()); // '_' is literal, not a wildcard
 }
+
+// ── PR2b: 120-day window splitter (pure) ─────────────────────────────────────
+
+TEST_CASE("nvd_split_windows: partitions [start,end] into <=max windows, oldest-first",
+          "[nvd][window]") {
+    using namespace std::chrono;
+    const auto base = system_clock::time_point{};
+    const auto max = hours(24 * 120);
+
+    // 300 days / 120 → 3 contiguous windows covering the whole span.
+    auto w = nvd_split_windows(base, base + hours(24 * 300), max);
+    REQUIRE(w.size() == 3);
+    REQUIRE(w.front().first == base);
+    REQUIRE(w.back().second == base + hours(24 * 300));
+    REQUIRE(w[0].second == w[1].first); // contiguous
+    REQUIRE(w[1].second == w[2].first);
+    for (const auto& [s, e] : w)
+        REQUIRE(e - s <= max);
+
+    // Exactly one window at/under the cap.
+    REQUIRE(nvd_split_windows(base, base + max, max).size() == 1);
+    REQUIRE(nvd_split_windows(base, base + hours(24 * 10), max).size() == 1);
+
+    // Degenerate inputs → empty.
+    REQUIRE(nvd_split_windows(base + hours(1), base, max).empty()); // inverted
+    REQUIRE(nvd_split_windows(base, base, max).empty());            // zero span
+    REQUIRE(nvd_split_windows(base, base + max, hours(0)).empty()); // zero window
+}
