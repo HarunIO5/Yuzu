@@ -615,3 +615,22 @@ TEST_CASE("nvd_rate_limit_wait: non-positive elapsed never waits (overflow-class
     // elapsed == 0 (same instant) → no wait.
     REQUIRE(nvd_rate_limit_wait(now, now, interval) == steady_clock::duration::zero());
 }
+
+// ── PR2b: prefix-anchored matching (perf-P1) ─────────────────────────────────
+
+TEST_CASE("NvdDatabase: match is prefix-anchored (product starts with name), not substring",
+          "[nvd][match]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve("CVE-A", "libopenssl", "3.0.7")); // product embeds 'openssl'
+
+    // Under the old LIKE '%name%', inventory 'openssl' matched 'libopenssl'. Now
+    // matching is prefix-anchored (index-usable), so the product must START WITH
+    // the inventory name — 'openssl' no longer matches 'libopenssl'.
+    REQUIRE(db.match_inventory({{"openssl", "3.0.6"}}).empty());
+    // A genuine prefix still matches.
+    REQUIRE(db.match_inventory({{"libopenssl", "3.0.6"}}).size() == 1);
+    REQUIRE(db.match_inventory({{"lib", "3.0.6"}}).size() == 1); // 'lib' is a prefix
+    // Escaped metacharacters still can't broaden the prefix.
+    db.upsert_cve(make_cve("CVE-B", "openssl", "3.0.7"));
+    REQUIRE(db.match_inventory({{"open_sl", "3.0.6"}}).empty()); // '_' is literal, not a wildcard
+}

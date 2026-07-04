@@ -542,7 +542,13 @@ NvdDatabase::match_inventory(const std::vector<SoftwareItem>& inventory) const {
         if (item.name.empty() || item.version.empty())
             continue;
 
-        std::string pattern = "%" + like_escape(to_lower(item.name)) + "%";
+        // PREFIX-anchored, not substring: `name%` (no leading `%`) so
+        // idx_cve_match_product turns this into an index seek instead of a full
+        // cve_match scan per item — required at full-catalog scale (perf-P1 hard
+        // gate). Narrower than substring: the inventory name must be a PREFIX of
+        // the CPE product (canonical tokens, so acceptable; vendor-precise
+        // identity waits for ADR-0018).
+        std::string pattern = like_escape(to_lower(item.name)) + "%";
 
         sqlite3_reset(stmt);
         sqlite3_bind_text(stmt, 1, pattern.c_str(), -1, SQLITE_TRANSIENT);
