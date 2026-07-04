@@ -112,6 +112,30 @@ struct DnsEntry {
     std::string source; // cache, hosts_file, unknown
 };
 
+// One mapped-drive mapping (capability-map §3.8). Snapshot type for the
+// `mapdrive` capture source; diffed into MapDriveEvent rows. Diff key =
+// (direction, local_mount, remote_path, remote_host, username); `provider` is a
+// value-only field (not keyed). NB: no field is named `interface` — that is a
+// Win32 COM macro under full <windows.h>; keep it that way if fields are added.
+struct MapDriveEntry {
+    std::string direction;   // outbound (we map a remote share) | inbound (a remote host maps ours)
+    std::string local_mount; // outbound: drive letter / mountpoint; inbound: accessed share (may be "")
+    std::string remote_path; // outbound: \\server\share, //server/share, server:/export; inbound: ""
+    std::string remote_host; // outbound: the server; inbound: the connecting client
+    std::string username;    // outbound: mapping credential; inbound: authenticated account
+    std::string provider;    // SMB / NFS / WebDAV / transport (value-only, not keyed)
+};
+
+// One historically-inferred mapping for the one-time init backfill. `entry` is a
+// past mapping read from a persistent OS artifact (registry MRU/Network, fstab,
+// Samba/Security log); `ts` is the artifact's timestamp (registry key last-write,
+// event/log time) or 0 when the artifact carries no time (e.g. fstab). Inserted
+// as `action='historical'`, `origin='historical'` rows that bypass the live diff.
+struct MapDriveHistoryRow {
+    MapDriveEntry entry;
+    int64_t ts{0};
+};
+
 // ── Platform enumeration functions ────────────────────────────────────────────
 //
 // Adding a NEW capture source? Follow the core pattern these functions use
@@ -168,11 +192,72 @@ std::vector<ArpEntry> enumerate_arp();
  */
 std::vector<DnsEntry> enumerate_dns();
 
+/**
+ * Enumerate CURRENT mapped drives in both directions (capability-map §3.8) for
+ * the live snapshot-diff. Windows: outbound via WNetOpenEnumW/WNetEnumResourceW
+ * (+ WNetGetUserW), inbound via NetSessionEnum (degrades to empty without
+ * admin/Server-Operator). Linux: outbound via /proc/mounts network fstypes,
+ * inbound via `smbstatus` (empty if Samba absent). Returns `{}` on macOS
+ * (kPlanned). Hard-capped at kMapDriveEntryCap (warn on truncation).
+ */
+std::vector<MapDriveEntry> enumerate_mapdrive();
+
+/**
+ * Enumerate PREVIOUS (historical) mapped drives for the one-time init backfill
+ * (capability-map §3.8). Windows: outbound from HKCU\Network + Map Network Drive
+ * MRU + MountPoints2 across offline profiles (ts = subkey last-write), inbound
+ * from Security event log 4624 (logon_type=3 network) logons (ts = event time).
+ * Linux: outbound from /etc/fstab (ts=0), inbound from Samba logs (ts = log time).
+ * Returns `{}` on macOS. Deduplicated by mapping identity, capped at
+ * kMapDriveHistoryCap.
+ */
+std::vector<MapDriveHistoryRow> enumerate_mapdrive_history();
+
+/**
+ * Collapse duplicate historical rows by mapping identity (direction, local_mount,
+ * remote_path, remote_host, username), keeping the smallest non-zero timestamp
+ * (earliest known sighting), and apply kMapDriveHistoryCap. Declared here so it is
+ * unit-testable (the enumerate_* callers are I/O-gated).
+ */
+std::vector<MapDriveHistoryRow> dedup_history(std::vector<MapDriveHistoryRow> rows);
+
+// ── Pure text parsers for the mapdrive collector (no I/O — unit-tested) ────────
+// The platform shell does the I/O (subprocess / registry / file read) and hands
+// the raw text to these; keeping the parse pure makes every leg testable off its
+// native OS from captured sample output.
+
+/** Parse `/proc/mounts` (or /proc/self/mountinfo-style) text into current
+ *  outbound network mappings. Honours the kernel `\040`/`\011` octal escaping. */
+std::vector<MapDriveEntry> parse_proc_mounts(const std::string& text);
+
+/** Parse `/etc/fstab` text into historical outbound network mappings (ts=0). */
+std::vector<MapDriveHistoryRow> parse_fstab(const std::string& text);
+
+/** Parse `smbstatus -b`/`-S` text into current inbound (client) sessions. */
+std::vector<MapDriveEntry> parse_smbstatus(const std::string& text);
+
+/** Parse `wevtutil qe Security … /f:text` output into historical inbound rows:
+ *  4624 events with logon_type=3 (network), ts = event time. 4634 (logoff) blocks
+ *  are ignored — the collector queries 4624 only. */
+std::vector<MapDriveHistoryRow> parse_win_security_logons(const std::string& text);
+
+/** Parse Samba `log.smbd` / `journalctl -u smbd` text into historical inbound
+ *  connect events (ts = log line time). */
+std::vector<MapDriveHistoryRow> parse_samba_logs(const std::string& text);
+
 /// Per-cycle collection caps (ADR-0015 §"Memory bound"). The collector stops
 /// enumerating at the cap and logs a truncation warning rather than growing
 /// unbounded.
 inline constexpr std::size_t kArpEntryCap = 2048;
 inline constexpr std::size_t kDnsEntryCap = 4096;
+/// Live mapped-drive snapshot cap (inbound sessions on a file server can be many).
+inline constexpr std::size_t kMapDriveEntryCap = 4096;
+/// Historical-backfill cap. Kept below mapdrive_live's row-count retention
+/// (retention_default = 5000) so a one-shot backfill cannot alone overflow the
+/// live tier and evict its own rows on the first retention pass; historical rows
+/// share the live row budget with subsequent live diff rows (mapped drives are
+/// low-cardinality, so this is a safety backstop, not an expected limit).
+inline constexpr std::size_t kMapDriveHistoryCap = 4096;
 /// Per-cycle cap on installed-software entries (machine + all per-user hives in
 /// one tick). Sized to hold a bloated many-profile RDS/Citrix host's full
 /// inventory while bounding memory + tick duration on a corrupt/huge registry
@@ -324,5 +409,20 @@ std::vector<ArpEvent> compute_arp_events(const std::vector<ArpEntry>& previous,
 std::vector<DnsEvent> compute_dns_events(const std::vector<DnsEntry>& previous,
                                          const std::vector<DnsEntry>& current,
                                          int64_t timestamp, int64_t snapshot_id);
+
+/**
+ * Compute mapped-drive diff (capability-map §3.8).
+ * Key: direction + local_mount + remote_path + remote_host + username.
+ * Detects mappings that appeared (`appeared`) and disappeared (`removed`); a
+ * changed `provider` on an otherwise-identical mapping is NOT an event (value
+ * update only). Every emitted row is stamped `origin='live'` — historical rows
+ * never flow through this diff (they are inserted directly by the backfill).
+ * `direction` and `username` are keyed so an outbound map and an inbound session
+ * that share host/user do not collide, and a re-credentialed mount is a genuine
+ * removed+appeared pair.
+ */
+std::vector<MapDriveEvent> compute_mapdrive_events(const std::vector<MapDriveEntry>& previous,
+                                                   const std::vector<MapDriveEntry>& current,
+                                                   int64_t timestamp, int64_t snapshot_id);
 
 } // namespace yuzu::tar
