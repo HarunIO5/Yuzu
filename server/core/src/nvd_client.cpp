@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -28,24 +29,6 @@ constexpr auto kApiKeyInterval = std::chrono::milliseconds(600);  // 50 req / 30
 // Per-request socket timeouts (tighten httplib's 300s connect/read defaults).
 constexpr time_t kConnectTimeoutSec = 30;
 constexpr time_t kReadTimeoutSec = 60;
-
-std::string current_iso_timestamp() {
-    auto now = std::chrono::system_clock::now();
-    auto time_t_now = std::chrono::system_clock::to_time_t(now);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-
-    std::tm utc_tm{};
-#ifdef _WIN32
-    gmtime_s(&utc_tm, &time_t_now);
-#else
-    gmtime_r(&time_t_now, &utc_tm);
-#endif
-
-    std::ostringstream oss;
-    oss << std::put_time(&utc_tm, "%Y-%m-%dT%H:%M:%S") << '.' << std::setfill('0') << std::setw(3)
-        << ms.count();
-    return oss.str();
-}
 
 std::string url_encode(const std::string& value) {
     std::ostringstream escaped;
@@ -140,11 +123,9 @@ nvd_rate_limit_wait(std::optional<std::chrono::steady_clock::time_point> last,
     return interval - elapsed;
 }
 
-NvdFetchResult NvdClient::fetch_modified_since(const std::string& iso_timestamp) {
+NvdFetchResult NvdClient::fetch_paginated(const std::string& date_params) {
     NvdFetchResult combined;
     int start_index = 0;
-
-    std::string end_date = current_iso_timestamp();
 
     while (true) {
         rate_limit();
@@ -152,9 +133,7 @@ NvdFetchResult NvdClient::fetch_modified_since(const std::string& iso_timestamp)
         httplib::Client client(std::string("https://") + kNvdHost);
         configure_client(client);
 
-        std::string query = std::string(kNvdPath) + "?" +
-                            "lastModStartDate=" + url_encode(iso_timestamp) +
-                            "&lastModEndDate=" + url_encode(end_date) +
+        std::string query = std::string(kNvdPath) + "?" + date_params +
                             "&resultsPerPage=" + std::to_string(kResultsPerPage) +
                             "&startIndex=" + std::to_string(start_index);
 
@@ -169,17 +148,26 @@ NvdFetchResult NvdClient::fetch_modified_since(const std::string& iso_timestamp)
 
         if (!res) {
             spdlog::error("NVD API request failed: connection error");
+            combined.ok = false;
             return combined;
         }
 
         if (res->status != 200) {
             spdlog::error("NVD API returned HTTP {}: {}", res->status, res->body.substr(0, 200));
+            combined.ok = false;
             return combined;
         }
 
         auto page = parse_response(res->body);
+        if (!page.ok) {
+            // 200 with a bad/unexpected body mid-pagination — do NOT hand back a
+            // truncated window as success (UP-1/UP-2). Fail the whole fetch so the
+            // caller keeps its cursor and retries.
+            combined.ok = false;
+            return combined;
+        }
         if (page.records.empty() && page.total_results == 0) {
-            // Parse error or no results
+            // Genuinely-empty window (NVD returned totalResults:0). Nothing to page.
             return combined;
         }
 
@@ -206,36 +194,38 @@ NvdFetchResult NvdClient::fetch_modified_since(const std::string& iso_timestamp)
     return combined;
 }
 
-NvdFetchResult NvdClient::fetch_by_keyword(const std::string& keyword, int start_index) {
-    rate_limit();
+NvdFetchResult NvdClient::fetch_modified_between(const std::string& mod_start,
+                                                const std::string& mod_end) {
+    return fetch_paginated("lastModStartDate=" + url_encode(mod_start) + "&lastModEndDate=" +
+                           url_encode(mod_end));
+}
 
-    httplib::Client client(std::string("https://") + kNvdHost);
-    configure_client(client);
+NvdFetchResult NvdClient::fetch_by_published_window(const std::string& pub_start,
+                                                    const std::string& pub_end) {
+    return fetch_paginated("pubStartDate=" + url_encode(pub_start) + "&pubEndDate=" +
+                           url_encode(pub_end));
+}
 
-    std::string query = std::string(kNvdPath) + "?" + "keywordSearch=" + url_encode(keyword) +
-                        "&resultsPerPage=" + std::to_string(kResultsPerPage) +
-                        "&startIndex=" + std::to_string(start_index);
-
-    httplib::Headers headers;
-    headers.emplace("Accept", "application/json");
-    if (!api_key_.empty()) {
-        headers.emplace("apiKey", api_key_);
+std::vector<std::pair<std::chrono::system_clock::time_point, std::chrono::system_clock::time_point>>
+nvd_split_windows(std::chrono::system_clock::time_point start,
+                  std::chrono::system_clock::time_point end,
+                  std::chrono::system_clock::duration max_window) {
+    std::vector<std::pair<std::chrono::system_clock::time_point,
+                          std::chrono::system_clock::time_point>>
+        out;
+    if (start >= end || max_window <= std::chrono::system_clock::duration::zero()) {
+        return out;
     }
-
-    spdlog::info("NVD keyword search: '{}' startIndex={}", keyword, start_index);
-    auto res = client.Get(query, headers);
-
-    if (!res) {
-        spdlog::error("NVD API keyword request failed: connection error");
-        return {};
+    // Partition [start, end] into consecutive windows each at most max_window
+    // long (NVD caps pub/lastMod date ranges at 120 days). Oldest-first; the
+    // backfill walks the result in reverse for newest-first coverage.
+    auto ws = start;
+    while (ws < end) {
+        const auto we = (end - ws > max_window) ? ws + max_window : end;
+        out.emplace_back(ws, we);
+        ws = we;
     }
-
-    if (res->status != 200) {
-        spdlog::error("NVD API returned HTTP {}: {}", res->status, res->body.substr(0, 200));
-        return {};
-    }
-
-    return parse_response(res->body);
+    return out;
 }
 
 NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
@@ -245,13 +235,26 @@ NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
     try {
         doc = nlohmann::json::parse(json_body);
     } catch (const nlohmann::json::parse_error& e) {
+        // A 200 with an unparseable body (proxy/error page, truncated response)
+        // is a FAILURE, not an empty result — flag it so the caller doesn't treat
+        // it as "window done" and advance its cursor past unfetched CVEs (UP-1/UP-2).
         spdlog::error("NVD JSON parse error: {}", e.what());
+        result.ok = false;
         return result;
     }
 
-    result.total_results = doc.value("totalResults", 0);
+    // totalResults is now integrity-load-bearing (the empty-window checks key off it), so
+    // read it defensively: a non-integer/missing value → 0 rather than a thrown type_error
+    // (#1889 review r5). value() would throw on e.g. "totalResults":"x".
+    result.total_results = doc.contains("totalResults") && doc["totalResults"].is_number_integer()
+                               ? doc["totalResults"].get<int>()
+                               : 0;
 
+    // A well-formed NVD response always carries a "vulnerabilities" array (empty
+    // for a genuinely-empty window). Its absence means an unexpected body shape —
+    // treat as failure, not empty.
     if (!doc.contains("vulnerabilities") || !doc["vulnerabilities"].is_array()) {
+        result.ok = false;
         return result;
     }
 
@@ -395,6 +398,18 @@ NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
 
     spdlog::debug("NVD parsed {} records from {} vulnerabilities", result.records.size(),
                   doc["vulnerabilities"].size());
+
+    // Self-contradictory response: NVD's totalResults claims CVEs exist but we parsed
+    // none (a stale cache/proxy serving a well-formed empty page, or a truncated body).
+    // Treat as a FAILURE so the caller holds its cursor and retries rather than skipping a
+    // populated window (#1889 review r5). A genuinely-empty window is totalResults==0,
+    // which stays ok=true and is handled as verified-empty upstream.
+    if (result.records.empty() && result.total_results > 0) {
+        spdlog::warn("NVD parse: totalResults={} but 0 usable records — treating as failure "
+                     "(won't skip a populated window)",
+                     result.total_results);
+        result.ok = false;
+    }
 
     return result;
 }

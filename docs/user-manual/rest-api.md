@@ -4857,13 +4857,54 @@ Returns recent analytics events. Accepts `limit` as a query parameter (default 5
 
 Returns the status of the NVD (National Vulnerability Database) sync.
 
-Response fields: `enabled`, `syncing`, `last_sync_time`, `last_error`, and
-`total_cves`. **`total_cves` is a count of distinct CVEs** in the local store.
+Response fields: `enabled`, `syncing`, `last_sync_time`, `last_error`,
+`total_cves`, `backfill_complete`, and `backfill_oldest_published`.
+`enabled` reflects whether NVD **sync** is configured on (i.e. `--no-nvd-sync` was
+*not* passed) — not merely whether the local mirror DB is open. Under `--no-nvd-sync`
+the mirror stays queryable (`/api/nvd/match` still works against seeded/previously-synced
+data) but `enabled` is `false` and `POST /api/nvd/sync` returns an error. Only `enabled`
+and `total_cves` are guaranteed present; the sync-progress fields (`syncing`,
+`last_sync_time`, `last_error`, `backfill_complete`, `backfill_oldest_published`) are
+omitted when sync is disabled, and the whole body is `{"enabled":false}` when the mirror
+DB is closed.
+**`total_cves` is a count of distinct CVEs** in the local store.
 (Prior to the CPE-range-matching change it counted one row per affected
 product, so a multi-product CVE inflated the figure — after upgrade the number
 reads lower even once fully synced, and reads near-zero briefly after the
 one-time schema migration until the next sync repopulates the mirror. This is
 expected, not data loss.)
+
+`backfill_complete` (boolean) reports whether the newest-first catalog backfill
+has reached its configured floor **and the catalog holds real NVD-sourced CVEs** —
+the built-in fallback rules seeded at startup do **not** count, so `total_cves` can
+be non-zero while `backfill_complete` is still `false`. A mirror with no NVD CVEs is
+never reported complete, so a fresh or rate-limited deployment (or one whose upstream
+NVD fetches have not yet returned data) shows `false` with the cursor at the floor
+until real NVD data lands. That is expected, not a stall.
+`backfill_oldest_published` (ISO 8601 string)
+is the progress cursor — the `published` date of the oldest CVE fetched so far,
+walking backwards. During the initial backfill `total_cves` climbs continuously
+and `last_sync_time` advances after **every** successful fetch window — so a
+non-empty `last_sync_time` does **not** mean the mirror is complete. Use
+`backfill_complete` (with the `backfill_oldest_published` cursor for progress) as
+the authoritative "initial mirror built" signal, not `last_sync_time`.
+
+`last_error` (string, present only while sync is enabled) surfaces the most recent
+sync-health problem and is cleared at the start of the next sync tick — a non-empty
+value is a transient, self-healing condition, not a product bug. Values you may see:
+a transient fetch failure (`NVD backfill fetch failed — retrying (mirror incomplete)`
+or `NVD freshness fetch failed — retrying` — a connection/HTTP/parse error, cleared once
+a fetch succeeds); a local persist failure (`NVD backfill window persist failed — mirror
+incomplete` / `NVD freshness window persist failed` — a disk/DB issue; the mirror holds
+its cursor and stays `backfill_complete: false` rather than dropping the fetched CVEs);
+a prolonged upstream outage (`NVD returning empty responses — mirror not populated`); and
+re-confirmation of a suspicious empty window (`re-confirming a suspicious empty NVD window
+(n/N)` — an older published-date window returned empty *after* real data had already
+landed; the backfill holds, staying `backfill_complete: false`, and re-checks it before
+trusting it, so a stale cache/proxy serving an empty page can't make it skip a populated
+range and falsely report complete).
+These are operational states, not product bugs — the mirror recovers automatically
+once the underlying condition clears.
 
 #### `POST /api/nvd/sync`
 
