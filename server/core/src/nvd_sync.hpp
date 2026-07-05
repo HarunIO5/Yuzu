@@ -85,6 +85,10 @@ private:
     // grace) so a thread wedged in an uncancellable fetch (#1867) is detached +
     // leaked rather than joined-forever, letting the process exit.
     std::atomic<bool> finished_{false};
+    // Consecutive empty-catalog recovery resets in do_backfill (bounded by
+    // kMaxEmptyCatalogResets). Touched only on the sync thread; clears when real NVD
+    // data is persisted (#1889 review r4).
+    int empty_catalog_resets_{0};
 
 #ifdef __cpp_lib_jthread
     void sync_loop(std::stop_token stop);

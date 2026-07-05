@@ -41,6 +41,11 @@ long long epoch_secs(std::chrono::system_clock::time_point tp) {
 // (#1889 review r2 / governance UP-3/UP-4).
 constexpr long long kNvdCatalogStartEpoch = 915148800; // 1999-01-01T00:00:00Z
 
+// Cap on consecutive empty-catalog recovery resets (see do_backfill). Bounds a
+// full-range re-walk to at most this many passes when NVD returns well-formed-but-
+// empty windows for an extended outage, instead of re-walking every ~60s tick.
+constexpr int kMaxEmptyCatalogResets = 5;
+
 // Cursors are stored in sync_meta as epoch-seconds strings (no ISO parsing —
 // avoids std::chrono::parse portability differences). A cursor is rejected →
 // nullopt (caller restarts from a safe idempotent default) when it is empty,
@@ -192,13 +197,15 @@ bool NvdSyncManager::backfill_complete() const {
         const auto cursor =
             parse_cursor(db_->get_meta("backfill_oldest_published"), kNvdCatalogStartEpoch);
         // Position AND content: the cursor must have reached the floor AND the catalog
-        // must actually hold CVEs. Without the content check, a corrupt at/below-floor
-        // cursor — or an NVD outage that returns empty windows — would report the mirror
-        // "complete" over an EMPTY catalog, making every vuln scan silently return clean
-        // (a false-negative). The count is short-circuited so it only runs once the cheap
-        // floor test already passed (governance Gate 4 UP-1/UP-2).
+        // must actually hold real NVD CVEs. Without the content check, a corrupt
+        // at/below-floor cursor — or an NVD outage that returns empty windows — would
+        // report the mirror "complete" over an empty catalog, making every vuln scan
+        // silently return clean (a false-negative). Uses nvd_cve_count() (source='nvd'),
+        // NOT total_cve_count(), so the built-in fallback rules seeded at startup can't
+        // masquerade as a populated mirror (#1889 review r4). Short-circuited so the
+        // COUNT only runs once the cheap floor test already passed.
         return cursor.has_value() && *cursor <= backfill_floor(std::chrono::system_clock::now()) &&
-               db_->total_cve_count() > 0;
+               db_->nvd_cve_count() > 0;
     } catch (const std::exception& e) {
         spdlog::warn("NVD backfill_complete() meta read failed: {} (assuming not complete)",
                      e.what());
@@ -328,14 +335,58 @@ void NvdSyncManager::do_backfill() {
                  now);
 
     // Recovery: if the walk would be a no-op (cursor already at/below the floor) but the
-    // catalog is EMPTY, the mirror was emptied out-of-band (corruption / manual truncate /
-    // disk loss) without a matching cursor reset. Restart from `now` so we actually
-    // re-fetch, rather than sitting "incomplete" (per the content guard in
+    // catalog holds no real NVD CVEs, the mirror was emptied out-of-band (corruption /
+    // manual truncate / disk loss) without a matching cursor reset. Restart from `now` so
+    // we actually re-fetch, rather than sitting "incomplete" (per the content guard in
     // backfill_complete()) forever while the loop does nothing (governance Gate 6 SRE).
-    if (cursor <= floor && db_->total_cve_count() == 0) {
-        spdlog::warn("NVD backfill: cursor at/below the floor but the catalog is empty — "
-                     "resetting the cursor to `now` to re-fetch the full range");
-        cursor = now;
+    // Bounded: if NVD keeps returning well-formed-but-empty windows (an outage where
+    // result.ok stays true), stop re-walking after kMaxEmptyCatalogResets to avoid a
+    // full-range re-walk every ~60s tick. The counter clears the moment real data lands
+    // (see the successful-upsert path below), so a genuine NVD recovery resumes cleanly.
+    if (cursor <= floor && db_->nvd_cve_count() == 0) {
+        if (empty_catalog_resets_ >= kMaxEmptyCatalogResets) {
+            // Capped: stop re-walking the full range every tick. Instead probe ONLY the
+            // newest window so a genuine NVD recovery is detected without a server restart.
+            // If it's still empty/erroring, stay capped (a cheap one-window no-op). If data
+            // returns, clear the cap and fall through to a full re-walk — the probe result
+            // is deliberately NOT upserted here, so a partial (newest-window-only) catalog
+            // can't falsely satisfy the content guard (grill-with-docs self-review).
+            if (stopping_.load())
+                return;
+            auto probe = fetcher_->fetch_by_published_window(iso_of(now - max_window), iso_of(now));
+            if (!probe.ok || probe.records.empty()) {
+                // Still empty — re-assert the starved state each tick. do_sync clears
+                // status_.last_error at the top of every tick, so a one-shot set on the
+                // cap-transition would vanish for the rest of the outage (re-review SHOULD).
+                std::lock_guard<std::mutex> lock{mu_};
+                status_.last_error = "NVD returning empty responses — mirror not populated";
+                return;
+            }
+            // Data is back — full re-walk this tick. Do NOT clear the cap here: the in-loop
+            // reset below clears it only once a window actually PERSISTS, so a flapping NVD
+            // (probe returns data, deeper windows keep failing) can't re-enter uncapped
+            // full re-walks (cpp-safety r4). The probe result is deliberately not upserted,
+            // so a newest-window-only catalog can't falsely satisfy the content guard.
+            spdlog::info("NVD backfill: data returned after an empty-catalog outage — resuming "
+                         "full recovery");
+            cursor = now;
+        } else {
+            if (++empty_catalog_resets_ == kMaxEmptyCatalogResets) {
+                spdlog::error("NVD backfill: catalog still empty after {} recovery resets — NVD "
+                              "appears to be returning empty responses; pausing full re-walks and "
+                              "probing the newest window each tick until data returns or restart",
+                              kMaxEmptyCatalogResets);
+                // Surface the starved state on /api/nvd/status so a prolonged empty-NVD
+                // outage is operator-alertable, not just a one-shot log line (Gate 4 UP-5).
+                std::lock_guard<std::mutex> lock{mu_};
+                status_.last_error = "NVD returning empty responses — mirror not populated";
+            } else {
+                spdlog::warn("NVD backfill: cursor at/below the floor but the catalog is empty — "
+                             "resetting the cursor to `now` to re-fetch (recovery {} of {})",
+                             empty_catalog_resets_, kMaxEmptyCatalogResets);
+            }
+            cursor = now;
+        }
     }
 
     // On a fresh backfill start, pin the freshness cursor to now so that after a
@@ -358,8 +409,25 @@ void NvdSyncManager::do_backfill() {
             return;
         }
         if (!result.records.empty()) {
-            db_->upsert_cves(result.records);
+            if (!db_->upsert_cves(result.records)) {
+                // Persist failed (BEGIN/COMMIT/rollback) — HOLD the cursor and retry next tick;
+                // never advance past unpersisted CVEs (#1889 review r4). We deliberately do NOT
+                // advance-and-drop after N tries: for a vuln mirror, silently dropping a window
+                // is a PERMANENT false-negative (freshness only re-fetches by lastMod, so a
+                // historical CVE is never recovered), whereas holding keeps backfill_complete()
+                // false so the catalog correctly reports incomplete. A transient failure clears
+                // on retry; a persistent one (catastrophic disk/corruption) fails SAFE — the
+                // mirror stays incomplete and the error is surfaced on /api/nvd/status.
+                spdlog::error("NVD backfill window persist failed — holding the cursor and "
+                              "retrying; the mirror stays INCOMPLETE until it succeeds");
+                {
+                    std::lock_guard<std::mutex> lock{mu_};
+                    status_.last_error = "NVD backfill window persist failed — mirror incomplete";
+                }
+                return;
+            }
             total += result.records.size();
+            empty_catalog_resets_ = 0; // real NVD data landed — clear the recovery backstop
         }
         cursor = window_start;
         // Re-capture the wall clock per window so last_sync_time actually advances
@@ -387,7 +455,7 @@ void NvdSyncManager::do_backfill() {
         // log on the SAME content check backfill_complete() uses, so the log can never
         // claim "complete" while the status API / gauge correctly report incomplete over
         // an empty catalog (governance Gate 6 compliance).
-        if (db_->total_cve_count() > 0) {
+        if (db_->nvd_cve_count() > 0) {
             spdlog::info("NVD backfill complete — floor reached ({} CVEs upserted this pass)",
                          total);
         } else {
@@ -426,10 +494,21 @@ void NvdSyncManager::do_freshness() {
             return;
         }
         if (!result.records.empty()) {
-            db_->upsert_cves(result.records);
+            if (!db_->upsert_cves(result.records)) {
+                // Persist failed — HOLD last_freshness_check and retry; never advance past
+                // unpersisted CVEs (dropping a modified CVE is a silent, permanent miss —
+                // #1889 review r4). Fails SAFE: freshness stays behind and the error surfaces.
+                spdlog::error("NVD freshness window persist failed — holding the cursor and "
+                              "retrying; freshness stays behind until it succeeds");
+                {
+                    std::lock_guard<std::mutex> lock{mu_};
+                    status_.last_error = "NVD freshness window persist failed";
+                }
+                return;
+            }
             total += result.records.size();
         }
-        // Advance only after a successful window.
+        // Advance only after a successful (fetched AND persisted) window.
         db_->set_meta("last_freshness_check", std::to_string(epoch_secs(we)));
     }
 

@@ -4875,10 +4875,12 @@ one-time schema migration until the next sync repopulates the mirror. This is
 expected, not data loss.)
 
 `backfill_complete` (boolean) reports whether the newest-first catalog backfill
-has reached its configured floor **and the local catalog is non-empty** — a mirror
-with zero CVEs is never reported complete, so a fresh or rate-limited deployment (or
-one whose upstream NVD fetches have not yet returned data) shows `false` with the
-cursor at the floor until real CVE data lands. That is expected, not a stall.
+has reached its configured floor **and the catalog holds real NVD-sourced CVEs** —
+the built-in fallback rules seeded at startup do **not** count, so `total_cves` can
+be non-zero while `backfill_complete` is still `false`. A mirror with no NVD CVEs is
+never reported complete, so a fresh or rate-limited deployment (or one whose upstream
+NVD fetches have not yet returned data) shows `false` with the cursor at the floor
+until real NVD data lands. That is expected, not a stall.
 `backfill_oldest_published` (ISO 8601 string)
 is the progress cursor — the `published` date of the oldest CVE fetched so far,
 walking backwards. During the initial backfill `total_cves` climbs continuously
@@ -4886,6 +4888,15 @@ and `last_sync_time` advances after **every** successful fetch window — so a
 non-empty `last_sync_time` does **not** mean the mirror is complete. Use
 `backfill_complete` (with the `backfill_oldest_published` cursor for progress) as
 the authoritative "initial mirror built" signal, not `last_sync_time`.
+
+`last_error` (string, present only while sync is enabled) surfaces the most recent
+sync-health problem and is cleared at the start of the next sync tick. Expected,
+self-healing values include a local persist failure (`NVD backfill/freshness window
+persist failed — mirror incomplete` — a disk/DB issue; the mirror holds its cursor
+and stays `backfill_complete: false` rather than dropping the fetched CVEs) and a
+prolonged upstream outage (`NVD returning empty responses — mirror not populated`).
+These are operational states, not product bugs — the mirror recovers automatically
+once the underlying condition clears.
 
 #### `POST /api/nvd/sync`
 

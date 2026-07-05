@@ -164,7 +164,7 @@ TEST_CASE("NvdDatabase: upsert batch", "[nvd][db]") {
     std::vector<CveRecord> records;
     for (int i = 0; i < 5; ++i)
         records.push_back(make_cve("CVE-2024-000" + std::to_string(i), "test", "1.0"));
-    db.upsert_cves(records);
+    REQUIRE(db.upsert_cves(records)); // returns true on a fully-persisted batch
     REQUIRE(db.total_cve_count() == 5);
 }
 
@@ -678,6 +678,7 @@ struct MockFetcher : INvdFetcher {
     std::vector<std::pair<std::string, std::string>> published_calls;
     std::vector<std::pair<std::string, std::string>> modified_calls;
     bool fail = false;
+    bool empty_ok = false; // fetch succeeds (ok=true) but returns zero records (NVD outage shape)
 
     static CveRecord one_cve(std::size_t n) {
         CveRecord rec;
@@ -695,7 +696,7 @@ struct MockFetcher : INvdFetcher {
         published_calls.emplace_back(s, e);
         NvdFetchResult r;
         r.ok = !fail;
-        if (r.ok)
+        if (r.ok && !empty_ok)
             r.records.push_back(one_cve(published_calls.size()));
         return r;
     }
@@ -761,7 +762,7 @@ TEST_CASE("NvdSyncManager: freshness splits a >120-day gap into windows", "[nvd]
     // cursor older than the 8-year floor (~9y ago) plus stored CVEs → complete.
     db->set_meta("backfill_oldest_published", std::to_string(secs_ago(365 * 9)));
     db->set_meta("last_freshness_check", std::to_string(secs_ago(300)));
-    db->upsert_cves({MockFetcher::one_cve(1)}); // content guard: complete requires CVEs
+    REQUIRE(db->upsert_cves({MockFetcher::one_cve(1)})); // content guard: complete requires CVEs
     auto mock = std::make_unique<MockFetcher>();
     auto* m = mock.get();
     NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 8);
@@ -911,7 +912,7 @@ TEST_CASE("NvdSyncManager: a completed bounded backfill stays complete + display
         duration_cast<seconds>((system_clock::now() - years(9)).time_since_epoch()).count();
     auto db = std::make_shared<NvdDatabase>(":memory:");
     db->set_meta("backfill_oldest_published", std::to_string(cursor_9y_ago));
-    db->upsert_cves({MockFetcher::one_cve(1)}); // content guard: complete requires CVEs
+    REQUIRE(db->upsert_cves({MockFetcher::one_cve(1)})); // content guard: complete requires CVEs
     auto mock = std::make_unique<MockFetcher>();
     NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
     const auto st = mgr.status();
@@ -931,7 +932,7 @@ TEST_CASE("NvdSyncManager: an at-floor cursor with an EMPTY catalog is NOT compl
     auto mock = std::make_unique<MockFetcher>();
     NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
     REQUIRE_FALSE(mgr.status().backfill_complete);        // empty catalog → not complete
-    db->upsert_cves({MockFetcher::one_cve(1)});           // add content...
+    REQUIRE(db->upsert_cves({MockFetcher::one_cve(1)}));  // add content...
     REQUIRE(mgr.status().backfill_complete);              // ...now genuinely complete
 }
 
@@ -949,8 +950,78 @@ TEST_CASE("NvdSyncManager: an emptied catalog with a stuck at-floor cursor re-fe
     NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
     mgr.sync_now();
     REQUIRE_FALSE(m->published_calls.empty()); // it re-fetched instead of sitting idle
-    REQUIRE(db->total_cve_count() > 0);         // catalog repopulated
+    REQUIRE(db->nvd_cve_count() > 0);           // real NVD catalog repopulated
     REQUIRE(mgr.status().backfill_complete);    // and is now genuinely complete
+}
+
+TEST_CASE("NvdSyncManager: built-in fallback rows do NOT satisfy the completion content guard",
+          "[nvd][backfill]") {
+    // #1889 review r4 Blocker 2: seed_builtin_rules() adds source='builtin' rows before
+    // the first sync. total_cve_count() counts them, so an empty-NVD mirror with a cursor
+    // at the floor would falsely report complete and skip straight to freshness. The guard
+    // uses nvd_cve_count() (source='nvd'), so builtins alone never mark a mirror complete.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->seed_builtin_rules();          // source='builtin' rows, zero real NVD data
+    REQUIRE(db->total_cve_count() > 0); // builtins present...
+    REQUIRE(db->nvd_cve_count() == 0);  // ...but zero NVD rows
+    db->set_meta("backfill_oldest_published", std::to_string(secs_ago(365 * 9))); // at/below 8y floor
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->fail = true; // we only need the completeness verdict + proof it attempts a real fetch
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
+    REQUIRE_FALSE(mgr.status().backfill_complete); // builtins don't satisfy the guard
+    mgr.sync_now();
+    REQUIRE_FALSE(m->published_calls.empty());     // reached do_backfill (a real fetch), not freshness
+    REQUIRE(m->modified_calls.empty());            // definitely not the freshness path
+}
+
+TEST_CASE("NvdSyncManager: empty-catalog recovery is bounded (no infinite re-walk)",
+          "[nvd][backfill]") {
+    // #1889 review r4 minor: if NVD returns well-formed-but-EMPTY windows during an outage
+    // (result.ok true, zero records), the empty-catalog recovery must not re-walk the full
+    // range on every tick forever — it is capped at kMaxEmptyCatalogResets.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(secs_ago(365 * 9))); // at floor
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->empty_ok = true; // every fetch succeeds but returns zero records
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
+    for (int i = 0; i < 20; ++i)
+        mgr.sync_now();
+    // Bounded: ~25 windows per walk × 5 capped resets ≈ ≤125, far below an uncapped
+    // 20 passes × ~25 = ~500. And an all-empty catalog never falsely completes.
+    REQUIRE(m->published_calls.size() < 200);
+    REQUIRE_FALSE(mgr.status().backfill_complete);
+}
+
+TEST_CASE("NvdSyncManager: capped empty-catalog recovery resumes when NVD data returns",
+          "[nvd][backfill]") {
+    // The cap must NOT require a server restart to recover (grill-with-docs self-review):
+    // once capped, do_backfill probes the newest window each tick, and when NVD returns
+    // data it clears the cap and rebuilds the catalog to completion.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(secs_ago(365 * 9)));
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->empty_ok = true; // NVD outage: ok but empty windows
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
+    for (int i = 0; i < 10; ++i)
+        mgr.sync_now(); // drive past the cap
+    REQUIRE_FALSE(mgr.status().backfill_complete);
+    m->empty_ok = false; // NVD recovers — real data again
+    for (int i = 0; i < 3; ++i)
+        mgr.sync_now(); // probe detects data → full re-walk → complete
+    REQUIRE(mgr.status().backfill_complete);
+    REQUIRE(db->nvd_cve_count() > 0);
+}
+
+TEST_CASE("NvdDatabase::upsert_cves returns false when the DB is not open", "[nvd][db]") {
+    // #1889 review r4 Blocker 1: the bool return is the signal do_backfill/do_freshness
+    // use to hold the resume cursor on a persistence failure. A closed DB is the
+    // deterministic, cross-platform failure case.
+    NvdDatabase db("/proc/yuzu-nonexistent-dir/nvd.db"); // cannot be created/opened
+    REQUIRE_FALSE(db.is_open());
+    REQUIRE_FALSE(db.upsert_cves({MockFetcher::one_cve(1)})); // false, nothing persisted
 }
 
 TEST_CASE("NvdClient::parse_response: 200-with-bad-body is ok=false, empty window is ok=true",

@@ -134,8 +134,8 @@ it. It is consumed by the **fleet-topology vuln overlay** only (`FleetTopologySt
 > **Gap (range comparator now DONE; identity is the remaining gap):** the range-aware
 > comparator + `cpeMatch` range test shipped with the CPE-range PR. What remains is
 > **vendor-precise identity** — typed-identity→CPE mapping (curated + pgvector fuzzy, Lane 1's
-> NVD-fallback and Lane 3's future federation) to replace the `product LIKE ?` substring match
-> (ADR-0018) — alongside Lane 1's OVAL-primary (V2.4) and Lane 2's OSV.dev-by-PURL (V2.9), as
+> NVD-fallback and Lane 3's future federation) to replace the prefix-anchored `product LIKE 'name%'`
+> match (ADR-0018) — alongside Lane 1's OVAL-primary (V2.4) and Lane 2's OSV.dev-by-PURL (V2.9), as
 > part of the single server correlation engine. *(roadmap M1a; topology attach is M3)*
 
 ### V2.4 Distro advisory / OVAL backport correlation :x: `T1`
