@@ -3,7 +3,8 @@ status: proposed
 date: 2026-07-01
 owner: "@lesault (Andy Younie)"
 depends-on: 0018 (server-authoritative matching — the engine that produces these findings); 0005 (two-matcher split)
-related: docs/vuln-scan-engine-design.md §4.4; docs/vuln-scan-roadmap.md M2; docs/vuln-scan-capability-map.md V4
+related: docs/vuln-scan-engine-design.md §4.4; docs/vuln-scan-roadmap.md M2; docs/vuln-scan-capability-map.md V4; 0023 (correlation engine — first consumer, provisional number)
+amended: 2026-07-05 (correlation-engine grill-with-docs session) — adds a fourth status `potential` and an orthogonal confidence axis (see Amendment)
 ---
 
 # 0019 — Vulnerability findings are tri-state; coverage is a dimension separate from vulnerability
@@ -86,6 +87,48 @@ vulnerability status.**
 
 **Ownership.** Andy owns the finding-status taxonomy and the coverage-metric definition; Eng owns
 carrying the feed-version timestamp and computing coverage counters at correlation time.
+
+## Amendment — 2026-07-05: a fourth status `potential`, plus a confidence axis
+
+> Added during the correlation-engine design (grill-with-docs). The original tri-state assumed the
+> matching feed for a given package is *backport-correct* — true for OVAL (Lane 1's authoritative
+> source, ADR-0018) but **not** for raw NVD-on-distro. M1a (`docs/vuln-scan-roadmap.md`) stands up the
+> correlation engine on **NVD-only, before OVAL lands (M1b)**. Against NVD alone, a distro package's
+> `release` backport suffix (`1.1.1f-1ubuntu2.16`) is invisible, so an in-range NVD hit on a
+> distro package is *not* a confirmed vulnerability — it is the dominant false-positive source ADR-0018
+> lines 67-73 warns about. Asserting such a hit as **Vulnerable** would reintroduce exactly the
+> scanner-lie this ADR exists to prevent, in the false-**positive** direction.
+
+**The finding status is extended from three values to four:**
+
+- **Vulnerable** — matched an advisory in a **backport-correct** feed (OVAL, M1b), or a curated exact-CPE
+  match where backport is not a confound. *An asserted, confirmed vulnerability.*
+- **`potential`** *(new)* — matched an NVD version range, but the match is **not backport-confirmed** (no
+  OVAL for this package yet). Surfaced as *"unconfirmed — pending OVAL backport check, as of feed-sync T"*,
+  and **counted separately from Vulnerable** (never folded into the vulnerable headline). When OVAL lands
+  (M1b) each `potential` resolves deterministically → **Vulnerable** (OVAL: not-backported) or →
+  **Assessed–clean** (OVAL: backport-fixed).
+- **Assessed–clean** — within a covering feed's scope, no match. (Unchanged.)
+- **Not-assessed** — no feed covers the package; identified but never evaluated. (Unchanged.)
+
+**A second, orthogonal dimension: `confidence`.** Independent of status, each `potential`/Vulnerable
+finding carries `confidence ∈ {high, low}` reflecting the **identity-mapping** certainty — `high` = a
+curated or exact CPE identity; `low` = a best-effort normalized-name match. Confidence answers "did we map
+this package to the right CPE product," which is orthogonal to status's "what did the feed say." (This is
+the same separation-of-dimensions principle as coverage vs vulnerability, applied to identity.)
+
+**Feed-freshness threading (realises cost #3 above).** Every `potential` and Assessed–clean verdict is
+stamped with the NVD catalog feed-sync timestamp, so a stale mirror yields a *stale* signal, not a
+confidently-current one.
+
+**Consequence — M1a acceptance reconciled.** The roadmap's M1a bar is *"no lower-bound false positives."*
+The MVP hits it **because it never asserts Vulnerable on a distro package pre-OVAL** — such hits are
+`potential`, explicitly unconfirmed. The confirmed-Vulnerable bucket is ~empty until M1b; that is the
+honest state, not a gap.
+
+**Ownership.** Andy owns the finding-status taxonomy, so this amendment is within the ADR owner's remit;
+it is recorded here rather than as a new ADR because it refines this ADR's core taxonomy. Route through the
+same `/governance` path on the implementing PR.
 
 ## Ratification
 
