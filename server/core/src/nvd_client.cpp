@@ -194,6 +194,16 @@ NvdFetchResult NvdClient::fetch_paginated(const std::string& date_params) {
 
         rate_limit();
 
+        // rate_limit()'s throttle/backoff sleep is cancellable and can wake early on
+        // stop(); re-check before issuing the (uncancellable, up to 90s) GET so a
+        // shutdown during the throttle isn't followed by one more in-flight request
+        // (#1879 / PR2C unhappy-path UP-3).
+        if (cancelled()) {
+            combined.ok = false;
+            combined.reason = NvdFailureReason::kCancelled;
+            return combined;
+        }
+
         httplib::Client client(std::string("https://") + kNvdHost);
         configure_client(client);
 

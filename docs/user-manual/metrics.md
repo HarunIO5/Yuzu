@@ -434,6 +434,21 @@ automatically — expected during a large backfill without an API key, not a fau
 is any other non-2xx status; `parse` is a malformed response body. See
 [Rate-limit and auth-error handling](server-admin.md#nvd-cve-sync) for operator guidance.
 
+**Alerting.** Only `http_403` is unambiguously operator-actionable, so page on it and
+merely record the rest:
+
+```
+# Page: bad/revoked API key — sync makes no progress until rotated
+increase(yuzu_nvd_sync_failures_total{reason="http_403"}[1h]) > 0
+# Do NOT page on http_429 — it is expected rate-limiting, self-heals via backoff.
+```
+
+Note that `http_429` **will** climb during a first-run full backfill on a server with no
+`--nvd-api-key` (each window that exhausts its retry budget increments it before the next
+tick retries) — that is expected first-run behaviour, not a regression. A sustained
+`yuzu_nvd_backfill_complete == 0` (see above) is the durable "mirror stuck" signal, not the
+failures counter on its own.
+
 ## Management group metrics
 
 The server exposes two gauges for management group telemetry. These are

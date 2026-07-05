@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <exception>
 #include <format>
 #include <memory>
 #include <mutex>
@@ -331,21 +332,22 @@ NvdSyncManager::backfill_floor(std::chrono::system_clock::time_point now) const 
 }
 
 void NvdSyncManager::report_failure(NvdFailureReason reason, const char* phase) {
-    // A shutdown cancel is not a failure — don't log it as one, don't count it,
-    // and don't invoke the callback, which may touch owner state (server metrics_)
-    // being torn down on the leak-on-detach path. stopping_ is set before that
-    // teardown, so this guard NARROWS the window to an implausible sliver (a
-    // multi-second stall inside the log call below, between this check and the
-    // invoke, while the 5s grace expires and the owner frees metrics_); cpp-safety
-    // + security cleared it as sound in practice. A full close is the pull-model
-    // follow-up (surface counts in SyncStatus, emit at scrape) — see PR notes.
-    if (stopping_.load() || reason == NvdFailureReason::kCancelled)
+    // A shutdown cancel is not a failure — don't log it as one, don't count it, and
+    // don't invoke the callback, which reaches into owner state (server metrics_)
+    // that is freed on the leak-on-detach path. stopping_ is set before that
+    // teardown. kNone can't reach here (only set on ok==true) but is guarded too so
+    // it can never mint a spurious reason="none" series.
+    if (stopping_.load() || reason == NvdFailureReason::kCancelled ||
+        reason == NvdFailureReason::kNone)
         return;
-    spdlog::warn("NVD {} window failed (reason={}) — will retry next tick (cursor unchanged)", phase,
-                 nvd_reason_label(reason));
-    if (on_sync_failure_) {
-        // The callback reaches into server-level metrics; never let a throw from
-        // it escape and std::terminate the sync thread (UP-6).
+    // Fire the metrics callback FIRST, immediately after a fresh stopping_ re-check,
+    // so nothing stall-prone (the log call below) sits between the check and the
+    // cross-object metrics_ touch — that shrinks the teardown-UAF window the guard
+    // narrows to a bare preemption sliver. The durable close is the pull-model
+    // (surface counts in SyncStatus, emit at scrape) tracked in #1909.
+    if (on_sync_failure_ && !stopping_.load()) {
+        // Never let a throw from the callback escape and std::terminate the sync
+        // thread (UP-6).
         try {
             on_sync_failure_(reason);
         } catch (const std::exception& e) {
@@ -354,6 +356,8 @@ void NvdSyncManager::report_failure(NvdFailureReason reason, const char* phase) 
             spdlog::error("NVD failure callback threw a non-std exception");
         }
     }
+    spdlog::warn("NVD {} window failed (reason={}) — will retry next tick (cursor unchanged)", phase,
+                 nvd_reason_label(reason));
 }
 
 void NvdSyncManager::do_backfill() {
@@ -451,7 +455,9 @@ void NvdSyncManager::do_backfill() {
             report_failure(result.reason, "backfill");
             if (!stopping_.load() && result.reason != NvdFailureReason::kCancelled) {
                 std::lock_guard<std::mutex> lock{mu_};
-                status_.last_error = "NVD backfill fetch failed — retrying (mirror incomplete)";
+                status_.last_error = std::string("NVD backfill fetch failed (") +
+                                     nvd_reason_label(result.reason) +
+                                     ") — retrying (mirror incomplete)";
             }
             return;
         }
@@ -574,7 +580,9 @@ void NvdSyncManager::do_freshness() {
             report_failure(result.reason, "freshness");
             if (!stopping_.load() && result.reason != NvdFailureReason::kCancelled) {
                 std::lock_guard<std::mutex> lock{mu_};
-                status_.last_error = "NVD freshness fetch failed — retrying";
+                status_.last_error =
+                    std::string("NVD freshness fetch failed (") + nvd_reason_label(result.reason) +
+                    ") — retrying";
             }
             return;
         }

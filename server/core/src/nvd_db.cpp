@@ -548,7 +548,7 @@ bool NvdDatabase::upsert_cves_impl(const std::vector<CveRecord>& records) {
     sqlite3_stmt* ins = nullptr;
     if (!prepare_upsert_stmts(db_, hdr, del, ins)) {
         sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-        return;
+        return false; // nothing persisted — caller holds its resume cursor (#1889 r4)
     }
 
     std::size_t failed = 0;
