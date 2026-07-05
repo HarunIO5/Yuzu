@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <shared_mutex>
+#include <string_view>
 
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
@@ -31,6 +32,11 @@ namespace {
 // operator-supplied reason is sanitised (control bytes → space) and truncated to
 // this before it reaches the audit detail.
 constexpr std::size_t kMaxJustificationLength = 1024;
+
+// Max stored length of a single sanitised detail value (e.g. an OIDC
+// display name or email). These are short identity labels, not free-text
+// justifications, so the cap is much tighter than kMaxJustificationLength.
+constexpr std::size_t kMaxDetailValueLength = 128;
 
 // The A4 denial envelope has moved to detail::a4_denial in
 // rest_a4_envelope_http.hpp (#1470 — folded into the one unified builder so
@@ -93,6 +99,38 @@ static std::string find_cookie_value(const std::string& hdr, const std::string& 
 }
 
 } // namespace
+
+namespace detail {
+
+// See declaration + full rationale in auth_routes.hpp. Lives in the named
+// `detail` namespace (not the anonymous one above) so unit tests can link
+// against it directly — mirrors the rest_a4_envelope.hpp pattern.
+std::string sanitize_detail_value(std::string_view v) {
+    std::string out;
+    out.reserve(std::min(v.size(), kMaxDetailValueLength));
+    for (char c : v) {
+        const auto uc = static_cast<unsigned char>(c);
+        out.push_back((c == ';' || c == '=' || c == '\r' || c == '\n' || uc < 0x20 || uc == 0x7F)
+                          ? '_'
+                          : c);
+    }
+    if (out.size() > kMaxDetailValueLength) {
+        out.resize(kMaxDetailValueLength);
+        std::size_t i = out.size();
+        while (i > 0 && (static_cast<unsigned char>(out[i - 1]) & 0xC0) == 0x80)
+            --i;
+        if (i > 0) {
+            const unsigned char lead = static_cast<unsigned char>(out[i - 1]);
+            const std::size_t seq_len =
+                lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
+            if (out.size() - (i - 1) < seq_len)
+                out.resize(i - 1);
+        }
+    }
+    return out;
+}
+
+} // namespace detail
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -188,6 +226,12 @@ std::string AuthRoutes::extract_form_value(const std::string& body, const std::s
 auth::Session AuthRoutes::synthesize_token_session(const ApiToken& api_token) {
     auth::Session synth;
     synth.username = api_token.principal_id;
+    // #1837: no separate display label is stored for a token; fall back to
+    // the principal id itself (matches the pre-#1837 behavior for local
+    // principals, and is the best available label for a stable SSO id with
+    // no live session to render a human name from — there is no persistent
+    // principal→display-name directory; see #1852).
+    synth.display_name = api_token.principal_id;
     synth.auth_source = api_token.mcp_tier.empty() ? "api_token" : "mcp_token";
     synth.token_scope_service = api_token.scope_service;
     synth.mcp_tier = api_token.mcp_tier;
@@ -1847,6 +1891,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         auto result = oidc_provider_->handle_callback(code, state);
         if (!result) {
+            // No display=/email= detail here — handle_callback failed before
+            // claims were extracted (token exchange, signature, or
+            // validate_claims rejection incl. the #1837 governance sub/iss
+            // checks), so there is no human name to carry. Every OTHER
+            // auth.oidc_login_failed / auth.sso_group_provision emission
+            // below this point (claims successfully parsed) DOES carry it.
             spdlog::warn("OIDC callback failed: {}", result.error());
             audit_log(req, "auth.oidc_login_failed", "failure");
             emit_event("auth.oidc_login_failed", req,
@@ -1862,7 +1912,16 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto& claims = result.value();
         auto email = claims.email.empty() ? claims.preferred_username : claims.email;
         auto display = claims.name.empty() ? email : claims.name;
-        auto username = display.empty() ? email : display;
+        // #1837 — the STABLE authorization principal, not the mutable
+        // display name: `sub` is only guaranteed unique per-issuer (RFC
+        // 7519), so it must be scoped by `iss`. Two SSO users who happen to
+        // share a display name (or one whose display name later changes)
+        // must never collide onto — or silently migrate onto — the same
+        // principal, which #1832's RBAC reconcile would otherwise make
+        // destructive (one user's login deleting the other's group
+        // memberships). Mirrors AuthManager::create_oidc_session's
+        // construction exactly.
+        const std::string username = "oidc:" + claims.iss + "#" + claims.sub;
         auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
 
         // #1832 — reconcile IdP group memberships into the RBAC store BEFORE
@@ -1896,8 +1955,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     claims.groups_overage ? "groups_overage" : "groups_absent";
                 spdlog::info("OIDC group provisioning skipped for '{}': reason={}", username,
                             reason);
-                audit_log_for_principal(req, "auth.sso_group_provision", "skipped", username,
-                                        "user", "", "", "reason=" + reason + ";source=entra");
+                audit_log_for_principal(
+                    req, "auth.sso_group_provision", "skipped", username, "user", "", "",
+                    "reason=" + reason + ";source=entra" +
+                        ";display=" + detail::sanitize_detail_value(display) +
+                        ";email=" + detail::sanitize_detail_value(email));
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_sso_group_provision_total",
                               {{"source", "entra"}, {"result", "skipped"}})
@@ -1910,14 +1972,19 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 audit_log_for_principal(
                     req, "auth.sso_group_provision", "error", username, "user", "", "",
                     "reason=group_count_exceeded;count=" +
-                        std::to_string(claims.groups.size()) + ";source=entra");
+                        std::to_string(claims.groups.size()) + ";source=entra" +
+                        ";display=" + detail::sanitize_detail_value(display) +
+                        ";email=" + detail::sanitize_detail_value(email));
                 // cons-S2 — also emit the same failed-OIDC-login signal the
                 // sibling token-exchange-failure branch emits above, so a
                 // SIEM query counting failed OIDC logins by
                 // `auth.oidc_login_failed` doesn't miss a provisioning-denied
                 // login (this branch denies the login just as surely).
-                audit_log_for_principal(req, "auth.oidc_login_failed", "error", username, "user",
-                                        "", "", "reason=group_count_exceeded");
+                audit_log_for_principal(
+                    req, "auth.oidc_login_failed", "error", username, "user", "", "",
+                    std::string("reason=group_count_exceeded") +
+                        ";display=" + detail::sanitize_detail_value(display) +
+                        ";email=" + detail::sanitize_detail_value(email));
                 emit_event("auth.oidc_login_failed", req,
                           {{"source_ip", req.remote_addr},
                            {"username", username},
@@ -1941,12 +2008,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 if (!reconciled) {
                     spdlog::warn("OIDC group provisioning failed for '{}': {}", username,
                                 reconciled.error());
-                    audit_log_for_principal(req, "auth.sso_group_provision", "error", username,
-                                            "user", "", "",
-                                            "reason=" + reconciled.error() + ";source=entra");
+                    audit_log_for_principal(
+                        req, "auth.sso_group_provision", "error", username, "user", "", "",
+                        "reason=" + reconciled.error() + ";source=entra" +
+                            ";display=" + detail::sanitize_detail_value(display) +
+                            ";email=" + detail::sanitize_detail_value(email));
                     // cons-S2 — see the over-cap branch above.
-                    audit_log_for_principal(req, "auth.oidc_login_failed", "error", username,
-                                            "user", "", "", "reason=" + reconciled.error());
+                    audit_log_for_principal(
+                        req, "auth.oidc_login_failed", "error", username, "user", "", "",
+                        "reason=" + reconciled.error() +
+                            ";display=" + detail::sanitize_detail_value(display) +
+                            ";email=" + detail::sanitize_detail_value(email));
                     emit_event("auth.oidc_login_failed", req,
                               {{"source_ip", req.remote_addr},
                                {"username", username},
@@ -1970,7 +2042,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     audit_log_for_principal(
                         req, "auth.sso_group_provision", "ok", username, "user", "", "",
                         "source=entra;added=" + std::to_string(reconciled->added) +
-                            ";removed=" + std::to_string(reconciled->removed));
+                            ";removed=" + std::to_string(reconciled->removed) +
+                            ";display=" + detail::sanitize_detail_value(display) +
+                            ";email=" + detail::sanitize_detail_value(email));
                 }
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_sso_group_provision_total",
@@ -2017,7 +2091,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                      std::chrono::duration_cast<std::chrono::steady_clock::duration>(age);
         }
 
-        auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub,
+        auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub, claims.iss,
                                                            claims.groups, admin_gid, mfa_at);
 
         res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
@@ -2025,8 +2099,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // Explicit-principal audit row — request lands at /auth/callback
         // with no session cookie yet, so the default resolve_session
         // path would leave principal empty (Gate 4 consistency B3). Use
-        // the validated `display` from the IdP as the canonical
-        // principal name. Role is resolved from the freshly-minted
+        // the STABLE `username` (#1837: "oidc:<iss>#<sub>") as the
+        // canonical audit principal — never the mutable display name, or
+        // an IdP-side rename would sever the audit trail's identity
+        // linkage across logins. Role is resolved from the freshly-minted
         // session — for the audit row we re-validate to capture the
         // role the user actually holds (group-mapping may have made
         // them admin).
@@ -2038,29 +2114,40 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // Record whether the IdP attested MFA (the `amr` decision) in the
         // audit detail so the CC6.6 "was this privileged SSO login MFA-
         // verified" question is answerable from Yuzu's own chain without
-        // cross-referencing IdP logs (governance compliance-S2).
+        // cross-referencing IdP logs (governance compliance-S2). Also carry
+        // the human-readable `display`/`email` in the detail string (never
+        // in the principal field) so a SIEM operator can see both the
+        // stable identity and a readable name for the same row.
         // #1830.2: when the login resolved to admin, also name the granting
-        // group — mirrors the SAML admin audit detail (comp-S1/UP-5 above)
-        // so a reviewer can see WHY this OIDC login is admin without
-        // cross-referencing boot flags.
-        // cons-N1: leading "auth_source=oidc;" token mirrors SAML's
-        // "auth_source=saml;" leading token (the shared ";admin_group=<value>"
-        // suffix below already matches).
+        // group — mirrors the SAML admin audit detail so a reviewer can see
+        // WHY this OIDC login is admin without cross-referencing boot flags.
+        // cons-N1: leading "auth_source=oidc;" mirrors SAML's leading
+        // "auth_source=saml;" token.
+        //
+        // `display`/`email` are IdP-supplied — `detail::sanitize_detail_value()`
+        // is applied to prevent `;`/`=`/newlines/control bytes/markup from
+        // corrupting this flat "k=v;k=v" detail string's SIEM parsing or
+        // causing stored XSS if rendered unescaped. The stable `username`
+        // principal (`oidc:<iss>#<sub>`) is NOT sanitized here — it is the
+        // audit KEY, not a detail value, and is never embedded in `detail`.
         auto oidc_audit_detail = std::string("auth_source=oidc;amr_mfa_asserted=") +
-                                 (amr_mfa_asserted ? "true" : "false");
+                                 (amr_mfa_asserted ? "true" : "false") +
+                                 ";display=" + detail::sanitize_detail_value(display) +
+                                 ";email=" + detail::sanitize_detail_value(email);
         if (effective_role == auth::role_to_string(auth::Role::admin)) {
             oidc_audit_detail += ";admin_group=" + admin_gid;
         }
-        audit_log_for_principal(req, "auth.oidc_login", "ok", display, effective_role, "User",
-                                display, oidc_audit_detail);
+        audit_log_for_principal(
+            req, "auth.oidc_login", "ok", username, effective_role, "User", username,
+            oidc_audit_detail);
         emit_event("auth.oidc_login", req,
                    {{"source_ip", req.remote_addr},
-                    {"username", display},
+                    {"username", username},
                     {"auth_method", "oidc"},
                     {"amr_mfa_asserted", amr_mfa_asserted},
-                    {"oidc_sub", claims.sub},
-                    {"email", email},
-                    {"name", claims.name}});
+                    {"oidc_sub", detail::sanitize_detail_value(claims.sub)},
+                    {"email", detail::sanitize_detail_value(email)},
+                    {"name", detail::sanitize_detail_value(claims.name)}});
         if (auto* m = auth_mgr_.metrics_registry()) {
             // #1828.2: mirror the SAML login counter — role sourced from the
             // same effective_role already resolved for the audit row above.

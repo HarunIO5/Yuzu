@@ -1090,7 +1090,16 @@ void RestApiV1::register_routes(
             return;
 
         JObj data;
-        data.add("username", session->username).add("role", auth::role_to_string(session->role));
+        // #1837: `username` is the STABLE authorization principal (an
+        // opaque `oidc:<iss>#<sub>` id for SSO sessions); `display_name` is
+        // the human-readable label ("" for a legacy session created before
+        // this field existed, so fall back to `username`) — expose both so
+        // API/dashboard callers keep a readable identity without weakening
+        // what `check_permission`/audit key on.
+        data.add("username", session->username)
+            .add("display_name",
+                session->display_name.empty() ? session->username : session->display_name)
+            .add("role", auth::role_to_string(session->role));
 
         if (rbac_store && rbac_store->is_rbac_enabled()) {
             data.add("rbac_enabled", true);

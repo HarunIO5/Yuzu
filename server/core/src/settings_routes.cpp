@@ -3391,6 +3391,24 @@ void SettingsRoutes::register_routes(
             return;
         }
 
+        // #1837 governance follow-up — reserve the `oidc:`/`saml:`/`ad:` SSO-
+        // principal namespace prefixes on LOCAL user creation. Defense-in-
+        // depth: is_valid_username's ':' rejection already makes the exact
+        // stable principal string unconstructable here, but an explicit
+        // reservation documents intent and survives a future charset change.
+        if (is_reserved_identity_prefix(username)) {
+            spdlog::warn("POST /api/settings/users: username '{}' uses a reserved SSO-principal "
+                        "prefix — rejected",
+                        username);
+            audit_fn_(req, "user.create", "denied", "User", username, "reserved_prefix");
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Username cannot begin with a reserved prefix: oidc:, saml:, or ad:","level":"error"}})");
+            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            return;
+        }
+
         // #399: reject duplicate username on the create path.
         if (auth_mgr_->get_user_role(username).has_value()) {
             spdlog::warn("POST /api/settings/users: username '{}' already exists — rejected",

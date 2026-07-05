@@ -299,6 +299,7 @@ if build_server
       'unit/server/test_schedule_routes.cpp',
       'unit/server/test_schedule_runner.cpp',
       'unit/server/test_rbac_store.cpp',
+      'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_provider.cpp',
       'unit/server/test_oidc_routes.cpp',
       'unit/server/test_saml_provider.cpp',

@@ -206,7 +206,9 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   be eligible **and** present a mandatory second factor **and** pass a fresh MFA
   step-up. The mandatory second factor is **local TOTP enrollment** for a local
   session, or a **fresh IdP-attested MFA `amr` proof** for an OIDC session when
-  `--jit-oidc-amr-elevation` is enabled (see "OIDC-amr elevation" below). This
+  `--jit-oidc-amr-elevation` is enabled (the OIDC path is **temporarily severed**
+  on this branch — an OIDC session is denied at the eligibility gate; see
+  "OIDC-amr elevation" below and #1852). This
   requirement is mandatory **unconditionally** here, NOT gated on
   `--mfa-enforcement`: elevation is the privilege-crossing boundary (non-admin →
   full admin), so — unlike the other step-up sites where the actor is already
@@ -255,7 +257,19 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   tokens resolve through `synthesize_token_session` (no cookie, no
   `elevated_until`), so a long-lived automation credential can **never** be
   elevated.
-- **OIDC-amr elevation (shipped follow-up).** An OIDC operator whose SSO
+- **OIDC-amr elevation — TEMPORARILY SEVERED by the #1837/#1857 principal
+  re-key (restoration tracked in #1852).** As of the `oidc:<iss>#<sub>` principal
+  re-key, an OIDC session's principal is **not** a valid local-`users` username
+  (it contains `:`/`#`), so `is_elevation_eligible` fails closed and the elevate
+  route denies an OIDC session at the **eligibility gate** — before the OIDC-amr
+  branch below is ever reached. OIDC operators therefore **cannot JIT-elevate**
+  on this branch. This is deliberate: it severs the pre-#1837 accident where an
+  SSO display name that coincidentally equalled a provisioned *local* username
+  borrowed that local user's eligibility + TOTP. The `amr`/`--jit-oidc-amr-elevation`
+  mechanism described below is retained (currently unreachable-for-success) and
+  documents the **intended** path that #1852 restores against the stable
+  principal; treat the rest of this subsection as the restored-state design.
+- **OIDC-amr elevation (design — restored by #1852).** An OIDC operator whose SSO
   session was authenticated with IdP MFA — asserted via the OIDC `amr` claim
   at `/auth/callback`, which seeds `Session::mfa_verified_at` when
   `amr_asserts_mfa(claims.amr)` is true (see `docs/auth-mfa-design.md` "OIDC
@@ -506,6 +520,185 @@ Implementation: `RbacStore::reconcile_idp_memberships` /
 `tests/unit/server/test_rbac_store.cpp`, `test_oidc_provider.cpp`. SAML group
 sync is out of scope here (dropped in #1827; will ride this same reconcile
 path once #1826 merges).
+
+## Stable principal vs. display name (#1837)
+
+`Session` carries two separate identity fields with different jobs:
+
+- **`username`** — the STABLE authorization principal. `check_permission`,
+  `reconcile_idp_memberships`, elevation eligibility, and every audit
+  `principal` field key on this value. It must be immutable for the
+  lifetime of the identity it represents.
+- **`display_name`** — a human-readable label for UI/audit-DETAIL
+  rendering ONLY. Never consulted for authorization; safe to change on
+  every login.
+
+**Why this split exists.** Before #1837, `create_oidc_session` keyed
+`username` on `claims.name` (falling back to `claims.email`) — an
+IdP-editable, non-unique display label. Two different SSO users who
+happened to share a display name (a common collision in orgs with
+duplicate names, or after a legal name change re-used an old name)
+collided onto ONE authorization principal. Once #1832 shipped
+`reconcile_idp_memberships` — which deletes a principal's un-reasserted
+IdP-sourced group memberships on every login — that collision became
+destructive: user B's login could silently delete user A's group
+memberships (and, in the group-membership window between the two
+logins, inherit A's roles).
+
+**The fix.** OIDC sessions now key `username` on:
+
+```
+"oidc:" + iss + "#" + sub
+```
+
+`sub` (the OIDC subject claim) is only guaranteed unique **per issuer**
+(RFC 7519) — a bare `sub` from two different IdPs (or two tenants of the
+same IdP product) could theoretically collide, so `iss` (the token
+issuer) scopes it. This is an OPAQUE id — never render it as a human
+name. `display_name` is set to `claims.name` (falling back to
+`claims.email`), exactly as `username` used to be computed, and is
+free to change on every login without touching the stable principal or
+the RBAC memberships/roles bound to it.
+
+`sub` is now authorization-load-bearing (it is half of the RBAC
+principal), so `OidcProvider::validate_claims` — the same chokepoint that
+already rejects `iss`/`aud`/`exp`/`nonce` mismatches — also rejects a
+token whose `sub` is empty, contains a control character (byte `< 0x20`
+or `== 0x7F`, including CR/LF/tab), or exceeds 255 bytes, and rejects an
+empty `iss` defensively. Without this, an IdP token that omits `sub`
+would collapse every such login onto the single principal `oidc:<iss>#`
+(destructive under the #1832 reconcile), and a control/newline byte in
+`sub` would corrupt the audit `principal` column. Rejection is
+fail-closed — the login is denied (`auth.oidc_login_failed`), no session
+minted.
+
+**Recovering a human name without a live session.** There is no
+persistent principal→display-name directory. The audit `principal`
+column is the authoritative stable id (`oidc:<iss>#<sub>`) for every SSO
+audit row; the human name for that same login is carried alongside it in
+that row's `detail` field (`display=<sanitized name>;email=<sanitized
+email>` — see `/auth/callback`'s `audit_log_for_principal` calls, which
+attach this to every SSO audit action: `auth.oidc_login`,
+`auth.oidc_login_failed`, `auth.sso_group_provision`). A live session's
+`Session::display_name` is the other source, for the currently-signed-in
+user only. Rendering a principal for which no session is live and no
+audit row is being inspected (e.g. an admin-facing user list keyed on raw
+`username` strings) has no name to show today — a durable
+principal→display-name directory (persistent, survives restart, joinable
+outside an audit row) is tracked as a fast-follow in **issue #1852**. An
+earlier revision of this section documented an in-memory
+`AuthManager::sso_identities_` resolution map upserted on every
+`create_oidc_session` call; it had zero production callers (every render
+site used a live session or an audit-row detail instead) and was removed
+as dead code in the #1837 governance hardening round.
+
+**Render sites.** `GET /api/me` (the legacy dashboard nav-bar
+"who am I", consumed by every page's `nav-user`/`context-user` JS) and
+`GET /api/v1/me` both now return `display_name` alongside the stable
+`username`; the dashboard JS shows `display_name`, falling back to
+`username` for a legacy/local session predating this field.
+
+**SAML is unaffected this slice.** `create_saml_session` still keys
+`username` on the raw NameID (`display_name` is set to the same value,
+purely for render-site parity) — SAML does not sync to `rbac_store` yet
+(dropped in #1827), so the collision this fix closes is dormant there.
+Keying SAML on `entity_id#NameID` is a tracked fast-follow, to land
+alongside SAML group sync.
+
+**Audit-detail-field injection defense (`sanitize_detail_value`).** Every
+IdP-supplied value that reaches an audit `detail` string or an
+`emit_event` JSON attribute — `name`/`email`/`sub` (and the derived
+`display`) — is untrusted: a hostile or misconfigured IdP, or a
+user-editable IdP profile field, controls it. `detail` is a flat
+`"k=v;k=v"` string parsed by SIEM tooling, so an unsanitised value could
+inject `;`/`=` to forge additional fields or `\r`/`\n`/other control
+bytes to inject fake log lines. `detail::sanitize_detail_value`
+(`auth_routes.hpp`/`.cpp`) is the single chokepoint that neutralises
+this: it replaces `;`, `=`, `\r`, `\n`, and any control byte (incl. DEL)
+with `_`, then truncates to 128 bytes on a UTF-8 code-point boundary.
+Every `display=`/`email=`/`oidc_sub`/`name` value attached in
+`/auth/callback` is run through it before concatenation. **It is
+audit-detail-field-injection defense only — it does NOT strip HTML
+markup and is not a stored-XSS defense by itself.** A value with no
+control bytes (e.g. a display name containing `<script>`) passes through
+unchanged; if that value is later rendered into HTML, the render layer's
+own escaping (`html_escape`) is what neutralises it. See the docstring on
+`detail::sanitize_detail_value` in `auth_routes.hpp` for the full contract.
+
+**Migration.** `RbacStore` schema v3 deletes every `group_members` row
+belonging to an IdP-sourced group (`groups.source != 'local'`) on
+upgrade — those rows were keyed on the OLD display-name principal and
+would otherwise be BOTH orphaned (never re-referenced by the new
+stable-keyed principal) AND a resurrected confused-deputy hazard: a
+LOCAL user who later takes the old display name as their username would
+silently inherit whatever roles the stale row's group grants. The purge
+is additive/safe — only `group_members` rows for non-local groups are
+removed; `groups`/`roles`/`role_permissions`/local memberships are
+untouched, and IdP membership re-populates under the new stable key on
+each affected user's next SSO login via `reconcile_idp_memberships`.
+
+**Known gap — OIDC JIT admin elevation is temporarily unavailable for SSO
+operators, pending durable SSO identity provisioning (issue #1852).**
+`AuthDB::set_elevation_eligible`/`is_elevation_eligible` key on
+`users.username` and are gated through `is_valid_username`, which allows
+only alphanumerics plus `. _ -` and explicitly rejects `:` (comment:
+"prevent config file format injection"). The stable OIDC principal shape
+(`oidc:<iss>#<sub>`) contains both `:` and `#`, so it fails that check
+unconditionally — `POST /api/v1/users/{name}/elevation-eligibility` 400s
+before reaching the store, and `is_elevation_eligible(session->username)`
+for a live OIDC session returns `InvalidUsername`, which the caller treats
+as fail-closed/denied. But widening `is_valid_username`'s charset would not
+be sufficient to fix this: an OIDC login provisions **no `users` row at
+all** — `elevation_eligible`/`mfa_totp_secret` are columns on `users`, and
+there is no row for an SSO principal to set them on. **An admin cannot
+restore this today by "re-providing eligibility against the stable id" —
+that operation does not exist until #1852 (a durable, first-class identity
+record for SSO principals) lands.**
+
+**This is not a regression of a previously-supported flow.** Before #1837,
+`Session::username` for an OIDC session was the mutable display name
+(`claims.name`, falling back to `claims.email`), and `is_elevation_eligible`
+looked that string up directly in `users.username`. Elevation for an SSO
+operator therefore only ever "worked" by accident, and only when **both**
+of two coincidences held: the IdP-asserted display name had to consist
+solely of `is_valid_username`'s narrow charset (no space, no `@` — so most
+real display names/emails already failed this silently), **and** it had to
+exactly match an existing *local* `users.username`. When both held, the SSO
+login's principal silently **borrowed that local principal's
+`elevation_eligible` flag and `mfa_totp_secret` enrollment** — a latent
+cross-principal grant with zero cryptographic binding between the SSO
+identity and the local account it happened to name-collide with: anyone
+the IdP would authenticate under that same display name inherited that
+local account's admin-elevation path. #1837 severs this borrowing as a
+direct, correct consequence of closing the display-name collision it rode
+on (see above) — it is closing an unsafe accident, not breaking a supported
+capability. #1852 is the deliberate, durable restoration.
+
+**Session-revocation-by-username is a narrower, structurally different
+gap.** The operationally-critical kill step
+(`AuthManager::invalidate_user_sessions`'s in-memory sweep, keyed by plain
+string equality over `sessions_`) carries no `is_valid_username` gate and
+revokes any principal string, `oidc:<iss>#<sub>` included — there is no
+missing-row problem here, unlike elevation. `DELETE
+/api/v1/sessions?username=`'s own query-parameter check does still run
+`is_valid_username` at the REST layer, so an admin typing the literal
+`oidc:<iss>#<sub>` string still gets a 400 today from that endpoint — but
+that charset-only validator predates #1837 and would already have rejected
+most OIDC display-name-keyed usernames (spaces, `@`) before this change
+too, so this is a narrow, pre-existing, easily-widened validator gap, not a
+new #1837 regression and not gated on #1852. Separately, the
+`auth.db`-persisted half of revocation
+(`AuthDB::invalidate_all_sessions`'s `DELETE FROM sessions`, surfaced as
+`db_persisted=false` for an SSO target) was **already** a no-op for OIDC
+before #1837 too: `AuthDB::create_session` is never called for an OIDC
+login — SSO sessions have always been in-memory-only and were never
+written to `auth.db`'s `sessions` table in the first place.
+
+Implementation: `Session::username`/`display_name`
+(`auth.hpp`), `AuthManager::create_oidc_session` (`auth.cpp`), the
+stable-id construction and per-audit-row `display=`/`email=` detail
+attachment in `auth_routes.cpp` `/auth/callback`, `RbacStore` migration
+v3 (`rbac_store.cpp`). Tests: `tests/unit/server/test_oidc_principal_key.cpp`.
 
 ## SAML 2.0 SP
 

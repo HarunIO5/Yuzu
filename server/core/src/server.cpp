@@ -5603,8 +5603,17 @@ private:
             auto session = require_auth(req, res);
             if (!session)
                 return;
+            // #1837: `username` is the STABLE authorization principal (an
+            // opaque `oidc:<iss>#<sub>` id for SSO sessions) — never render
+            // it alone as the nav-bar identity. `display_name` is the
+            // human-readable label consumed by every page's nav/context
+            // bar JS below; falls back to `username` for a legacy session
+            // created before this field existed.
             auto j = nlohmann::json(
-                {{"username", session->username}, {"role", auth::role_to_string(session->role)}});
+                {{"username", session->username},
+                {"display_name",
+                 session->display_name.empty() ? session->username : session->display_name},
+                {"role", auth::role_to_string(session->role)}});
             // Add RBAC role if enabled
             if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
                 j["rbac_enabled"] = true;
