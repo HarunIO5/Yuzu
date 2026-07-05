@@ -104,11 +104,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`duration_secs=<n> mfa=<oidc_amr|local_totp> expires_at=<rfc3339> justification=<text>`
   — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the
   free-text `justification=` field so a crafted justification can't forge either).
-  **⚠️ Temporarily severed by the #1837/#1857 OIDC principal re-key (see that
-  entry): an OIDC session is now keyed on `oidc:<iss>#<sub>`, which has no local
-  `users` row, so it is denied JIT elevation at the eligibility gate. The
-  `amr`/`--jit-oidc-amr-elevation` path above is retained but unreachable until
-  #1852 restores OIDC elevation; local-session JIT elevation is unaffected.**
 - **JIT admin elevation follow-ups: passive-lapse audit + absolute `expires_at` (SOC 2
   CC6.3/CC6.6).** Closes the two residual risks tracked in
   `docs/security-reviews/jit-elevation-2026-06-30.md`. (A) A JIT elevation window that
