@@ -39,6 +39,7 @@ Run all tests: `meson test -C build-linux --print-errorlogs`
 | `test_inventory_sync.cpp` | Agent daily-sync (ADR-0016): `sync_scheduler`, `sync_source_installed_software` | Canonical-hash cross-pin (blob contract v2, 12 fields); SyncScheduler first-run jitter / hash-skip / change / need_full / phase-spread / weekly full-floor / consecutive-need_full backoff; `inv|` row parse incl. short/over-long-row tolerance; `clamp_field` separator-strip + codepoint-boundary truncation (UP-10) + invalid-UTF-8 scrub to U+FFFD (UP-IN1); empty-name drop (UP-1); empty-inventory skip (UP-IN6); invalid-UTF-8 parity vector (16 cases); `LocalDispatcher` `capture_cap` plumbing regression (default-cap truncates / explicit larger cap doesn't) |
 | `test_installed_apps_inventory.cpp` | `installed_apps_inventory.hpp` pure helpers (blob contract v2) | Per-ecosystem line parsers (`parse_dpkg_inv_line`/`parse_rpm_inv_line`/`parse_pacman_inv_line`/`parse_apk_inv_line`) incl. held-package/native-package/epoch-only/wrong-token-count edge cases; EVR splitters (deb/pacman `[epoch:]ver-rel`, apk `name-ver-rN`); rpm `(none)`→empty mapping; `/etc/os-release` quote/comment/CRLF handling; `pipe_safe`; `format_inv_row` 13-token layout |
 | `test_win_str_utils.cpp` _(Windows-only)_ | Shared `yuzu::win` wide<->UTF-8 helpers (#1681): `agents/shared/win_str.hpp` | `to_wide`/`from_wide` round-trip preserving "Café"; empty + null input; 512-wchar value with no terminator (#652); lone surrogate → U+FFFD; `reg_sz_to_utf8` trailing-NUL strip (none/one/two), embedded-NUL first-stop (#1682 R6), entry-level full-512 no-terminator, non-wchar-multiple size floor, null buffer + empty payload |
+| `test_service_binpath.cpp` _(Windows-only)_ | SCM `--service` binPath quoting (#1822): `agents/core/src/service_win.hpp` `make_service_binpath` | Spaceless path; `Program Files`-style path (exe-only quoting); exact ` --service` suffix (3 cases) |
 
 ### Untested Agent Components
 
@@ -50,6 +51,8 @@ Run all tests: `meson test -C build-linux --print-errorlogs`
 | **Certificate discovery** | Windows-specific CryptoAPI | Low |
 | **Cloud identity** | Requires cloud environment | Low |
 | **Identity store** | File I/O, low logic density | Low |
+| **SCM dispatcher** (#1822, `service_win.cpp` `service_main`/`handler_ex`/`run_service`) | Requires a real SCM-launched process (`StartServiceCtrlDispatcherW`); verified via live Windows-service testing instead (install/start/stop/crash-recovery/fail-closed-exit, documented on issue #1822) — see #1840 for a proposed testable-seam extraction | Low |
+| **`win_sc_handle.hpp` `ScHandle`** (RAII SC_HANDLE, move-only) | No dedicated move-semantics unit test yet (same gap as the pre-existing local copy in `guard_service.cpp`) — see #1840 | Low |
 
 ### Untested Plugin Runtime Logic
 
