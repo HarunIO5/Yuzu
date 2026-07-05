@@ -304,9 +304,7 @@ public:
         // Initialise every reason series to 0 so the counter (and its HELP/TYPE)
         // is present in /metrics on a healthy server — otherwise absent()-style
         // alerts misfire and Grafana shows "No data" until the first failure (sre).
-        for (auto r : {NvdFailureReason::kConnection, NvdFailureReason::kHttp429,
-                       NvdFailureReason::kHttp403, NvdFailureReason::kHttpOther,
-                       NvdFailureReason::kParse}) {
+        for (auto r : kNvdCountedReasons) {
             metrics_.counter("yuzu_nvd_sync_failures_total", {{"reason", nvd_reason_label(r)}});
         }
         metrics_.describe("yuzu_server_default_certs_active",
@@ -1173,15 +1171,9 @@ public:
         if (cfg_.nvd_sync_enabled && nvd_db_->is_open()) {
             nvd_sync_ = std::make_unique<NvdSyncManager>(
                 nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy, cfg_.nvd_sync_interval,
-                cfg_.nvd_backfill_years, [this](NvdFailureReason r) {
-                    // Fires from the sync thread on a non-cancel failure (#1880).
-                    // metrics_ is thread-safe. NvdSyncManager's stopping_ guard
-                    // makes a call after ServerImpl teardown implausible (not
-                    // provably impossible — see report_failure); acceptable per
-                    // the cpp-safety/architect review, pull-model close deferred.
-                    metrics_.counter("yuzu_nvd_sync_failures_total", {{"reason", nvd_reason_label(r)}})
-                        .increment();
-                });
+                cfg_.nvd_backfill_years);
+            // Failure counts are surfaced via SyncStatus and emitted from the /metrics
+            // scrape (pull model, #1909) — no sync-thread→metrics_ callback.
             // #1867: do NOT start the background thread here. Its first action is
             // an uncancellable NVD fetch; if a LATER ctor step fails closed (e.g.
             // the Postgres substrate probe below sets startup_failed_), ~ServerImpl
@@ -4828,6 +4820,23 @@ private:
                 if (nvd_sync_) {
                     auto st = nvd_sync_->status();
                     metrics_.gauge("yuzu_nvd_backfill_complete").set(st.backfill_complete ? 1 : 0);
+                    // Pull model (#1909): the manager holds the authoritative monotonic
+                    // per-reason failure counts; emit them as yuzu_nvd_sync_failures_total by
+                    // incrementing the exported series by the delta since the last scrape
+                    // (Counter has no set()). No sync-thread→metrics_ callback → no teardown race.
+                    // The whole loop is serialized so two CONCURRENT /metrics scrapes (an HA
+                    // Prometheus pair) can't both read the same value(), compute the same delta,
+                    // and double-increment the counter (which would then stall until the real
+                    // tally re-exceeds it).
+                    std::lock_guard<std::mutex> emit_lock{nvd_metrics_scrape_mu_};
+                    for (auto r : kNvdCountedReasons) {
+                        const int i = nvd_reason_index(r);
+                        auto& c = metrics_.counter("yuzu_nvd_sync_failures_total",
+                                                   {{"reason", nvd_reason_label(r)}});
+                        const double delta = static_cast<double>(st.failure_counts[i]) - c.value();
+                        if (delta > 0)
+                            c.increment(delta);
+                    }
                 }
             }
             res.set_content(metrics_.serialize(), "text/plain; version=0.0.4; charset=utf-8");
@@ -10711,6 +10720,9 @@ private:
     // NVD CVE feed
     std::shared_ptr<NvdDatabase> nvd_db_;
     std::unique_ptr<NvdSyncManager> nvd_sync_;
+    // Serializes the /metrics emit of yuzu_nvd_sync_failures_total so two concurrent scrapes
+    // can't double-apply the same per-reason delta (#1912 review).
+    mutable std::mutex nvd_metrics_scrape_mu_;
 
     // OTA agent updates
     std::unique_ptr<UpdateRegistry> update_registry_;

@@ -3,10 +3,11 @@
 #include "nvd_client.hpp"
 #include "nvd_db.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <functional>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -16,19 +17,13 @@ namespace yuzu::server {
 
 class NvdSyncManager {
 public:
-    // Called (from the sync thread) when a sync fails for a non-cancel reason, so
-    // the owner can increment a metric (#1880). Never invoked on a shutdown-cancel.
-    using FailureCallback = std::function<void(NvdFailureReason)>;
-
     // Production: builds an NvdClient as the fetcher. backfill_years bounds how
     // far back the newest-first backfill walks (0 = full history to NVD's start).
     NvdSyncManager(std::shared_ptr<NvdDatabase> db, std::string api_key, std::string proxy_url,
-                   std::chrono::seconds sync_interval, int backfill_years = 8,
-                   FailureCallback on_failure = {});
-    // Test: inject a mock fetcher (no network) + optional failure callback.
+                   std::chrono::seconds sync_interval, int backfill_years = 8);
+    // Test: inject a mock fetcher (no network).
     NvdSyncManager(std::shared_ptr<NvdDatabase> db, std::unique_ptr<INvdFetcher> fetcher,
-                   std::chrono::seconds sync_interval, int backfill_years,
-                   FailureCallback on_failure = {});
+                   std::chrono::seconds sync_interval, int backfill_years);
     ~NvdSyncManager();
 
     NvdSyncManager(const NvdSyncManager&) = delete;
@@ -61,12 +56,15 @@ public:
         std::string last_error;
         bool backfill_complete = false;       // catalog build reached the floor
         std::string backfill_oldest_published; // ISO 8601 cursor (progress), or empty
+        // Monotonic per-reason failure counts (indexed by nvd_reason_index). The
+        // /metrics scrape reads these and emits yuzu_nvd_sync_failures_total — the
+        // pull model that replaced the cross-thread callback (#1909).
+        std::array<std::uint64_t, kNvdCountedFailureReasons> failure_counts{};
     };
     SyncStatus status() const;
 
 private:
     std::shared_ptr<NvdDatabase> db_;
-    FailureCallback on_sync_failure_; // optional; invoked on a non-cancel sync failure (#1880)
     // Set by stop() so a long backfill/freshness pass aborts between windows
     // (cooperative cancellation — #1867 fix #2). Checked in do_backfill/do_freshness.
     // DECLARED BEFORE fetcher_ on purpose: the fetcher's NvdClient borrows
@@ -104,6 +102,12 @@ private:
     // sync_active_, so no atomic is needed.
     int empty_catalog_resets_{0};
     int empty_window_confirmations_{0};
+    // Per-reason failure tally (indexed by nvd_reason_index), incremented on the sync
+    // thread in report_failure and read (relaxed-copied) into SyncStatus by status()
+    // on the scrape thread — atomic so that cross-thread read carries no data race.
+    // This is the pull model that removed the sync-thread→ServerImpl::metrics_ callback
+    // and its teardown-UAF window (#1909).
+    std::array<std::atomic<std::uint64_t>, kNvdCountedFailureReasons> failure_counts_{};
 
 #ifdef __cpp_lib_jthread
     void sync_loop(std::stop_token stop);
@@ -121,8 +125,8 @@ private:
     // and the completion comparison.
     std::chrono::system_clock::time_point
     backfill_floor(std::chrono::system_clock::time_point now) const;
-    // Log a failed window and fire on_sync_failure_ — UNLESS it was a shutdown
-    // cancel (stopping_ / kCancelled), which is not a failure (#1880/#1879).
+    // Log a failed window and tally it in failure_counts_ (the pull model, #1909) —
+    // UNLESS it was a shutdown cancel (stopping_ / kCancelled), which is not a failure.
     void report_failure(NvdFailureReason reason, const char* phase);
 };
 

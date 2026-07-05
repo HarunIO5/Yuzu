@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <ctime>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -57,7 +59,9 @@ std::string url_encode(const std::string& value) {
 
 } // namespace
 
-NvdClient::NvdClient(std::string api_key, std::string proxy_url) : api_key_(std::move(api_key)) {
+NvdClient::NvdClient(std::string api_key, std::string proxy_url, std::string base_url)
+    : api_key_(std::move(api_key)),
+      base_url_(base_url.empty() ? (std::string("https://") + kNvdHost) : std::move(base_url)) {
     // Parse proxy URL: "http://host:port" or "host:port"
     if (!proxy_url.empty()) {
         auto url = proxy_url;
@@ -157,6 +161,21 @@ const char* nvd_reason_label(NvdFailureReason reason) {
     return "none";
 }
 
+int nvd_reason_index(NvdFailureReason reason) {
+    // Dense 0..4 index, in the same order as nvd_reason_label's counted labels.
+    // kNone/kCancelled are not countable failures → -1.
+    switch (reason) {
+    case NvdFailureReason::kConnection: return 0;
+    case NvdFailureReason::kHttp429:    return 1;
+    case NvdFailureReason::kHttp403:    return 2;
+    case NvdFailureReason::kHttpOther:  return 3;
+    case NvdFailureReason::kParse:      return 4;
+    case NvdFailureReason::kNone:
+    case NvdFailureReason::kCancelled:  return -1;
+    }
+    return -1;
+}
+
 std::chrono::steady_clock::duration
 nvd_rate_limit_wait(std::optional<std::chrono::steady_clock::time_point> last,
                     std::chrono::steady_clock::time_point now,
@@ -204,7 +223,7 @@ NvdFetchResult NvdClient::fetch_paginated(const std::string& date_params) {
             return combined;
         }
 
-        httplib::Client client(std::string("https://") + kNvdHost);
+        httplib::Client client(base_url_);
         configure_client(client);
 
         std::string query = std::string(kNvdPath) + "?" + date_params +
@@ -357,21 +376,46 @@ NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
         // it as "window done" and advance its cursor past unfetched CVEs (UP-1/UP-2).
         spdlog::error("NVD JSON parse error: {}", e.what());
         result.ok = false;
+        result.reason = NvdFailureReason::kParse;
         return result;
     }
 
-    // totalResults is now integrity-load-bearing (the empty-window checks key off it), so
-    // read it defensively: a non-integer/missing value → 0 rather than a thrown type_error
-    // (#1889 review r5). value() would throw on e.g. "totalResults":"x".
-    result.total_results = doc.contains("totalResults") && doc["totalResults"].is_number_integer()
-                               ? doc["totalResults"].get<int>()
-                               : 0;
+    // totalResults is integrity-load-bearing (the empty-window contradiction guard AND
+    // pagination key off it), so validate its RANGE, not just its JSON type. is_number_integer()
+    // passes an oversized value that get<int>() then silently narrows NEGATIVE — 2147483648 ->
+    // -2147483648, 9223372036854775807 -> -1 — with NO throw. A negative total slips past the
+    // `total_results > 0` contradiction guard (false-"verifying" a stale/corrupt empty page) and
+    // breaks `start_index >= total_results` pagination (silent truncation). So read it wide and
+    // treat a present-but-out-of-range or non-integer totalResults as a parse failure, not a
+    // silent 0 (PR #1912 review — HIGH). A MISSING totalResults stays a lenient 0; a body missing
+    // the `vulnerabilities` array is caught as a parse failure below.
+    if (doc.contains("totalResults")) {
+        const auto& tr = doc["totalResults"];
+        if (!tr.is_number_integer()) {
+            spdlog::error("NVD response totalResults is not an integer — treating as a parse "
+                          "failure (won't trust the window)");
+            result.ok = false;
+            result.reason = NvdFailureReason::kParse;
+            return result;
+        }
+        const std::int64_t tr64 = tr.get<std::int64_t>();
+        if (tr64 < 0 || tr64 > std::numeric_limits<int>::max()) {
+            spdlog::error("NVD response totalResults={} out of [0, INT_MAX] — treating as a parse "
+                          "failure (won't trust the window)",
+                          tr64);
+            result.ok = false;
+            result.reason = NvdFailureReason::kParse;
+            return result;
+        }
+        result.total_results = static_cast<int>(tr64);
+    }
 
     // A well-formed NVD response always carries a "vulnerabilities" array (empty
     // for a genuinely-empty window). Its absence means an unexpected body shape —
     // treat as failure, not empty.
     if (!doc.contains("vulnerabilities") || !doc["vulnerabilities"].is_array()) {
         result.ok = false;
+        result.reason = NvdFailureReason::kParse; // malformed body → parse failure (reason parity)
         return result;
     }
 
@@ -526,6 +570,7 @@ NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
                      "(won't skip a populated window)",
                      result.total_results);
         result.ok = false;
+        result.reason = NvdFailureReason::kParse; // malformed/inconsistent body → parse failure
     }
 
     return result;

@@ -2,6 +2,7 @@
 
 #include "nvd_db.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <optional>
@@ -46,7 +47,10 @@ public:
 
 class NvdClient : public INvdFetcher {
 public:
-    explicit NvdClient(std::string api_key = {}, std::string proxy_url = {});
+    // base_url overrides the NVD API root (default https://services.nvd.nist.gov). Only
+    // used to point fetch_paginated at a local httplib::Server in tests; production passes {}.
+    explicit NvdClient(std::string api_key = {}, std::string proxy_url = {},
+                       std::string base_url = {});
 
     // Both ISO 8601; the window must be within NVD's 120-day cap (nvd_split_windows).
     NvdFetchResult fetch_by_published_window(const std::string& pub_start,
@@ -67,6 +71,7 @@ private:
     std::string api_key_;
     std::string proxy_host_;
     int proxy_port_ = 0;
+    std::string base_url_; // NVD API root; set in the ctor (prod default or a test override)
     // std::nullopt until the first request — a sentinel time_point overflowed
     // the rate-limit subtraction and slept ~forever on the first call (#1867).
     std::optional<std::chrono::steady_clock::time_point> last_request_time_;
@@ -112,5 +117,23 @@ std::chrono::seconds nvd_backoff_delay(int attempt, const std::string& retry_aft
 /// parity test so the strings can't drift). kNone/kCancelled → "none" (never
 /// counted).
 const char* nvd_reason_label(NvdFailureReason reason);
+
+/// Number of failure reasons that are COUNTED in yuzu_nvd_sync_failures_total —
+/// every reason except kNone/kCancelled (a cancel is not a failure).
+inline constexpr int kNvdCountedFailureReasons = 5;
+
+/// The counted reasons, in nvd_reason_index order — the SINGLE place the countable
+/// enumerators are listed. Iterate this (not an inline brace-list) when zero-initing
+/// or emitting the metric, so adding a 6th reason is one edit here (+ the label/index
+/// switches + the array size), never a silently-forgotten series.
+inline constexpr std::array<NvdFailureReason, kNvdCountedFailureReasons> kNvdCountedReasons = {
+    NvdFailureReason::kConnection, NvdFailureReason::kHttp429, NvdFailureReason::kHttp403,
+    NvdFailureReason::kHttpOther, NvdFailureReason::kParse};
+
+/// Dense index in [0, kNvdCountedFailureReasons) for a counted reason, or -1 for
+/// kNone/kCancelled. The order matches nvd_reason_label's counted labels. Used to
+/// accumulate per-reason failure counts on the sync manager and emit them from the
+/// /metrics scrape (the pull model that removed the cross-thread callback, #1909).
+int nvd_reason_index(NvdFailureReason reason);
 
 } // namespace yuzu::server

@@ -15,15 +15,19 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <httplib.h>
 #include <sqlite3.h>
 
+#include <atomic>
 #include <chrono>
-#include <functional>
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1094,6 +1098,37 @@ TEST_CASE("NvdClient::parse_response: totalResults>0 with empty vulnerabilities 
     REQUIRE(client.parse_response(R"({"totalResults":0,"vulnerabilities":[]})").ok); // genuinely empty
 }
 
+TEST_CASE("NvdClient::parse_response: out-of-range totalResults is a parse failure, not a silent wrap",
+          "[nvd][parse]") {
+    // PR #1912 review (HIGH): is_number_integer() checks JSON type, not C++ int range, so
+    // get<int>() SILENTLY NARROWS an oversized value NEGATIVE (no throw). A negative total would
+    // slip past the `total_results > 0` contradiction guard (false-"verifying" a stale/corrupt
+    // empty page → permanent CVE false-negatives) and break `start_index >= total_results`
+    // pagination. Every out-of-range/non-integer totalResults must be reason=kParse, ok=false.
+    NvdClient c;
+    // > INT_MAX (2^31): get<int>() wraps to INT_MIN without the range check.
+    auto big = c.parse_response(R"({"totalResults":2147483648,"vulnerabilities":[]})");
+    REQUIRE_FALSE(big.ok);
+    REQUIRE(big.reason == NvdFailureReason::kParse);
+    // INT64_MAX: wraps to -1.
+    auto huge = c.parse_response(R"({"totalResults":9223372036854775807,"vulnerabilities":[]})");
+    REQUIRE_FALSE(huge.ok);
+    REQUIRE(huge.reason == NvdFailureReason::kParse);
+    // A literal negative totalResults.
+    auto neg = c.parse_response(R"({"totalResults":-5,"vulnerabilities":[]})");
+    REQUIRE_FALSE(neg.ok);
+    REQUIRE(neg.reason == NvdFailureReason::kParse);
+    // A non-integer totalResults.
+    auto str = c.parse_response(R"({"totalResults":"1000","vulnerabilities":[]})");
+    REQUIRE_FALSE(str.ok);
+    REQUIRE(str.reason == NvdFailureReason::kParse);
+    // Exactly INT_MAX stays in range (accepted as a value; the contradiction guard then trips
+    // because records are empty — but as a parse failure, NOT a silent negative wrap).
+    auto max = c.parse_response(R"({"totalResults":2147483647,"vulnerabilities":[]})");
+    REQUIRE_FALSE(max.ok);
+    REQUIRE(max.reason == NvdFailureReason::kParse);
+}
+
 TEST_CASE("NvdDatabase::upsert_cves returns false when the DB is not open", "[nvd][db]") {
     // #1889 review r4 Blocker 1: the bool return is the signal do_backfill/do_freshness
     // use to hold the resume cursor on a persistence failure. A closed DB is the
@@ -1182,36 +1217,37 @@ TEST_CASE("nvd_backoff_delay: Retry-After honoured, else exponential with cap", 
     REQUIRE(nvd_backoff_delay(10, "") == seconds(1800)); // capped
 }
 
-TEST_CASE("NvdSyncManager: a sync failure fires the callback with its reason; cancel does not",
+TEST_CASE("NvdSyncManager: a sync failure tallies its reason in status; cancel does not",
           "[nvd][failure]") {
-    // A real failure reason reaches the callback.
+    // Pull model (#1909): report_failure increments a per-reason counter surfaced via
+    // status().failure_counts, which the /metrics scrape emits as
+    // yuzu_nvd_sync_failures_total — no cross-thread callback.
     {
         auto db = std::make_shared<NvdDatabase>(":memory:");
         auto mock = std::make_unique<MockFetcher>();
         mock->fail = true;
         mock->fail_reason = NvdFailureReason::kHttp403;
-        std::vector<NvdFailureReason> reasons;
-        NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1,
-                           [&](NvdFailureReason r) { reasons.push_back(r); });
+        NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1);
         mgr.sync_now();
-        REQUIRE(reasons.size() == 1);
-        REQUIRE(reasons[0] == NvdFailureReason::kHttp403);
+        const auto st = mgr.status();
+        REQUIRE(st.failure_counts[nvd_reason_index(NvdFailureReason::kHttp403)] == 1);
+        // Only the 403 series moved.
+        REQUIRE(st.failure_counts[nvd_reason_index(NvdFailureReason::kConnection)] == 0);
     }
-    // A cancellation is NOT a failure — the callback must not fire.
+    // A cancellation is NOT a failure — no series moves.
     {
         auto db = std::make_shared<NvdDatabase>(":memory:");
         auto mock = std::make_unique<MockFetcher>();
         mock->fail = true;
         mock->fail_reason = NvdFailureReason::kCancelled;
-        int calls = 0;
-        NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1,
-                           [&](NvdFailureReason) { ++calls; });
+        NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1);
         mgr.sync_now();
-        REQUIRE(calls == 0);
+        for (auto n : mgr.status().failure_counts)
+            REQUIRE(n == 0);
     }
 }
 
-// ── PR2c governance: reason→label parity + callback-throw safety ─────────────
+// ── PR2c: reason→label + reason→index parity (yuzu_nvd_sync_failures_total) ───
 
 TEST_CASE("nvd_reason_label maps every reason to its stable metric label", "[nvd][failure]") {
     // The SINGLE source of truth for the yuzu_nvd_sync_failures_total label set —
@@ -1225,15 +1261,90 @@ TEST_CASE("nvd_reason_label maps every reason to its stable metric label", "[nvd
     REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kCancelled)) == "none");
 }
 
-TEST_CASE("NvdSyncManager: a throwing failure callback does not kill the sync thread",
+TEST_CASE("nvd_reason_index: counted reasons are dense 0..N-1, cancel/none are -1",
           "[nvd][failure]") {
-    auto db = std::make_shared<NvdDatabase>(":memory:");
-    auto mock = std::make_unique<MockFetcher>();
-    mock->fail = true;
-    mock->fail_reason = NvdFailureReason::kConnection;
-    // report_failure must swallow a throw from the (server-provided) callback so a
-    // metrics hiccup can't std::terminate the sync thread (UP-6).
-    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1,
-                       [](NvdFailureReason) { throw std::runtime_error("metrics boom"); });
-    REQUIRE_NOTHROW(mgr.sync_now());
+    // The index must stay in lockstep with nvd_reason_label's counted order and the
+    // kNvdCountedFailureReasons-sized failure_counts array (a stale index would tally
+    // the wrong series or index out of bounds).
+    REQUIRE(nvd_reason_index(NvdFailureReason::kConnection) == 0);
+    REQUIRE(nvd_reason_index(NvdFailureReason::kHttp429) == 1);
+    REQUIRE(nvd_reason_index(NvdFailureReason::kHttp403) == 2);
+    REQUIRE(nvd_reason_index(NvdFailureReason::kHttpOther) == 3);
+    REQUIRE(nvd_reason_index(NvdFailureReason::kParse) == 4);
+    REQUIRE(nvd_reason_index(NvdFailureReason::kNone) == -1);
+    REQUIRE(nvd_reason_index(NvdFailureReason::kCancelled) == -1);
+}
+
+// ── #1879/#1880 in-fetch integration: 429 retry loop + mid-backoff cancellation ──
+// These drive the real fetch_paginated retry/backoff/cancel paths against a local
+// httplib::Server on an OS-assigned ephemeral port (no fixed port → no shared-runner
+// collision). An API key keeps the inter-request throttle at 600ms; the tests use a
+// small Retry-After so the backoff itself is short.
+
+namespace {
+// Bring up an NVD-shaped server on 127.0.0.1:<ephemeral>. handler owns the response.
+struct LocalNvdServer {
+    httplib::Server svr;
+    int port = 0;
+    std::thread th;
+    template <typename Handler>
+    explicit LocalNvdServer(Handler h) {
+        svr.Get("/rest/json/cves/2.0", std::move(h));
+        port = svr.bind_to_any_port("127.0.0.1");
+        REQUIRE(port > 0); // bind failed → fail loudly, don't spin forever below
+        th = std::thread([this] { svr.listen_after_bind(); });
+        // Bounded readiness wait (~2s) so a server that never comes up fails the test
+        // with a diagnostic instead of hanging the whole suite.
+        for (int i = 0; i < 2000 && !svr.is_running(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        REQUIRE(svr.is_running());
+    }
+    std::string url() const { return "http://127.0.0.1:" + std::to_string(port); }
+    ~LocalNvdServer() {
+        svr.stop();
+        if (th.joinable())
+            th.join();
+    }
+};
+} // namespace
+
+TEST_CASE("NvdClient::fetch_paginated: an HTTP 429 backs off and retries the same page",
+          "[nvd][http]") {
+    std::atomic<int> hits{0};
+    LocalNvdServer server([&](const httplib::Request&, httplib::Response& res) {
+        if (++hits == 1) {
+            res.status = 429;
+            res.set_header("Retry-After", "1"); // 1s backoff, then retry
+        } else {
+            res.status = 200;
+            res.set_content(R"({"totalResults":0,"vulnerabilities":[]})", "application/json");
+        }
+    });
+    NvdClient c("test-key", /*proxy=*/{}, server.url());
+    auto r = c.fetch_by_published_window("2024-01-01T00:00:00.000", "2024-01-02T00:00:00.000");
+    REQUIRE(r.ok);              // the retry after the 429 succeeded
+    REQUIRE(hits.load() == 2);  // exactly one retry — the 429 didn't fail the window
+}
+
+TEST_CASE("NvdClient::fetch_paginated: a cancel during the 429 backoff aborts promptly",
+          "[nvd][http]") {
+    LocalNvdServer server([](const httplib::Request&, httplib::Response& res) {
+        res.status = 429;
+        res.set_header("Retry-After", "5"); // a 5s backoff we intend to interrupt
+    });
+    std::atomic<bool> cancel{false};
+    NvdClient c("test-key", /*proxy=*/{}, server.url());
+    c.set_cancel_flag(&cancel);
+    std::thread canceller([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        cancel.store(true);
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = c.fetch_by_published_window("2024-01-01T00:00:00.000", "2024-01-02T00:00:00.000");
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    canceller.join();
+    REQUIRE_FALSE(r.ok);
+    REQUIRE(r.reason == NvdFailureReason::kCancelled);
+    // Woke mid-backoff (~400ms), nowhere near the full 5s Retry-After.
+    REQUIRE(elapsed < std::chrono::seconds(3));
 }

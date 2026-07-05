@@ -78,9 +78,8 @@ std::optional<std::chrono::system_clock::time_point> parse_cursor(const std::str
 
 NvdSyncManager::NvdSyncManager(std::shared_ptr<NvdDatabase> db, std::string api_key,
                                std::string proxy_url, std::chrono::seconds sync_interval,
-                               int backfill_years, FailureCallback on_failure)
-    : db_{std::move(db)}, on_sync_failure_{std::move(on_failure)}, interval_{sync_interval},
-      backfill_years_{backfill_years} {
+                               int backfill_years)
+    : db_{std::move(db)}, interval_{sync_interval}, backfill_years_{backfill_years} {
     // Build the concrete client in the body so we can wire the cancel flag before
     // erasing to INvdFetcher (#1879). &stopping_ is a stable member address; the
     // client only dereferences it during a fetch, long after construction.
@@ -91,10 +90,9 @@ NvdSyncManager::NvdSyncManager(std::shared_ptr<NvdDatabase> db, std::string api_
 
 NvdSyncManager::NvdSyncManager(std::shared_ptr<NvdDatabase> db,
                                std::unique_ptr<INvdFetcher> fetcher,
-                               std::chrono::seconds sync_interval, int backfill_years,
-                               FailureCallback on_failure)
-    : db_{std::move(db)}, on_sync_failure_{std::move(on_failure)}, fetcher_{std::move(fetcher)},
-      interval_{sync_interval}, backfill_years_{backfill_years} {}
+                               std::chrono::seconds sync_interval, int backfill_years)
+    : db_{std::move(db)}, fetcher_{std::move(fetcher)}, interval_{sync_interval},
+      backfill_years_{backfill_years} {}
 
 NvdSyncManager::~NvdSyncManager() {
     // On the detach path stop() returns false; the owner (ServerImpl::stop())
@@ -174,6 +172,11 @@ void NvdSyncManager::request_sync() {
 NvdSyncManager::SyncStatus NvdSyncManager::status() const {
     std::lock_guard<std::mutex> lock{mu_};
     SyncStatus st = status_;
+    // Snapshot the per-reason failure tallies for the /metrics scrape (pull model,
+    // #1909). Relaxed loads: each is an independent monotonic counter and the scrape
+    // only needs a recent value, not cross-counter ordering.
+    for (std::size_t i = 0; i < failure_counts_.size(); ++i)
+        st.failure_counts[i] = failure_counts_[i].load(std::memory_order_relaxed);
     // Surface backfill progress (cpp/consistency S1 + sre): the store is the
     // source of truth for completion + the newest-first cursor.
     // Completion is DERIVED (cursor vs current floor), not read from a sticky flag —
@@ -332,30 +335,20 @@ NvdSyncManager::backfill_floor(std::chrono::system_clock::time_point now) const 
 }
 
 void NvdSyncManager::report_failure(NvdFailureReason reason, const char* phase) {
-    // A shutdown cancel is not a failure — don't log it as one, don't count it, and
-    // don't invoke the callback, which reaches into owner state (server metrics_)
-    // that is freed on the leak-on-detach path. stopping_ is set before that
-    // teardown. kNone can't reach here (only set on ok==true) but is guarded too so
-    // it can never mint a spurious reason="none" series.
+    // A shutdown cancel is not a failure — don't log it as one and don't count it.
+    // kNone can't reach here (only set on ok==true) but is guarded so it can never
+    // land in the countable index range.
     if (stopping_.load() || reason == NvdFailureReason::kCancelled ||
         reason == NvdFailureReason::kNone)
         return;
-    // Fire the metrics callback FIRST, immediately after a fresh stopping_ re-check,
-    // so nothing stall-prone (the log call below) sits between the check and the
-    // cross-object metrics_ touch — that shrinks the teardown-UAF window the guard
-    // narrows to a bare preemption sliver. The durable close is the pull-model
-    // (surface counts in SyncStatus, emit at scrape) tracked in #1909.
-    if (on_sync_failure_ && !stopping_.load()) {
-        // Never let a throw from the callback escape and std::terminate the sync
-        // thread (UP-6).
-        try {
-            on_sync_failure_(reason);
-        } catch (const std::exception& e) {
-            spdlog::error("NVD failure callback threw: {}", e.what());
-        } catch (...) {
-            spdlog::error("NVD failure callback threw a non-std exception");
-        }
-    }
+    // Pull model (#1909): tally the failure on the manager itself. The /metrics scrape
+    // reads failure_counts_ via status() and emits yuzu_nvd_sync_failures_total. There
+    // is NO cross-object callback, so the sync thread never touches ServerImpl::metrics_
+    // — the teardown-UAF window the callback had is gone (the manager, even leaked on
+    // the detach path, owns this atomic for its whole lifetime).
+    const int idx = nvd_reason_index(reason);
+    if (idx >= 0)
+        failure_counts_[idx].fetch_add(1, std::memory_order_relaxed);
     spdlog::warn("NVD {} window failed (reason={}) — will retry next tick (cursor unchanged)", phase,
                  nvd_reason_label(reason));
 }

@@ -1,6 +1,7 @@
 #include "nvd_db.hpp"
 #include "migration_runner.hpp"
 #include "nvd_version.hpp"
+#include "sqlite_raii.hpp"
 
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
@@ -504,6 +505,13 @@ bool NvdDatabase::upsert_cves_impl(const std::vector<CveRecord>& records) {
         sqlite3_free(err_msg);
         return false;
     }
+    // RAII: any early return OR throw past here rolls the transaction back and finalizes the
+    // prepared statements. The dedupe below allocates (unordered_set/map + a merged vector), so
+    // a std::bad_alloc would otherwise leave the connection wedged in an open transaction AND
+    // leak the three statements (PR #1912 review; docs/cpp-conventions.md §Resource ownership,
+    // owners from sqlite_raii.hpp). Declared BEFORE the SqliteStmts so the statements finalize
+    // before this rolls back — SQLite wants live statements gone first.
+    SqliteTxn txn{db_};
 
     // ENFORCE (not just document) "at most one CveRecord per cve_id per batch":
     // upsert_cve_one does a delete-then-insert of the whole match set keyed on
@@ -511,7 +519,11 @@ bool NvdDatabase::upsert_cves_impl(const std::vector<CveRecord>& records) {
     // first's matches. Fast path (the common case, and the invariant today —
     // parse_response folds all cpeMatch nodes into ONE record): no duplicate
     // cve_id, so upsert `records` directly with zero copy. Slow path: merge the
-    // duplicates (append matches) into owned records so no rows are lost.
+    // duplicates (append matches) into owned records so no rows are lost. FIRST-HEADER-WINS:
+    // the earliest record's header fields (severity/description/published/last_modified) are
+    // kept; later duplicates contribute ONLY their matches. This only matters for a
+    // hypothetical future multi-record batch — parse_response folds each cve_id into one
+    // record today, so the merge path is unreached in practice (PR #1912 review, documented).
     std::vector<CveRecord> merged;
     const std::vector<CveRecord>* to_upsert = &records;
     {
@@ -542,35 +554,37 @@ bool NvdDatabase::upsert_cves_impl(const std::vector<CveRecord>& records) {
         }
     }
 
-    // Prepare the three upsert statements ONCE for the whole batch (#1881).
-    sqlite3_stmt* hdr = nullptr;
-    sqlite3_stmt* del = nullptr;
-    sqlite3_stmt* ins = nullptr;
-    if (!prepare_upsert_stmts(db_, hdr, del, ins)) {
-        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-        return false; // nothing persisted — caller holds its resume cursor (#1889 r4)
-    }
+    // Prepare the three upsert statements ONCE for the whole batch (#1881), RAII-owned so
+    // any throw/early-return between here and COMMIT finalizes them (PR #1912 review).
+    sqlite3_stmt* hdr_raw = nullptr;
+    sqlite3_stmt* del_raw = nullptr;
+    sqlite3_stmt* ins_raw = nullptr;
+    if (!prepare_upsert_stmts(db_, hdr_raw, del_raw, ins_raw))
+        return false; // nothing persisted — txn rolls back; caller holds its cursor (#1889 r4)
+    SqliteStmt hdr{hdr_raw};
+    SqliteStmt del{del_raw};
+    SqliteStmt ins{ins_raw};
 
     std::size_t failed = 0;
     for (const auto& record : *to_upsert) {
-        if (!upsert_cve_one(db_, record, hdr, del, ins))
+        if (!upsert_cve_one(db_, record, hdr.get(), del.get(), ins.get()))
             ++failed; // this CVE rolled back to its prior state; batch continues
     }
-
-    sqlite3_finalize(hdr);
-    sqlite3_finalize(del);
-    sqlite3_finalize(ins);
 
     if (failed > 0) {
         spdlog::warn("NvdDatabase: {}/{} CVE upserts rolled back (prior data retained)", failed,
                      to_upsert->size());
     }
 
-    if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, &err_msg) != SQLITE_OK) {
-        spdlog::error("NvdDatabase: COMMIT failed: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-        return false;
+    // Finalize the statements before COMMIT — SQLite requires no live statements at commit
+    // time (the SqliteStmt dtors would also do this, but do it explicitly pre-commit).
+    hdr.reset();
+    del.reset();
+    ins.reset();
+
+    if (txn.commit() != SQLITE_OK) {
+        spdlog::error("NvdDatabase: COMMIT failed");
+        return false; // commit failed → txn stays armed, its dtor rolls back
     }
     // Return false if the batch was not FULLY persisted — BEGIN/COMMIT failed (handled
     // above) or ANY record rolled back to its prior state (failed > 0). The caller HOLDS
