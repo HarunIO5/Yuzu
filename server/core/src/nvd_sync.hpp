@@ -3,9 +3,11 @@
 #include "nvd_client.hpp"
 #include "nvd_db.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -54,11 +56,21 @@ public:
         std::string last_error;
         bool backfill_complete = false;       // catalog build reached the floor
         std::string backfill_oldest_published; // ISO 8601 cursor (progress), or empty
+        // Monotonic per-reason failure counts (indexed by nvd_reason_index). The
+        // /metrics scrape reads these and emits yuzu_nvd_sync_failures_total — the
+        // pull model that replaced the cross-thread callback (#1909).
+        std::array<std::uint64_t, kNvdCountedFailureReasons> failure_counts{};
     };
     SyncStatus status() const;
 
 private:
     std::shared_ptr<NvdDatabase> db_;
+    // Set by stop() so a long backfill/freshness pass aborts between windows
+    // (cooperative cancellation — #1867 fix #2). Checked in do_backfill/do_freshness.
+    // DECLARED BEFORE fetcher_ on purpose: the fetcher's NvdClient borrows
+    // &stopping_ (set_cancel_flag), so the borrower (fetcher_) must destruct FIRST
+    // — members destruct in reverse declaration order (#1879 cpp-safety).
+    std::atomic<bool> stopping_{false};
     std::unique_ptr<INvdFetcher> fetcher_;
     std::chrono::seconds interval_;
     int backfill_years_;
@@ -76,9 +88,6 @@ private:
     // thread both call it on the same fetcher; running two concurrently races
     // the client's rate-limit state and doubles NVD load (#1867 governance).
     std::atomic<bool> sync_active_{false};
-    // Set by stop() so a long backfill/freshness pass aborts between windows
-    // (cooperative cancellation — #1867 fix #2). Checked in do_backfill/do_freshness.
-    std::atomic<bool> stopping_{false};
     // Set by request_sync() to make the loop run a sync at its next wake.
     bool sync_requested_{false}; // guarded by mu_
     // Set true when sync_loop() actually returns. stop() waits on this (bounded
@@ -93,6 +102,12 @@ private:
     // sync_active_, so no atomic is needed.
     int empty_catalog_resets_{0};
     int empty_window_confirmations_{0};
+    // Per-reason failure tally (indexed by nvd_reason_index), incremented on the sync
+    // thread in report_failure and read (relaxed-copied) into SyncStatus by status()
+    // on the scrape thread — atomic so that cross-thread read carries no data race.
+    // This is the pull model that removed the sync-thread→ServerImpl::metrics_ callback
+    // and its teardown-UAF window (#1909).
+    std::array<std::atomic<std::uint64_t>, kNvdCountedFailureReasons> failure_counts_{};
 
 #ifdef __cpp_lib_jthread
     void sync_loop(std::stop_token stop);
@@ -110,6 +125,9 @@ private:
     // and the completion comparison.
     std::chrono::system_clock::time_point
     backfill_floor(std::chrono::system_clock::time_point now) const;
+    // Log a failed window and tally it in failure_counts_ (the pull model, #1909) —
+    // UNLESS it was a shutdown cancel (stopping_ / kCancelled), which is not a failure.
+    void report_failure(NvdFailureReason reason, const char* phase);
 };
 
 } // namespace yuzu::server

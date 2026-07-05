@@ -4892,9 +4892,12 @@ the authoritative "initial mirror built" signal, not `last_sync_time`.
 `last_error` (string, present only while sync is enabled) surfaces the most recent
 sync-health problem and is cleared at the start of the next sync tick — a non-empty
 value is a transient, self-healing condition, not a product bug. Values you may see:
-a transient fetch failure (`NVD backfill fetch failed — retrying (mirror incomplete)`
-or `NVD freshness fetch failed — retrying` — a connection/HTTP/parse error, cleared once
-a fetch succeeds); a local persist failure (`NVD backfill window persist failed — mirror
+a transient fetch failure (`NVD backfill fetch failed (<reason>) — retrying (mirror
+incomplete)` or `NVD freshness fetch failed (<reason>) — retrying`, where `<reason>` is
+one of `connection`/`http_429`/`http_403`/`http_other`/`parse` — cleared once a fetch
+succeeds; a persistent `http_403` means a bad/revoked `--nvd-api-key`, so rotate it, and
+`http_429` is expected rate-limiting that self-heals via backoff); a local persist failure
+(`NVD backfill window persist failed — mirror
 incomplete` / `NVD freshness window persist failed` — a disk/DB issue; the mirror holds
 its cursor and stays `backfill_complete: false` rather than dropping the fetched CVEs);
 a prolonged upstream outage (`NVD returning empty responses — mirror not populated`); and

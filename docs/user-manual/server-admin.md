@@ -1028,6 +1028,8 @@ re-checks. Configuration is via CLI flags at startup (each has an env-var equiva
 > starting over. Sync progress is observable via `GET /api/nvd/status`
 > (`backfill_complete`, `backfill_oldest_published`, `total_cves`).
 
+**Rate-limit and auth-error handling:** HTTP 429 responses are backed off automatically (honouring `Retry-After`, else exponential to a 30-minute cap) and the same page is retried — expect `NVD HTTP 429 … backing off` warnings during a large backfill without an API key; this is expected, not a failure. HTTP 403 means a bad or revoked `--nvd-api-key`: it is logged distinctly and NOT retried — check/rotate the key. Both surface via `yuzu_nvd_sync_failures_total{reason=...}` (see the [metrics reference](metrics.md#nvd-cve-sync-metrics)).
+
 ---
 
 ## Retention Settings

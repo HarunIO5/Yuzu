@@ -2,6 +2,8 @@
 
 #include "nvd_db.hpp"
 
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <optional>
 #include <string>
@@ -14,6 +16,11 @@ class Client;
 
 namespace yuzu::server {
 
+// Why a fetch failed, so the caller can label the failure metric and treat a
+// config error (403) differently from a transient one (#1880). `kCancelled` is
+// a cooperative shutdown, NOT a failure — the caller must not count it (#1879).
+enum class NvdFailureReason { kNone, kConnection, kHttp429, kHttp403, kHttpOther, kParse, kCancelled };
+
 struct NvdFetchResult {
     std::vector<CveRecord> records;
     int total_results = 0;
@@ -22,6 +29,7 @@ struct NvdFetchResult {
     // failure from a genuinely-empty window so the caller doesn't treat a
     // transient error as "sync complete" and advance its cursor (#1875).
     bool ok = true;
+    NvdFailureReason reason = NvdFailureReason::kNone; // set when ok == false
 };
 
 // Fetch seam so NvdSyncManager's backfill/freshness logic is unit-testable
@@ -39,7 +47,10 @@ public:
 
 class NvdClient : public INvdFetcher {
 public:
-    explicit NvdClient(std::string api_key = {}, std::string proxy_url = {});
+    // base_url overrides the NVD API root (default https://services.nvd.nist.gov). Only
+    // used to point fetch_paginated at a local httplib::Server in tests; production passes {}.
+    explicit NvdClient(std::string api_key = {}, std::string proxy_url = {},
+                       std::string base_url = {});
 
     // Both ISO 8601; the window must be within NVD's 120-day cap (nvd_split_windows).
     NvdFetchResult fetch_by_published_window(const std::string& pub_start,
@@ -50,13 +61,21 @@ public:
     /// Parse a raw NVD API JSON response into CveRecords.
     NvdFetchResult parse_response(const std::string& json_body);
 
+    // Point the client at a cooperative-cancellation flag (owned elsewhere, e.g.
+    // NvdSyncManager::stopping_). When set true, fetch_paginated aborts between
+    // pages and during its rate-limit / backoff sleeps (#1879). Pass nullptr to
+    // clear. The pointee must outlive every fetch call.
+    void set_cancel_flag(const std::atomic<bool>* cancel) { cancel_ = cancel; }
+
 private:
     std::string api_key_;
     std::string proxy_host_;
     int proxy_port_ = 0;
+    std::string base_url_; // NVD API root; set in the ctor (prod default or a test override)
     // std::nullopt until the first request — a sentinel time_point overflowed
     // the rate-limit subtraction and slept ~forever on the first call (#1867).
     std::optional<std::chrono::steady_clock::time_point> last_request_time_;
+    const std::atomic<bool>* cancel_ = nullptr; // borrowed; see set_cancel_flag
 
     void rate_limit();
     void apply_proxy(httplib::Client& client) const;
@@ -65,6 +84,11 @@ private:
     // Paginate a query carrying the given NVD date filter (e.g.
     // "lastModStartDate=…&lastModEndDate=…" or "pubStartDate=…&pubEndDate=…").
     NvdFetchResult fetch_paginated(const std::string& date_params);
+    // True if cancellation was requested via set_cancel_flag.
+    bool cancelled() const { return cancel_ != nullptr && cancel_->load(); }
+    // Sleep for `d`, waking early if cancellation is requested. Returns false if
+    // it was cancelled (so callers abort), true if it slept the full duration.
+    bool cancellable_sleep(std::chrono::steady_clock::duration d) const;
 };
 
 /// Partition [start, end] into consecutive windows each at most `max_window`
@@ -82,5 +106,34 @@ std::chrono::steady_clock::duration
 nvd_rate_limit_wait(std::optional<std::chrono::steady_clock::time_point> last,
                     std::chrono::steady_clock::time_point now,
                     std::chrono::steady_clock::duration interval);
+
+/// How long to back off after an HTTP 429 (#1880): a numeric-seconds `Retry-After`
+/// if present (capped at 30 min), else exponential backoff by `attempt` (1-based:
+/// 30s, 60s, 120s, … capped). Pure.
+std::chrono::seconds nvd_backoff_delay(int attempt, const std::string& retry_after_hdr);
+
+/// Stable Prometheus `reason` label for a failure (the SINGLE source of truth for
+/// the yuzu_nvd_sync_failures_total label set — used by the metric wiring AND a
+/// parity test so the strings can't drift). kNone/kCancelled → "none" (never
+/// counted).
+const char* nvd_reason_label(NvdFailureReason reason);
+
+/// Number of failure reasons that are COUNTED in yuzu_nvd_sync_failures_total —
+/// every reason except kNone/kCancelled (a cancel is not a failure).
+inline constexpr int kNvdCountedFailureReasons = 5;
+
+/// The counted reasons, in nvd_reason_index order — the SINGLE place the countable
+/// enumerators are listed. Iterate this (not an inline brace-list) when zero-initing
+/// or emitting the metric, so adding a 6th reason is one edit here (+ the label/index
+/// switches + the array size), never a silently-forgotten series.
+inline constexpr std::array<NvdFailureReason, kNvdCountedFailureReasons> kNvdCountedReasons = {
+    NvdFailureReason::kConnection, NvdFailureReason::kHttp429, NvdFailureReason::kHttp403,
+    NvdFailureReason::kHttpOther, NvdFailureReason::kParse};
+
+/// Dense index in [0, kNvdCountedFailureReasons) for a counted reason, or -1 for
+/// kNone/kCancelled. The order matches nvd_reason_label's counted labels. Used to
+/// accumulate per-reason failure counts on the sync manager and emit them from the
+/// /metrics scrape (the pull model that removed the cross-thread callback, #1909).
+int nvd_reason_index(NvdFailureReason reason);
 
 } // namespace yuzu::server
