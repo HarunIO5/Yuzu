@@ -31,6 +31,7 @@
 #include "custom_properties_store.hpp"
 #include "data_export.hpp"
 #include "deployment_store.hpp"
+#include "discover_routes.hpp" // A2 discovery surface: /api/v1/discover/* (roadmap Issue 17.1)
 #include "discovery_store.hpp"
 #include "execution_event_bus.hpp"
 #include "execution_tracker.hpp"
@@ -92,6 +93,8 @@
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
+#include "schedule_routes.hpp"
+#include "schedule_runner.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
 #include "fleet_topology_store.hpp"
@@ -229,6 +232,13 @@ extern const std::string_view
 extern const std::vector<std::string>
     kBundledDefinitions;                            // build-time embed of content/definitions/
 extern const std::vector<std::string> kBundledSets; // build-time embed of content/packs/*sets*
+
+std::string trim_ascii_whitespace(std::string_view s) {
+    auto b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string_view::npos) return {};
+    auto e = s.find_last_not_of(" \t\r\n");
+    return std::string(s.substr(b, e - b + 1));
+}
 } // namespace yuzu::server
 
 namespace yuzu::server {
@@ -922,6 +932,15 @@ public:
 
         // Initialize OIDC provider if configured
         if (!cfg_.oidc_issuer.empty() && !cfg_.oidc_client_id.empty()) {
+            // #1830.1: trim leading/trailing ASCII whitespace from the
+            // admin-group config value — same trailing-space silent-lockout
+            // bug fixed for --saml-admin-group (UP-4, see below). Mutate
+            // cfg_ itself (not just the local oidc_cfg copy) so every other
+            // reader of cfg_.oidc_admin_group (the /auth/callback route's
+            // admin_gid lookup, the startup config-audit line) sees the
+            // trimmed value too.
+            cfg_.oidc_admin_group = trim_ascii_whitespace(cfg_.oidc_admin_group);
+
             oidc::OidcConfig oidc_cfg;
             oidc_cfg.issuer = cfg_.oidc_issuer;
             oidc_cfg.client_id = cfg_.oidc_client_id;
@@ -975,6 +994,33 @@ public:
         // saml_provider_ stays null on Windows — routes 404 via is_enabled() check.
 #else
         {
+            // UP-4: trim leading/trailing ASCII whitespace from the admin-group
+            // config value once, here — the single load point where cfg_ is
+            // assembled into SamlConfig. Without this, a trailing space in
+            // `--saml-admin-group "Admins "` compares raw against the parsed
+            // (whitespace-trimmed, see saml_provider.cpp get_text) assertion
+            // value and silently never matches — no admin is ever minted, with
+            // no error surfaced. group_attribute (the Name to match, not a
+            // value) is deliberately NOT trimmed here — IdP attribute names are
+            // exact-match XML identifiers, not free-text values susceptible to
+            // this class of operator typo. OIDC's admin_group is trimmed the
+            // same way, above at OIDC provider init (#1830.1).
+            cfg_.saml_admin_group = trim_ascii_whitespace(cfg_.saml_admin_group);
+
+            // sre-S3 / UP-1 / UP-9: half-configured group→role mapping grants
+            // no admin and fails silently otherwise — warn at boot so an
+            // operator who set one flag but not the other (a likely typo/
+            // partial-rollout mistake) finds out before wondering why no SAML
+            // login is ever admin. Both-set and both-empty are legitimate
+            // configurations and do NOT warn.
+            if (cfg_.saml_group_attribute.empty() != cfg_.saml_admin_group.empty()) {
+                spdlog::warn("SAML group→role mapping is half-configured "
+                             "(--saml-group-attribute=\"{}\", --saml-admin-group=\"{}\") — "
+                             "both flags must be set for any SAML login to be promoted to "
+                             "admin; as configured, no SAML session will ever grant admin.",
+                             cfg_.saml_group_attribute, cfg_.saml_admin_group);
+            }
+
             const bool saml_config_complete = !cfg_.saml_idp_sso_url.empty() &&
                                               !cfg_.saml_idp_cert.empty() &&
                                               !cfg_.saml_sp_entity_id.empty() &&
@@ -1020,14 +1066,24 @@ public:
                         saml_cfg.sp_entity_id   = cfg_.saml_sp_entity_id;
                         saml_cfg.sp_acs_url     = cfg_.saml_sp_acs_url;
                         saml_cfg.idp_cert_pem   = std::move(cert_pem);
+                        saml_cfg.group_attribute = cfg_.saml_group_attribute;
                         saml_cfg.enabled        = true;
                         // Construct in the single-threaded startup phase — xmlsec global init
                         // is not thread-safe; the std::call_once guard in saml_provider.cpp
                         // makes repeated construction safe thereafter.
                         saml_provider_ = std::make_unique<saml::SamlProvider>(std::move(saml_cfg));
                         if (saml_provider_ && saml_provider_->is_enabled()) {
-                            spdlog::info("SAML SP initialized (idp_sso_url={}, sp_entity_id={})",
-                                         cfg_.saml_idp_sso_url, cfg_.saml_sp_entity_id);
+                            // sre-S2: log the group→role flags alongside the
+                            // existing endpoint fields. Both values are
+                            // low-sensitivity (an attribute name and a group
+                            // identifier, not a secret), so logging them
+                            // outright — rather than just a configured/not
+                            // boolean — gives an operator a one-line way to
+                            // confirm the deployed config matches intent.
+                            spdlog::info("SAML SP initialized (idp_sso_url={}, sp_entity_id={}, "
+                                         "group_attribute=\"{}\", admin_group=\"{}\")",
+                                         cfg_.saml_idp_sso_url, cfg_.saml_sp_entity_id,
+                                         cfg_.saml_group_attribute, cfg_.saml_admin_group);
                         } else {
                             spdlog::error("SAML: provider constructed but is_enabled() returned "
                                           "false — SAML login disabled (fail-closed)");
@@ -1101,7 +1157,12 @@ public:
         if (cfg_.nvd_sync_enabled && nvd_db_->is_open()) {
             nvd_sync_ = std::make_unique<NvdSyncManager>(nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy,
                                                          cfg_.nvd_sync_interval);
-            nvd_sync_->start();
+            // #1867: do NOT start the background thread here. Its first action is
+            // an uncancellable NVD fetch; if a LATER ctor step fails closed (e.g.
+            // the Postgres substrate probe below sets startup_failed_), ~ServerImpl
+            // would have to join a thread wedged mid-fetch and hang the process
+            // forever, defeating any restart policy. The thread is started in run()
+            // only after every fail-closed check and the listeners are up.
         }
 
         // Initialize OTA update registry
@@ -1545,6 +1606,44 @@ public:
                 ev.detail = "instruction-definition signature enforcement disabled at startup "
                             "(--allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS) "
                             "— unsigned definitions will be accepted at import";
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+
+            // #1829 — same startup-posture audit pattern as the two rows
+            // above: an SSO admin-group mapping (--oidc-admin-group /
+            // --saml-admin-group) is a standing, security-relevant posture
+            // that a cold deployment with no logins yet would otherwise
+            // leave with zero audit evidence. Emit one row per configured
+            // flag so an auditor asking "was group X wired to admin during
+            // window Y?" can answer from the audit store. Values here are
+            // already trimmed (SAML: UP-4 above; OIDC: #1830.1 at OIDC
+            // provider init) and low-sensitivity (a group identifier, not a
+            // secret — matches the SAML admin audit-detail precedent,
+            // comp-S1/UP-5).
+            if (!cfg_.oidc_admin_group.empty() && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "config.admin_group_set";
+                ev.target_type = "AuthConfig";
+                ev.target_id = "oidc";
+                ev.detail = "provider=oidc;admin_group=" + cfg_.oidc_admin_group;
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+            if (!cfg_.saml_admin_group.empty() && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "config.admin_group_set";
+                ev.target_type = "AuthConfig";
+                ev.target_id = "saml";
+                ev.detail = "provider=saml;admin_group=" + cfg_.saml_admin_group;
                 ev.result = "success";
                 (void)audit_store_->log(ev);
             }
@@ -2656,6 +2755,14 @@ public:
             spdlog::info("Gateway upstream listening on {}", cfg_.gateway_upstream_address);
         }
 
+        // #1867: start NVD background sync only now — past every fail-closed
+        // check and with the listeners up. A construction failure returns above
+        // without ever starting the thread, so ~ServerImpl never has to join a
+        // thread wedged in an uncancellable fetch.
+        if (nvd_sync_) {
+            nvd_sync_->start();
+        }
+
         // Create AuthRoutes — must precede start_web_server which uses it
         auth_routes_ = std::make_unique<AuthRoutes>(
             cfg_, auth_mgr_, rbac_store_.get(), api_token_store_.get(), audit_store_.get(),
@@ -3061,6 +3168,15 @@ public:
         }
         preflight_runner_.reset();
 
+        // Join the schedule tick thread (borrows schedule_engine_ + the
+        // instruction/execution/approval/audit stores via schedule_runner_ —
+        // must stop before any of them are torn down), then drop the runner
+        // so its borrowed pointers can't be ticked again.
+        if (schedule_tick_thread_.joinable()) {
+            schedule_tick_thread_.join();
+        }
+        schedule_runner_.reset();
+
         // Join the result-set maintenance thread (borrows result_set_store_,
         // execution_tracker_, response_store_ — must stop before teardown)
         if (result_set_maint_thread_.joinable()) {
@@ -3075,7 +3191,14 @@ public:
         if (schedule_engine_)
             schedule_engine_->stop();
         if (nvd_sync_) {
-            nvd_sync_->stop();
+            if (!nvd_sync_->stop()) {
+                // stop() had to detach a wedged sync thread that still references
+                // the manager (client_, mu_, cv_, status_, and the NvdDatabase).
+                // LEAK the manager so the abandoned thread can't touch freed
+                // memory once it wakes — the process is exiting; the OS reclaims
+                // it. Destroying it here would be a teardown UAF (#1867).
+                (void)nvd_sync_.release();
+            }
         }
         if (analytics_store_)
             analytics_store_->stop_drain();
@@ -4737,12 +4860,14 @@ private:
             bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
             bool device_inventory_ok =
                 device_inventory_store_ && device_inventory_store_->is_open();
+            // Load-bearing for the MCP write surface + REST approvals (sre-BLOCKING-1).
+            bool approval_ok = approval_manager_ && approval_manager_->is_open();
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
                                  guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                                  offline_endpoint_ok && software_inventory_ok && app_perf_daily_ok &&
-                                 app_perf_fleet_ok && device_inventory_ok;
+                                 app_perf_fleet_ok && device_inventory_ok && approval_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4859,6 +4984,10 @@ private:
                 {"audit_store", audit_store_ && audit_store_->is_open()},
                 {"instruction_store", instruction_store_ && instruction_store_->is_open()},
                 {"api_token_store", api_token_store_ && api_token_store_->is_open()},
+                // Load-bearing for the MCP write surface + REST /api/approvals/*
+                // (governance sre-BLOCKING-1). is_open() is false after a failed
+                // consumed_at migration, so a broken approval schema fails readyz.
+                {"approval_manager", approval_manager_ && approval_manager_->is_open()},
                 {"policy_store", policy_store_ && policy_store_->is_open()},
                 {"rbac_store", rbac_store_ && rbac_store_->is_open()},
                 {"tag_store", tag_store_ && tag_store_->is_open()},
@@ -7669,47 +7798,10 @@ private:
 
         web_server_->Post("/api/schedules", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
-            if (!require_permission(req, res, "Schedule", "Write"))
-                return;
-            if (!schedule_engine_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            try {
-                auto j = nlohmann::json::parse(req.body);
-                InstructionSchedule sched;
-                sched.name = j.value("name", "");
-                sched.definition_id = j.value("definition_id", "");
-                sched.frequency_type = j.value("frequency_type", "once");
-                sched.interval_minutes = j.value("interval_minutes", 60);
-                sched.time_of_day = j.value("time_of_day", "00:00");
-                sched.day_of_week = j.value("day_of_week", 0);
-                sched.day_of_month = j.value("day_of_month", 1);
-                sched.scope_expression = j.value("scope_expression", "");
-                sched.requires_approval = j.value("requires_approval", false);
-
-                if (auto session = auth_routes_->resolve_session(req))
-                    sched.created_by = session->username;
-
-                auto result = schedule_engine_->create_schedule(sched);
-                if (!result) {
-                    res.status = 400;
-                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
-                                    "application/json");
-                    return;
-                }
-                (void)audit_log(req, "schedule.create", "success", "schedule", *result, sched.name);
-                res.set_header("HX-Trigger",
-                               R"({"showToast":{"message":"Schedule created","level":"success"}})");
-                res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
-            } catch (const std::exception& e) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
-            }
+            // Extracted to schedule_routes.cpp (H-01, #1806): the
+            // Schedule:Write + Execution:Execute gate ordering needs direct
+            // unit coverage that a bare inline lambda cannot get.
+            handle_create_schedule(*auth_routes_, schedule_engine_.get(), req, res);
         });
 
         web_server_->Delete(R"(/api/schedules/([^/]+))", [this](const httplib::Request& req,
@@ -7725,7 +7817,14 @@ private:
             }
 
             auto id = req.matches[1].str();
-            bool deleted = schedule_engine_->delete_schedule(id);
+            // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
+            // deletes only schedules the caller created, not the whole
+            // fleet's. auth_routes_->resolve_session, not require_permission's
+            // session (already consumed) — this call cannot fail auth since
+            // require_permission above already proved a valid session exists.
+            auto session = auth_routes_->resolve_session(req);
+            auto user = session ? session->username : std::string();
+            bool deleted = schedule_engine_->delete_schedule(id, user);
             if (deleted) {
                 (void)audit_log(req, "schedule.delete", "success", "schedule", id);
                 res.set_header("HX-Trigger",
@@ -7749,7 +7848,24 @@ private:
             auto id = req.matches[1].str();
             auto enabled_str = extract_json_string(req.body, "enabled");
             bool enabled = (enabled_str != "false");
-            schedule_engine_->set_enabled(id, enabled);
+            // H-01 (#1806): re-enabling arms the schedule to fire unattended
+            // through ScheduleRunner — the same fleet-wide-dispatch concern
+            // as create, so it needs the same Execution:Execute gate.
+            // Disabling only ever stops a schedule, so it stays gated on
+            // Schedule:Write alone — an operator must be able to kill a
+            // runaway schedule even without Execution:Execute.
+            if (enabled && !require_permission(req, res, "Execution", "Execute"))
+                return;
+
+            // M-01 (#1806): owner-scoped enable/disable, same as delete above.
+            auto session = auth_routes_->resolve_session(req);
+            auto user = session ? session->username : std::string();
+            bool changed = schedule_engine_->set_enabled(id, enabled, user);
+            if (changed) {
+                // L-04 (#1806): enable/disable had no audit trail at all.
+                (void)audit_log(req, enabled ? "schedule.enable" : "schedule.disable", "success",
+                                "schedule", id);
+            }
             res.set_content(nlohmann::json({{"enabled", enabled}}).dump(), "application/json");
         });
 
@@ -8655,6 +8771,61 @@ private:
                         spdlog::error("deployment prune threw ({}) — thread continuing", e.what());
                     } catch (...) {
                         spdlog::error("deployment prune threw unknown exception — continuing");
+                    }
+                }
+            }
+        });
+
+        // ScheduleRunner (#1191) — drives recurring-instruction schedules.
+        // ScheduleEngine::evaluate_due/advance_schedule had no production
+        // caller: schedules persisted and listed but never fired. Fires travel
+        // the same dispatch lambda as operator commands with tracked
+        // create-before-dispatch execution rows; approval-gated fires wait on
+        // the approvals queue (see schedule_runner.hpp). Joined BEFORE the
+        // stores in stop().
+        metrics_.describe("yuzu_schedule_fires_total",
+                          "Scheduled instruction occurrences dispatched successfully", "counter");
+        metrics_.describe("yuzu_schedule_fire_failures_total",
+                          "Scheduled occurrences skipped or failed (unknown/disabled definition, "
+                          "dispatch failure, no agents in scope, approval submit failure)",
+                          "counter");
+        metrics_.describe("yuzu_schedule_approvals_submitted_total",
+                          "Approval tickets submitted by the schedule runner for approval-gated "
+                          "occurrences",
+                          "counter");
+        metrics_.describe("yuzu_schedule_tick_errors_total",
+                          "Schedule runner tick() exceptions caught (alertable on sustained rate)",
+                          "counter");
+        schedule_runner_ = std::make_unique<ScheduleRunner>(ScheduleRunner::Deps{
+            .schedule_engine = schedule_engine_.get(),
+            .instruction_store = instruction_store_.get(),
+            .execution_tracker = execution_tracker_.get(),
+            .approval_manager = approval_manager_.get(),
+            .audit_store = audit_store_.get(),
+            .metrics = &metrics_,
+            .dispatch_fn = command_dispatch_fn,
+        });
+        schedule_tick_thread_ = std::thread([this]() {
+            spdlog::info("Schedule runner thread started (cadence=30s)");
+            while (!stop_requested_.load(std::memory_order_acquire)) {
+                for (int i = 0; i < 6 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
+                if (schedule_runner_) {
+                    // tick() touches SQLite and gRPC dispatch — either can
+                    // throw, and an exception escaping a std::thread entry
+                    // calls std::terminate, so one bad schedule must not take
+                    // the process. Catch, log, keep ticking.
+                    try {
+                        schedule_runner_->tick();
+                    } catch (const std::exception& e) {
+                        metrics_.counter("yuzu_schedule_tick_errors_total").increment();
+                        spdlog::error("schedule_runner: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        metrics_.counter("yuzu_schedule_tick_errors_total").increment();
+                        spdlog::error("schedule_runner: tick threw unknown exception — continuing");
                     }
                 }
             }
@@ -9834,6 +10005,17 @@ private:
                 return import_subordinate_chain(intermediate_pem, parent_chain_pem);
             });
 
+        // -- A2 discovery surface (roadmap Issue 17.1): /api/v1/discover/* --------
+        // Agentic-first (A1/A2, docs/agentic-first-principle.md) — RBAC permission
+        // catalog, published instruction definitions, REST route catalog (subset of
+        // the SAME OpenAPI document /api/v1/openapi.json serves), Scope DSL kinds +
+        // operators, and the plugin/action catalog observed across the fleet. No
+        // AuditFn: these are catalog/schema reads, not per-device PII — matches the
+        // GET /guaranteed-state/schemas precedent this module is modeled on.
+        discover_routes_ = std::make_unique<DiscoverRoutes>();
+        discover_routes_->register_routes(*web_server_, auth_fn, perm_fn, rbac_store_.get(),
+                                          instruction_store_.get(), &registry_);
+
         // DEX app-perf-over-time read providers (slice 2). One bundle of B1/B2
         // store seams shared by the REST endpoints and the MCP twins so both read
         // the SAME substrate. Each lambda null-checks the store at call time and
@@ -10239,7 +10421,38 @@ private:
                 &metrics_,
                 // DEX app-perf-over-time read providers (slice 2) — same bundle the
                 // REST endpoints use, so MCP and REST read the SAME B1/B2 substrate.
-                app_perf_providers);
+                app_perf_providers,
+                // #289 / Issue 13.5: the quarantine store backs the
+                // quarantine_device write tool (record + real isolate), and the
+                // tag-push closure fires the agent tag-push after set_tag exactly
+                // like the REST PUT /api/v1/tags path (D4). Same closure body as
+                // the REST registration above.
+                quarantine_store_.get(),
+                [this](const std::string& agent_id, const std::string& key) {
+                    std::string lower_key = key;
+                    std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                                   [](unsigned char c) { return std::tolower(c); });
+                    for (auto cat_key : kCategoryKeys) {
+                        if (cat_key == lower_key) {
+                            push_asset_tags_to_agent(agent_id);
+                            break;
+                        }
+                    }
+                },
+                // A2 discovery (roadmap Issue 17.1): backs the discover_plugins tool
+                // via the SAME AgentRegistry::help_json() the REST /discover/plugins
+                // route reads (discover_routes_ above).
+                &registry_,
+                // H1 (PR #1796): per-device scope gate for the device-targeted MCP
+                // write tools (set_tag / delete_tag / quarantine_device) — the SAME
+                // require_scoped_permission chokepoint the dashboard device routes
+                // and REST per-device endpoints use, so a management-group-confined
+                // operator cannot tag or isolate devices outside their groups.
+                [this](const httplib::Request& req, httplib::Response& res,
+                       const std::string& type, const std::string& op,
+                       const std::string& agent_id) -> bool {
+                    return require_scoped_permission(req, res, type, op, agent_id);
+                });
         }
 
         // -- Listen -----------------------------------------------------------
@@ -10527,6 +10740,7 @@ private:
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;
     std::unique_ptr<PreflightRunner> preflight_runner_; // borrows run+response stores
+    std::unique_ptr<ScheduleRunner> schedule_runner_;   // borrows engine + stores (#1191)
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
     std::unique_ptr<BaselineStore> baseline_store_;
     std::unique_ptr<CaStore> ca_store_;
@@ -10618,6 +10832,7 @@ private:
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
     std::unique_ptr<CaRoutes> ca_routes_; // PKI PR4: /api/v1/ca/*
+    std::unique_ptr<DiscoverRoutes> discover_routes_; // A2: /api/v1/discover/* (Issue 17.1)
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     std::unique_ptr<FleetTopologyStore> fleet_topology_store_;
@@ -10676,6 +10891,7 @@ private:
     std::thread policy_eval_thread_;
     std::thread app_perf_rollup_thread_;
     std::thread preflight_runner_thread_; // joined before stores in stop()
+    std::thread schedule_tick_thread_;    // drives ScheduleRunner (#1191); joined before stores
     std::thread result_set_maint_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)

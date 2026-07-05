@@ -253,13 +253,23 @@ public:
     /// as freshly MFA-verified.
     bool mark_session_mfa_verified(const std::string& token);
 
-    /// JIT admin elevation: set `elevated_until = now + duration` on the named
-    /// session, so its effective role is admin for the window (SOC 2 CC6.3/
-    /// CC6.6). The CALLER is responsible for the eligibility + MFA-step-up gates;
-    /// this only mutates the in-memory session. Returns the absolute expiry
-    /// `steady_clock::time_point` on success (so the route can report it),
-    /// nullopt if the session does not exist. `duration` is assumed already
-    /// clamped to the configured cap by the caller.
+    /// JIT admin elevation: set `elevated_until = min(now + duration,
+    /// session.expires_at)` on the named session, so its effective role is admin
+    /// for the window (SOC 2 CC6.3/CC6.6). The window is clamped to the
+    /// session's own absolute lifetime — an elevation can never outlive the
+    /// cookie session that carries it (residual-risk follow-up B, security
+    /// review 2026-06-30). The CALLER is responsible for the eligibility +
+    /// MFA-step-up gates; this only mutates the in-memory session. Returns the
+    /// absolute (possibly-clamped) expiry `steady_clock::time_point` on success
+    /// (so the route can report it), nullopt if the session does not exist OR
+    /// is already at/past its own `expires_at` (a dead-window guard, governance
+    /// hardening round UP-1/UP-4: a session that crosses its absolute lifetime
+    /// between validate_session and this call is REJECTED rather than granted a
+    /// zero-or-negative-length window — the session is left unmutated, so no
+    /// spurious `role.elevation.granted`/`role.elevation.expired` pair). The
+    /// caller's nullopt→401 path already covers this. `duration` is assumed
+    /// already clamped to the configured `--jit-max-elevation-secs` cap by the
+    /// caller.
     std::optional<std::chrono::steady_clock::time_point>
     elevate_session(const std::string& token, std::chrono::seconds duration);
 
@@ -274,6 +284,32 @@ public:
     /// session wipe on demote/delete (governance UP-1). Returns the number of
     /// sessions whose elevation was cleared.
     int revoke_user_elevations(const std::string& username);
+
+    /// Lazily reap a PASSIVELY-lapsed JIT elevation (residual-risk follow-up A,
+    /// security review 2026-06-30): if `token`'s session holds an elevation
+    /// whose window has elapsed (`elevated_until` set and `now >=
+    /// elevated_until`), clears it to the sentinel and returns the session's
+    /// username so the caller can emit `role.elevation.expired`. Returns
+    /// nullopt when the session does not exist, is oversized, is not elevated,
+    /// or its elevation is still live — including when `elevated_until` is
+    /// already the sentinel (never-elevated OR already reaped OR manually
+    /// revoked via `revoke_elevation`/`revoke_user_elevations`, both of which
+    /// also clear to the sentinel — so a manual step-down never ALSO reports a
+    /// passive expiry). Clearing on the FIRST observing call makes emission
+    /// exactly-once: a second call on the same lapsed window returns nullopt.
+    /// Called from `AuthRoutes::resolve_session` (the cookie chokepoint) on
+    /// every authenticated request — there is no background reaper thread.
+    std::optional<std::string> reap_expired_elevation(const std::string& token);
+
+    /// TEST-ONLY: push `token`'s absolute `expires_at` backward by `offset`
+    /// (a positive offset moves it into the past) without sleeping. Governance
+    /// hardening round — exercises `elevate_session`'s dead-window guard
+    /// (UP-1/UP-4: a session already at/past its own lifetime must be
+    /// REJECTED, not granted a zero-or-negative-length elevation). Mirrors
+    /// `AgentRegistry::expire_trusted_gateway_for_test`. Production code MUST
+    /// NOT call this — no caller in `server/core/src/**` references it. A
+    /// no-op if `token` is not a live session.
+    void expire_session_for_test(const std::string& token, std::chrono::seconds offset);
 
     /// Look up a session by cookie token.
     std::optional<Session> validate_session(const std::string& token) const;
@@ -395,11 +431,16 @@ public:
                                     std::chrono::steady_clock::time_point mfa_verified_at = {});
 
     /// Create an ephemeral session for a verified SAML assertion's NameID.
-    /// Thin slice: role defaults to `user` — no group→role mapping (deferred).
+    /// Role: admin if `groups` contains `admin_group` (exact match), user
+    /// otherwise — mirrors create_oidc_session's admin_group_id guard exactly.
+    /// Both `groups` and `admin_group` default-empty, so an unconfigured
+    /// deployment still mints `user` unconditionally (thin-slice-compatible).
     /// The session's `auth_source` is `"saml"`. `last_activity_at` is stamped
     /// per the standing invariant: any new session-creation site MUST stamp it
     /// or the idle-eviction gate will instantly expire the session (auth.hpp §78).
-    std::string create_saml_session(const std::string& name_id);
+    std::string create_saml_session(const std::string& name_id,
+                                    const std::vector<std::string>& groups = {},
+                                    const std::string& admin_group = {});
 
     const std::filesystem::path& config_path() const { return cfg_path_; }
 
@@ -580,6 +621,18 @@ std::filesystem::path default_cert_dir();
 
 std::string role_to_string(Role r);
 Role string_to_role(const std::string& s);
+
+/// Shared group→role resolution for federated (OIDC/SAML) session creation.
+/// Security-load-bearing: defaults to `Role::user`; promotes to `Role::admin`
+/// ONLY on an EXACT match between `admin_group` and one entry of `groups`.
+/// Never matches on NameID/email/display_name — those are attacker-controlled
+/// values that ride in the same assertion/claims. `admin_group` empty ⇒
+/// always `Role::user` (unconfigured deployment stays thin-slice-compatible).
+/// Extracted from create_oidc_session's original guard (byte-equivalent
+/// behaviour) and reused verbatim by create_saml_session — do not change
+/// this function's semantics without security-guardian review.
+Role resolve_role_from_groups(const std::vector<std::string>& groups,
+                              const std::string& admin_group);
 
 std::string pending_status_to_string(PendingStatus s);
 

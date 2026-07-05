@@ -9,10 +9,41 @@ cadences.
 
 ## What is collected
 
-- **Machine-wide installed software**: name, version, publisher, install date.
-  Collected by the existing `installed_apps` plugin via its `list` action
-  (Windows: `HKLM` + the agent service account's own `HKCU`; Linux:
-  `dpkg`/`rpm`/`pacman`; macOS: `system_profiler`).
+- **Machine-wide installed software** (blob contract v2): name, version,
+  publisher, install date, plus the package-manager fields below. Collected by
+  the `installed_apps` plugin via its `list_inventory` action (Windows: `HKLM` +
+  the agent service account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`;
+  macOS: `system_profiler`). The operator-facing `list` action keeps its
+  original 4-column output — automation built on it is unaffected.
+- **The honest-empty contract:** a field the ecosystem does not store is the
+  empty string, **never synthesised** (no `-` placeholders, no guessed `0`
+  epoch). Per-ecosystem availability:
+
+  | Field | rpm | deb | apk | pacman | Windows | macOS |
+  |---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | — |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — |
+
+  Notes: rpm `signature_status` reflects the **stored** signature header tags in
+  the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
+  verification. `distro_id`/`distro_version` are host-level (`/etc/os-release`
+  `ID`/`VERSION_ID`), stamped on every Linux row. deb rows include **held**
+  packages (they are installed). `homebrew` is a reserved `ecosystem` value —
+  not collected yet (brew is per-user; the sync is machine-scope).
+- **Changes for rpm fleets vs the v1 (4-field) contract:** `publisher` is now
+  the rpm **PACKAGER** tag (was VENDOR), and `version` is the upstream version
+  only — the release moved to its own `release` column (was fused
+  `VERSION-RELEASE`). Fleet-wide version rollups on Linux change shape
+  accordingly on the first post-upgrade sync.
 - **No end-user profiles / personal data.** We do **not** use the plugin's
   per-user enumeration (`list_per_user`), so no logged-in-user profiles and no
   usernames are collected — no end-user PII. (The only `HKCU` read is the agent's
@@ -47,10 +78,12 @@ cadences.
 
 The data lands in the Postgres schema **`software_inventory_store`**:
 
-- `installed_software(agent_id, name, version, publisher, install_date)` — one
-  row per installed package per device. `version`, `publisher`, and
-  `install_date` may be empty (`''`) — the `installed_apps` plugin does not
-  guarantee them on every platform/package.
+- `installed_software(agent_id, name, version, publisher, install_date, kind,
+  ecosystem, epoch, release, arch, signature_status, distro_id, distro_version)`
+  — one row per installed package per device. Every column except `agent_id`
+  and `name` may be empty (`''`) per the honest-empty contract above; rows
+  synced by a pre-v2 agent carry `''` in all eight v2 columns until that
+  agent's next full resend.
 - `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` — per
   device sync bookkeeping. `first_seen`/`last_seen` are **server receipt times**
   (epoch seconds, stamped when the report is ingested), **not** the agent-supplied
@@ -71,6 +104,19 @@ SELECT name, version, publisher, install_date
 FROM software_inventory_store.installed_software
 WHERE agent_id = '<agent-id>'
 ORDER BY name;
+
+-- Full EVR + provenance for one package across the fleet (rpm/deb hosts)
+SELECT agent_id, ecosystem, epoch, version, release, arch,
+       signature_status, distro_id, distro_version
+FROM software_inventory_store.installed_software
+WHERE name = 'openssl'
+ORDER BY agent_id;
+
+-- Unsigned rpm packages anywhere in the fleet
+SELECT agent_id, name, version, release
+FROM software_inventory_store.installed_software
+WHERE ecosystem = 'rpm' AND signature_status = 'unsigned'
+ORDER BY agent_id, name;
 ```
 
 **Counting the *active* fleet (excluding decommissioned devices).** A device's
@@ -142,7 +188,10 @@ curl -H "Authorization: Bearer $TOKEN" \
   `name` and `agent_id` for a fleet-wide scan.
 - Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, ...},
   "meta": {"api_version": "v1"}}`. Each row is
-  `{agent_id, name, version, publisher, install_date}`.
+  `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
+  release, arch, signature_status, distro_id, distro_version}` — the v2 fields
+  are `""` where the ecosystem does not store them (see the availability matrix
+  above). The MCP tool's rows carry the identical field set.
 - **Carries the same per-agent management-group drop filter as the MCP tool**
   (out-of-scope devices dropped, omission audited, `devices_omitted` reports the
   count) — and the same **ADR-0017 caveat: not yet verified effective** under the
@@ -265,6 +314,18 @@ immediately on a device, **restart the Yuzu agent** there — the first sync aft
 restart sends a full list. Note that app *counts* can rise slightly after the
 fix: names that previously collapsed to the same `?`-mangled string (e.g. two
 different non-ASCII apps) now separate into distinct rows.
+
+**A `need_full` spike right after deploying the blob-v2 release is expected.**
+The v2 contract reformats the canonical content hash (12 fields instead of 4),
+so every agent's first post-upgrade report mismatches its stored v1 hash and the
+server nacks `need_full` — one full resend per agent, phase-spread across the
+~24 h sync window, then hash-skip resumes. Watch
+`yuzu_inventory_ingest_total{outcome="need_full"}` fall back to baseline within
+a day. During a mixed-version window the loop is bounded, not broken: an **old
+agent against a new server** (or a new agent against an old server) settles into
+roughly one hash-only nack plus one full resend per day — data stays correct,
+and it ends when the lagging side upgrades. Deploy **server first, then agents**
+(the platform's normal order).
 
 **Observability.** The server emits `yuzu_inventory_ingest_total{source,outcome}`
 (outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped` / `rejected`,

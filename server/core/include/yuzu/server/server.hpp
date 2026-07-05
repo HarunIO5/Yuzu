@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server::auth {
@@ -67,6 +68,22 @@ struct Config {
     // elevation is in-memory per-session and auto-reverts on lapse. Default
     // 3600 (1h). Wired via --jit-max-elevation-secs / YUZU_JIT_MAX_ELEVATION_SECS.
     int jit_max_elevation_secs{3600};
+
+    // JIT elevation via OIDC IdP-MFA assertion (security review
+    // docs/security-reviews/jit-elevation-2026-06-30.md follow-up). When true
+    // (default), an OIDC session whose IdP login attested MFA via the `amr`
+    // claim (a seeded `Session::mfa_verified_at`, set at /auth/callback via
+    // amr_asserts_mfa) satisfies the mandatory-second-factor requirement at
+    // POST /api/v1/elevate WITHOUT local TOTP enrollment — the existing
+    // step-up freshness check still applies. A no-amr (single-factor) OIDC
+    // session is still hard-denied regardless of this flag. Set false to
+    // disable the OIDC-amr path entirely: OIDC sessions then cannot use JIT
+    // elevation at all (an OIDC session can't present a local TOTP step-up —
+    // its step-up is re-SSO), so an operator must elevate from a local session
+    // with local TOTP — an escape hatch for shops that want an elevation factor
+    // distinct from SSO. Wired via --jit-oidc-amr-elevation /
+    // YUZU_JIT_OIDC_AMR_ELEVATION.
+    bool jit_oidc_amr_elevation{true};
 
     // Operator dashboard idle (inactivity) session timeout — SOC 2 CC6.3.
     // Seconds of inactivity after which a cookie session is invalidated
@@ -166,6 +183,8 @@ struct Config {
     std::string saml_idp_cert;      // Filesystem path to IdP signing cert PEM (pinned key)
     std::string saml_sp_entity_id;  // SP entityID (used as AudienceRestriction)
     std::string saml_sp_acs_url;    // SP Assertion Consumer Service URL (POST binding)
+    std::string saml_group_attribute; // <Attribute Name="..."> carrying group values
+    std::string saml_admin_group;     // Group value (from saml_group_attribute) that maps to admin
 
     // Response persistence
     int response_retention_days{90};
@@ -280,6 +299,14 @@ struct Config {
     /// `--allow-unsigned-packs`.
     bool allow_unsigned_definitions{false};
 };
+
+/// Trim leading/trailing ASCII whitespace (space/tab/CR/LF). Used to
+/// normalize operator-supplied config values that are compared for EXACT
+/// string equality against IdP-attested data — a trailing space from a
+/// copy-pasted CLI arg would otherwise silently and permanently prevent any
+/// match (currently: SamlConfig's admin-group flag, UP-4). Pure/free so it is
+/// directly unit-testable without constructing a Server.
+std::string trim_ascii_whitespace(std::string_view s);
 
 /**
  * Server manages inbound agent connections and exposes a management gRPC API.

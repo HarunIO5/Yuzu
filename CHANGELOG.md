@@ -7,8 +7,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Do not add entries to this section directly** — including you, AI coding
+> agent reading this. Unreleased changes are recorded as one-file-per-change
+> fragments under [`changelog.d/`](changelog.d/README.md) and assembled here at
+> release time by `scripts/assemble-changelog.py` (direct edits fail the
+> `Changelog fragments` CI check). Entries below predate the fragment
+> convention and will be promoted normally at the next release.
+
 ### Added
 
+- **Recurring instruction schedules now actually fire (#1191).** `ScheduleEngine::evaluate_due`/`advance_schedule` had no production caller — schedules persisted and listed but never dispatched. A new `ScheduleRunner` poller (the `PolicyEvaluator`/`PreflightRunner` shape, 30s tick, joined before the stores) closes the gap: due schedules fire through the same tracked dispatch path as operator-initiated commands, the approval gate is never bypassed (`requires_approval` OR definition `approval_mode != "auto"`, one ticket per occurrence, one-approval == one-run via the occurrence anchor), and every outcome is audited (`instruction.schedule_fired`, `instruction.approval_required`) and counted (`yuzu_schedule_{fires,fire_failures,approvals_submitted,tick_errors}_total`). Hardened against adversarial review before merge: `POST /api/schedules` requires BOTH `Schedule:Write` and `Execution:Execute` — a created schedule is a fleet-wide command-dispatch primitive with no further permission check at fire time — and re-enabling a disabled schedule requires `Execution:Execute` too (disabling never does, so a runaway schedule can always be stopped); delete and enable/disable are owner-scoped (`created_by`); one approval ticket is now scoped to the single schedule occurrence that requested it (`approvals.schedule_id`), so two schedules sharing the same (creator, definition, scope) can no longer settle on each other's ticket.
+- **MCP agentic write surface + approval tickets (#289, R2).** Five MCP write tools
+  are now dispatched: `set_tag`, `delete_tag`, `approve_request`, `reject_request`,
+  and `quarantine_device` (records the quarantine and dispatches live isolation).
+  Approval-gated tools use a ticket-then-recall flow: the first call returns
+  `kApprovalRequired` (-32006) with `approval_id` + `status_url`; after a second
+  principal approves, the caller re-invokes with the `approval_id` and the ticket is
+  consumed exactly once (args-bound, replay-rejected). Approval ids are CSPRNG-drawn;
+  the mint is deduplicated so a token cannot flood the shared pending-approval queue.
+  Review-round hardening (PR #1796): `quarantine_device` is `Security:Execute` on BOTH
+  transports and the supervised approval-policy rule moved with it — closing a mismatch
+  that let a supervised token quarantine via REST `POST /api/v1/quarantine` with no
+  approval (the REST POST/DELETE routes now mirror-deny, #520); the three
+  device-targeted write tools (`set_tag`/`delete_tag`/`quarantine_device`) authorize
+  through the per-device management-group scope gate (`require_scoped_permission`), so
+  a group-confined operator cannot tag or isolate out-of-scope devices;
+  approved-but-unconsumed tickets expire after 7 days (a forgotten approval is no
+  longer a forever-valid capability); the approvals store records `consumed_by`
+  (SOC 2 CC7.2 evidence chain: submitted_by → reviewed_by → consumed_by); and the
+  device-targeted ticket-mint audit rows carry `agent_id=` so SIEM can filter pending
+  isolation requests by endpoint.
+- **A2 discovery surface (Issue 17.1, #1794).** `GET /api/v1/discover/{permissions,
+  instructions,routes,scope-kinds,plugins}` plus five mirrored read-only MCP tools let
+  an agentic worker enumerate RBAC permissions, instruction schemas, REST routes,
+  scope-DSL kinds, and plugin actions from the live server (ETag + 304, A4-shaped
+  degraded paths). REST and MCP share one builder per catalog (cannot drift).
+- **Agentic-worker self-orientation (R2 follow-up).** `discover_plugins` (REST + MCP,
+  now catalog `version: 2`) enriches each action with its `parameter_schema` inline
+  when the action has a published InstructionDefinition (joined on plugin+action), and
+  reports `actions_enriched_with_schema` — so a worker learns *how* to call an action,
+  not just that it exists, from one request. The `execute_instruction` and
+  `discover_plugins` tool descriptions now spell out the async dispatch→poll pattern and
+  point at the `yuzu://operating-model` resource. Measured effect: an LLM operator
+  driving the fleet with no hand-fed action list made zero blind parameter guesses.
+- **A4 error-envelope completion (R2).** `GET /api/v1/approvals/{id}` (the approval
+  `status_url` target); the `auth_routes` denial shapes are unified into one A4
+  envelope carrying `correlation_id` and the missing `securable_type:operation`; the
+  ~156 legacy `error_json` sites in `rest_api_v1.cpp` now emit the A4 envelope.
+  **Breaking —** many of those `/api/v1` errors were previously `{"error":"<string>"}`
+  and are now the nested A4 object `{"error":{"code","message","correlation_id",…}}`;
+  a client that read `error` as a string will break. Migrate to `error.code`/
+  `error.message`. See `docs/user-manual/upgrading.md`.
+- **Installed-software inventory gains package-manager fields (blob contract v2, ADR-0016).**
+  Every row in `GET /api/v1/inventory/software` and the `query_installed_software` MCP tool
+  now carries `kind` (package|app), `ecosystem` (rpm|deb|apk|pacman|windows|macos|homebrew),
+  `epoch`, `release`, `arch`, `signature_status` (rpm only, from stored rpm header tags —
+  never a live `rpm -K` verification), `distro_id`, and `distro_version`, alongside the
+  original name/version/publisher/install_date. A field the ecosystem does not store is
+  `""`, never synthesised — see `docs/user-manual/inventory.md` for the full per-ecosystem
+  matrix. Collection is a new `installed_apps` plugin action, `list_inventory`; the
+  operator-facing `list`/`query`/`list_per_user` actions are unchanged. New `apk`
+  (Alpine) package enumeration on the sync path. **Breaking — data shift on Linux
+  rpm fleets:** `publisher` now reflects the rpm PACKAGER tag (was VENDOR), and `version`
+  is upstream-only with the release moved to its own column (was fused
+  `VERSION-RELEASE`). A saved query/dashboard filter against the old `publisher` or
+  fused `version` shape on rpm hosts will silently stop matching post-upgrade — see
+  `docs/user-manual/inventory.md` before relying on either field in existing
+  automation. No wire-protocol or gateway change (the fields ride inside the
+  existing opaque sync blob). **Upgrade note:** deploy the server before agents; each
+  agent's first post-upgrade sync triggers one expected full resend (`need_full`),
+  phase-spread across the daily sync window, self-healing.
+- **JIT elevation: OIDC amr-asserted MFA satisfies the second-factor
+  requirement.** An OIDC operator can now activate `POST /api/v1/elevate`
+  when their SSO session was authenticated with IdP MFA — asserted via the
+  OIDC `amr` claim and seeded into `Session::mfa_verified_at` at
+  `/auth/callback` (the same mechanism OIDC login step-up already used).
+  Closes the v1 limitation tracked in
+  `docs/security-reviews/jit-elevation-2026-06-30.md`. Eligibility and MFA
+  status are both keyed on a `users` table row, which OIDC login does not
+  create — a federated-only identity needs one provisioned first (e.g.
+  `POST /api/v1/users`). The mandatory-MFA gate branches EXPLICITLY on
+  identity source: an OIDC session's only acceptable factor is a **seeded**
+  proof (`mfa_verified_at != epoch`, never merely `auth_source == "oidc"`,
+  security-F1) with the toggle on, and it can **never** fall through to a
+  local namesake account's TOTP enrollment (a hardening-round fix — the first
+  cut's single-flag guard allowed exactly that fallthrough, mislabeling the
+  audit trail). A single-factor (no-`amr`) SSO session is hard-denied with
+  its own distinct reason; a stale seeded proof still falls through to the
+  existing step-up freshness challenge rather than a silent grant. New toggle
+  `--jit-oidc-amr-elevation` / `YUZU_JIT_OIDC_AMR_ELEVATION` (default true;
+  `--no-jit-oidc-amr-elevation` disables JIT elevation for OIDC sessions
+  entirely — they cannot fall back to a local TOTP step-up, since their
+  step-up challenge is re-SSO, not a TOTP code). A one-time INFO log line
+  announces the posture at boot when OIDC is configured. The
+  `role.elevation.granted` audit detail records the factor source
+  (`duration_secs=<n> mfa=<oidc_amr|local_totp> expires_at=<rfc3339> justification=<text>`
+  — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the
+  free-text `justification=` field so a crafted justification can't forge either).
+- **JIT admin elevation follow-ups: passive-lapse audit + absolute `expires_at` (SOC 2
+  CC6.3/CC6.6).** Closes the two residual risks tracked in
+  `docs/security-reviews/jit-elevation-2026-06-30.md`. (A) A JIT elevation window that
+  lapses PASSIVELY (no manual `POST /api/v1/elevate/revoke`) is now audited as
+  `role.elevation.expired` — emitted LAZILY (no new background thread) by
+  `AuthManager::reap_expired_elevation`, called from the `AuthRoutes::resolve_session`
+  cookie chokepoint on the operator's first authenticated request after the window
+  elapses; exactly-once, and a manual revoke never also produces a spurious `expired`
+  row. (B) `POST /api/v1/elevate`'s window is now clamped to the session's own absolute
+  expiry (`AuthManager::elevate_session`), so an elevation can never outlive its cookie
+  session; the response reports the TRUE remaining time as `expires_in` plus a new
+  wall-clock `expires_at` (RFC3339 UTC), and the `role.elevation.granted` audit detail
+  carries `expires_at` too.
 - **SAML 2.0 SP — thin first slice.** SP-initiated login against a single, statically-pinned IdP.
   HTTP-Redirect binding for the `AuthnRequest`; HTTP-POST binding at the Assertion Consumer Service
   (`POST /saml/acs`). Assertion signature is validated against the pinned IdP cert (in-document
@@ -99,116 +207,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent returns `error|unknown action: purge_source` (it does not crash), but because dispatch is
   fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome with a fresh Scan.
 
-### Security
+### Fixed
 
-- **SSO IdP-group→RBAC provisioning is now source-aware and reconciled (#1832, HIGH).** Fixes two
-  bugs in the OIDC `/auth/callback` group sync: a **confused-deputy** (a locally-created RBAC group
-  and a same-named IdP group were the same `groups` row, so an operator-created local group named
-  e.g. `admins` silently inherited any role granted to an IdP group also asserting `admins`, and vice
-  versa) and a **deprovisioning bypass** (group memberships were only ever added, never removed, so
-  a user dropped from an IdP group kept every role that group granted indefinitely). Fix: IdP
-  memberships are now written under a **namespaced** group name (`entra:<group-id>`, via
-  `RbacStore::namespaced_group_name`) through a new transactional `RbacStore::reconcile_idp_memberships`
-  that both upserts the asserted set and deletes any of the user's `entra:`-owned memberships not
-  re-asserted this login — so IdP-side removal takes effect on the next SSO login. A
-  `source='local'` group create is rejected if its name collides with a reserved IdP prefix
-  (`local:`/`entra:`/`saml:`/`ad:`). The callback is **fail-closed**: an over-cap assertion
-  (`>200` groups) or a reconcile-store failure denies the login outright (no session minted) rather
-  than falling through to a session with stale/unreconciled roles. New audit action
-  `auth.sso_group_provision` (result=ok/skipped/error) and metric
-  `yuzu_auth_sso_group_provision_total{source,result}`. **Upgrade note:** operators who assigned an
-  RBAC role to the old raw-gid OIDC group must re-assign it to the namespaced `entra:<group-id>`
-  group — see `docs/user-manual/authentication.md` "RBAC Group Provisioning". SAML group sync is
-  out of scope here (dropped in #1827; will ride this same reconcile path once #1826 merges).
-- **#1832 hardening round — Entra group-overage no longer silently mass-deprovisions SSO users
-  (HIGH).** A user in more than ~200 Entra groups gets no `groups` claim at all — Entra replaces it
-  with a `_claim_names`/`_claim_sources` indirection pointer — and the original #1832 reconcile read
-  that as "this user is in zero groups", deleting every one of their existing IdP-sourced RBAC
-  memberships on their next login. `OidcProvider::parse_id_token` now sets
-  `groups_claim_present`/`groups_overage` on the parsed claims; `/auth/callback` calls
-  `reconcile_idp_memberships` only when the new `groups_claim_reconcilable(claims)` gate passes, and
-  otherwise **skips reconciliation entirely** — existing memberships are left untouched and the login
-  still proceeds (fail-open on membership, never on authentication). New audit result
-  `auth.sso_group_provision` `result=skipped` (`reason=groups_overage|groups_absent`). Also in this
-  round: `reconcile_idp_memberships` now verifies a namespaced group row's `source` before joining a
-  membership to it, so a pre-existing differently-sourced row occupying the same namespaced name (a
-  legacy local group literally named `entra:<gid>`, predating the reserved-prefix guard) can no longer
-  be silently joined and leak its roles; rejects `source=="local"`/empty outright (the stale-membership
-  DELETE is only safe for a real IdP source); drops blank/oversized asserted `external_id` entries
-  instead of seeding a garbage group; and now returns `{added, removed}` membership counts so a no-op
-  reconcile (the common steady-state login) writes no `auth.sso_group_provision` row at all, while a
-  denied login (over-cap or store failure) also emits the shared `auth.oidc_login_failed` audit +
-  analytics event so SIEM queries on that action don't miss a provisioning denial. See
-  `docs/auth-architecture.md` "RBAC group provisioning (#1832)".
-- **OIDC session principal is now keyed on the stable `iss`+`sub`, not the mutable display
-  name (#1837, HIGH).** `create_oidc_session`'s authorization principal (`Session::username`,
-  the value `check_permission`/`reconcile_idp_memberships`/audit rows key on) was previously
-  `claims.name` (falling back to `claims.email`) — an IdP-editable, non-unique label. Two SSO
-  users with the same display name collided onto one principal, and #1832's reconcile made
-  that collision destructive (one user's login could delete the other's group memberships and
-  silently inherit their roles). The stable principal is now `"oidc:" + iss + "#" + sub`
-  (`sub` is only guaranteed unique per-issuer per RFC 7519, hence the `iss` scoping); the
-  mutable display name moves to a new `Session::display_name` field, used for UI/audit-detail
-  rendering only; every SSO audit row also carries the sanitized human name in its `detail`
-  string, so a principal's name is recoverable from the audit log without a live session
-  (there is no persistent principal→name directory — that is tracked as a fast-follow, #1852).
-  Every nav-bar "who am I" render site (`/api/me`,
-  `/api/v1/me`, and the ten dashboard-page `nav-user`/`context-user` JS blocks) now shows
-  `display_name`, falling back to the stable id. SAML session-keying is unchanged this slice
-  (still the raw NameID) — SAML doesn't sync to `rbac_store` yet, so its principal risk is
-  dormant; tracked as a fast-follow. See `docs/auth-architecture.md` "Stable principal vs.
-  display name".
-
-### Breaking Changes
-
-- **OIDC group→RBAC role assignments must be re-pointed at the namespaced group name.** #1832
-  changed how IdP-asserted groups are stored — an asserted Entra group `8f3c...` is now the RBAC
-  group `entra:8f3c...`, not the raw id. Any role you previously delegated directly to the raw-gid
-  group does **not** automatically move to the namespaced one; re-assign it to `entra:<group-id>`
-  (the old raw-id row is left in place, harmless but unreachable by future logins). See
-  `docs/user-manual/authentication.md` "RBAC Group Provisioning".
-- **SSO operators re-login to regain group roles (#1837).** OIDC sessions now key on
-  `oidc:<iss>#<sub>` instead of the display name (see the Security entry above). `RbacStore`
-  migration v3 purges every IdP-sourced `group_members` row on upgrade (old display-name-keyed
-  memberships are unreachable and would otherwise be a resurrected confused-deputy risk if a
-  local user later took that display name) — they re-populate under the new stable key on each
-  SSO user's next login. **Release note:** between the v3 migration and a user's first re-login,
-  an operator whose admin role comes *only* from SSO group membership is roleless — recover via
-  a fresh SSO login (repopulates the membership), `--oidc-admin-group` (grants admin directly on
-  next login without needing the group reconcile), or a local admin / the break-glass account.
-- **OIDC JIT admin elevation is temporarily unavailable for SSO operators (#1837).** Pending
-  durable SSO identity provisioning (**issue #1852**). `AuthDB::set_elevation_eligible`/
-  `is_elevation_eligible` key on `users.username` and are gated through `is_valid_username`
-  (alphanumerics + `. _ -` only); the stable `oidc:<iss>#<sub>` principal fails that check
-  unconditionally. More fundamentally, an OIDC login provisions **no `users` row at all** — there
-  is no local record to set the flag on, widened validator or not. An admin **cannot** restore
-  this today by "re-providing eligibility against the stable id"; that path does not exist until
-  #1852 lands.
-  **This is not a regression of a previously-supported flow.** Before #1837, SSO elevation only
-  ever appeared to work by accident: it required the IdP-asserted display name to *coincidentally
-  equal* an existing local username, at which point the SSO session's (then-unstable, display-name-
-  keyed) principal silently **borrowed that local principal's `elevation_eligible` flag and TOTP
-  enrollment** — a latent cross-principal grant with no cryptographic binding between the SSO
-  identity and the local account it happened to name-collide with; a namesake local user's admin
-  elevation was reachable by anyone the IdP would authenticate under that same name. #1837 severs
-  that borrowing as a direct consequence of closing the collision it rode on. #1852 (a durable,
-  first-class identity record for SSO principals) is the real restoration path; this release does
-  not include it.
-  Session-revocation-by-username for an SSO operator is **not** structurally blocked the way
-  elevation is: the operationally-critical kill step
-  (`AuthManager::invalidate_user_sessions`'s in-memory sweep, keyed by plain string equality)
-  carries no `is_valid_username` gate and revokes any principal string, `oidc:<iss>#<sub>`
-  included — there is no missing-`users`-row problem here. `DELETE /api/v1/sessions?username=`'s
-  own query-param check does still run `is_valid_username` at the REST layer, so an admin typing
-  the literal `oidc:<iss>#<sub>` string into that endpoint still gets a 400 today — but that
-  charset-only validator predates #1837 and would already have rejected most OIDC
-  display-name-keyed usernames (spaces, `@`) before this change too, so it is a narrow,
-  pre-existing, easily-widened validator gap, not a new #1837 regression and not gated on #1852.
-  Separately, the `auth.db`-persisted half of revocation
-  (`AuthDB::invalidate_all_sessions`'s `DELETE FROM sessions`, which reports `db_persisted=false`
-  for an SSO target) was **already** a no-op for OIDC before #1837 too, because
-  `AuthDB::create_session` has never been called for an OIDC login (SSO sessions have always been
-  in-memory-only, never written to `auth.db`'s `sessions` table).
+- **`POST /api/v1/tokens` now honors `mcp_tier`.** The handler documented (and
+  `create_token` already accepted) an `mcp_tier` field but silently dropped it, so a
+  requested MCP token was minted with the empty (RBAC-defer) tier — defeating
+  self-service MCP-token provisioning. The field is now passed through and validated
+  against the closed tier set (`readonly`/`operator`/`supervised`, or omitted); an
+  unrecognised value is a 400. A tiered/service-scoped token missing `expires_at` (or
+  over the 90-day cap) now returns a `400` instead of a misleading `503` "CSPRNG
+  unavailable" that false-paged on-call and wrote a false entropy-failure audit row.
+  The granted `mcp_tier` is recorded in the `api_token.create` audit and echoed by
+  `GET /api/v1/tokens`. **Upgrade note:** any MCP token minted before this fix was
+  stored tier-empty (RBAC-deferred = over-privileged vs intent) — rotate pre-upgrade
+  `mcp_tier` tokens (see `docs/user-manual/upgrading.md`).
 
 ## [0.13.0] - 2026-07-01
 
@@ -424,6 +436,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   degraded (pool/query failure), so a fleet vulnerability query can never read a transient backend
   hiccup as "installed nowhere". An ingest report carrying an implausibly large source map is rejected
   wholesale, and concurrent-replace serialization uses a 64-bit advisory-lock key.
+
+### Changed
+
+- **`POST /api/v1/elevate` response contract: `expires_in` now reports TRUE remaining seconds, not
+  the requested duration.** Previously `expires_in` echoed the requested/capped `duration_secs`
+  verbatim. It now reflects the actual remaining window computed after the grant (always `<=` the
+  requested duration — the window is clamped both to `--jit-max-elevation-secs` and to the calling
+  session's own absolute expiry) and is accompanied by a new `expires_at` (RFC3339 UTC) field.
+  Integrators comparing `expires_in` for exact equality against their requested `duration_secs` should
+  switch to a `<=` comparison. A session already at/past its own absolute lifetime is now rejected
+  `401` rather than granted a zero-length window (governance hardening round, UP-1/UP-4).
 
 ### Security
 
