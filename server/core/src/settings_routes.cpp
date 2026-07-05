@@ -3291,6 +3291,7 @@ void SettingsRoutes::register_routes(
             auto client = std::make_unique<httplib::Client>(scheme + host);
             client->set_connection_timeout(10);
             client->set_read_timeout(10);
+            client->set_write_timeout(10);
             client->enable_server_certificate_verification(!skip_tls);
 
             auto result = client->Get(path);
