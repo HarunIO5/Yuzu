@@ -86,9 +86,13 @@ private:
     // leaked rather than joined-forever, letting the process exit.
     std::atomic<bool> finished_{false};
     // Consecutive empty-catalog recovery resets in do_backfill (bounded by
-    // kMaxEmptyCatalogResets). Touched only on the sync thread; clears when real NVD
-    // data is persisted (#1889 review r4).
+    // kMaxEmptyCatalogResets); clears when real NVD data is persisted (#1889 review r4).
+    // Consecutive re-confirmations of a suspicious empty window after real data has landed
+    // (bounded by kSuspiciousEmptyConfirmations); clears on data or on accepting the empty
+    // (#1889 review r5). Both are touched only inside do_sync()/do_backfill(), serialized by
+    // sync_active_, so no atomic is needed.
     int empty_catalog_resets_{0};
+    int empty_window_confirmations_{0};
 
 #ifdef __cpp_lib_jthread
     void sync_loop(std::stop_token stop);

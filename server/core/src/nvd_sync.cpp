@@ -46,6 +46,12 @@ constexpr long long kNvdCatalogStartEpoch = 915148800; // 1999-01-01T00:00:00Z
 // empty windows for an extended outage, instead of re-walking every ~60s tick.
 constexpr int kMaxEmptyCatalogResets = 5;
 
+// A window that returns ok+empty AFTER real data has landed is re-confirmed this many
+// times (holding the cursor) before it's accepted as genuinely empty and skipped —
+// guards against a stale cache/proxy serving an empty page for a populated range while
+// still terminating at a truly-empty boundary window (see do_backfill, #1889 review r5).
+constexpr int kSuspiciousEmptyConfirmations = 3;
+
 // Cursors are stored in sync_meta as epoch-seconds strings (no ISO parsing —
 // avoids std::chrono::parse portability differences). A cursor is rejected →
 // nullopt (caller restarts from a safe idempotent default) when it is empty,
@@ -403,9 +409,15 @@ void NvdSyncManager::do_backfill() {
 
         auto result = fetcher_->fetch_by_published_window(iso_of(window_start), iso_of(cursor));
         if (!result.ok) {
-            // Transient error — leave the cursor so the next tick retries this
-            // window rather than skipping unfetched CVEs (#1875).
+            // Transient error — leave the cursor so the next tick retries this window rather
+            // than skipping unfetched CVEs (#1875). Surface it so a PERSISTENT fetch failure
+            // (connection, HTTP error, or a self-contradictory totalResults>0-but-empty page
+            // forced to ok=false in parse_response) isn't silent on /api/nvd/status (#1889 r5).
             spdlog::warn("NVD backfill window failed — will retry next tick (cursor unchanged)");
+            {
+                std::lock_guard<std::mutex> lock{mu_};
+                status_.last_error = "NVD backfill fetch failed — retrying (mirror incomplete)";
+            }
             return;
         }
         if (!result.records.empty()) {
@@ -427,8 +439,40 @@ void NvdSyncManager::do_backfill() {
                 return;
             }
             total += result.records.size();
-            empty_catalog_resets_ = 0; // real NVD data landed — clear the recovery backstop
+            empty_catalog_resets_ = 0;      // real NVD data landed — clear the recovery backstop
+            empty_window_confirmations_ = 0; // ...and the suspicious-empty streak
+        } else if (db_->nvd_cve_count() > 0) {
+            // Empty window while the catalog ALREADY holds real NVD CVEs (nvd_cve_count is
+            // all-time, so this also covers a resumed build across restarts) — SUSPICIOUS. A
+            // stale cache/proxy can serve a well-formed empty page for a populated historical
+            // range, and blindly advancing would skip those CVEs and could report the mirror
+            // complete over a hole (#1889 review r5). Hold + re-confirm across a few ticks: a
+            // transient anomaly returns data on retry (the hole is filled), while a genuinely-
+            // empty window (e.g. near the 1999 floor, before NVD's earliest published CVE) is
+            // accepted after kSuspiciousEmptyConfirmations so it never wedges. Advancing only on
+            // a STABLY confirmed empty means no CVEs are dropped. Note the only empty shape that
+            // reaches here is NVD's own totalResults==0 — parse_response forces a totalResults>0-
+            // but-empty page to ok=false upstream, so we never "accept" a self-contradictory page.
+            if (++empty_window_confirmations_ < kSuspiciousEmptyConfirmations) {
+                spdlog::warn("NVD backfill: empty window ending {} after real data — re-confirming "
+                             "({}/{}) before trusting it (holding cursor)",
+                             iso_of(cursor), empty_window_confirmations_,
+                             kSuspiciousEmptyConfirmations);
+                {
+                    std::lock_guard<std::mutex> lock{mu_};
+                    status_.last_error = "re-confirming a suspicious empty NVD window (" +
+                                         std::to_string(empty_window_confirmations_) + "/" +
+                                         std::to_string(kSuspiciousEmptyConfirmations) + ")";
+                }
+                return; // hold — do not advance past a possibly-populated window
+            }
+            spdlog::info("NVD backfill: window ending {} confirmed empty after {} checks — "
+                         "accepting as genuinely empty and advancing",
+                         iso_of(cursor), empty_window_confirmations_);
+            empty_window_confirmations_ = 0;
         }
+        // (empty && nvd_cve_count()==0 → no data yet; nothing to skip past — the all-empty
+        // recovery block above owns that case. Fall through and advance.)
         cursor = window_start;
         // Re-capture the wall clock per window so last_sync_time actually advances
         // during a multi-hour backfill (#1889 review r2). `now` is deliberately NOT
@@ -491,6 +535,10 @@ void NvdSyncManager::do_freshness() {
         auto result = fetcher_->fetch_modified_between(iso_of(ws), iso_of(we));
         if (!result.ok) {
             spdlog::warn("NVD freshness window failed — will retry (cursor unchanged)");
+            {
+                std::lock_guard<std::mutex> lock{mu_};
+                status_.last_error = "NVD freshness fetch failed — retrying";
+            }
             return;
         }
         if (!result.records.empty()) {
@@ -508,7 +556,15 @@ void NvdSyncManager::do_freshness() {
             }
             total += result.records.size();
         }
-        // Advance only after a successful (fetched AND persisted) window.
+        // Advance only after a successful (fetched AND persisted) window. An ok+empty
+        // freshness window is TRUSTED as verified-empty and advances — unlike do_backfill's
+        // suspicious-empty hold, we do NOT re-confirm here: empty modified-since windows are
+        // normal and common (quiet periods), so holding on them would stall freshness for
+        // hours. parse_response still forces a self-contradictory totalResults>0-but-empty
+        // page to ok=false (handled above), so only NVD's own totalResults==0 advances. The
+        // residual — a stale cache serving totalResults==0 for a window that DID have lastMod
+        // changes — is an inherent trust-NVD limitation (a missed update, not a missed CVE;
+        // re-fetched if the CVE is modified again); see docs/vuln-scan-roadmap.md fast-follow.
         db_->set_meta("last_freshness_check", std::to_string(epoch_secs(we)));
     }
 

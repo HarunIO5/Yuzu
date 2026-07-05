@@ -4890,11 +4890,19 @@ non-empty `last_sync_time` does **not** mean the mirror is complete. Use
 the authoritative "initial mirror built" signal, not `last_sync_time`.
 
 `last_error` (string, present only while sync is enabled) surfaces the most recent
-sync-health problem and is cleared at the start of the next sync tick. Expected,
-self-healing values include a local persist failure (`NVD backfill/freshness window
-persist failed — mirror incomplete` — a disk/DB issue; the mirror holds its cursor
-and stays `backfill_complete: false` rather than dropping the fetched CVEs) and a
-prolonged upstream outage (`NVD returning empty responses — mirror not populated`).
+sync-health problem and is cleared at the start of the next sync tick — a non-empty
+value is a transient, self-healing condition, not a product bug. Values you may see:
+a transient fetch failure (`NVD backfill fetch failed — retrying (mirror incomplete)`
+or `NVD freshness fetch failed — retrying` — a connection/HTTP/parse error, cleared once
+a fetch succeeds); a local persist failure (`NVD backfill window persist failed — mirror
+incomplete` / `NVD freshness window persist failed` — a disk/DB issue; the mirror holds
+its cursor and stays `backfill_complete: false` rather than dropping the fetched CVEs);
+a prolonged upstream outage (`NVD returning empty responses — mirror not populated`); and
+re-confirmation of a suspicious empty window (`re-confirming a suspicious empty NVD window
+(n/N)` — an older published-date window returned empty *after* real data had already
+landed; the backfill holds, staying `backfill_complete: false`, and re-checks it before
+trusting it, so a stale cache/proxy serving an empty page can't make it skip a populated
+range and falsely report complete).
 These are operational states, not product bugs — the mirror recovers automatically
 once the underlying condition clears.
 

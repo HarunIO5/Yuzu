@@ -187,3 +187,19 @@ export — is a server-side derivation, never emitted by the agent). No server b
 yet, so it's cleanly reviewable and independently testable. Server M1a pieces (NVD reshape →
 comparator → engine → findings store → dispatch rewire) follow on subsequent PRs. Cut this PR
 fresh off current `dev` — `feat/vuln-scan-v1-inventory` is stale (see Open decisions #2).
+
+## Fast-follow — NVD mirror stale-empty hardening (tracked as #1906, from #1889 review r5)
+
+The initial backfill now HOLDS + re-confirms a suspicious empty published-date window
+after real data has landed (a stale cache/proxy can't skip a populated range and falsely
+report complete), and `parse_response` fails a self-contradictory `totalResults>0`-but-empty
+page. Two known residuals to harden later:
+
+- **Freshness trusts an NVD `totalResults==0` modified-window at face value** (unlike the
+  backfill hold — empty modified windows are normal, so holding would stall freshness). A
+  stale cache serving `totalResults==0` for a window that *did* have `lastModified` changes
+  is a missed *update* (not a missed CVE; recovered if the CVE is modified again). Consider a
+  bounded re-confirm keyed to "the prior freshness pass saw non-empty windows".
+- **The backfill accept-after-K heuristic** (`kSuspiciousEmptyConfirmations`) could still
+  accept a window a proxy keeps empty for ≥K ticks. K is a compile-time constant; consider
+  making it configurable, or cross-checking a second NVD endpoint/mirror for high-value ranges.

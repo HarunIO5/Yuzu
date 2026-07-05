@@ -243,7 +243,12 @@ NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
         return result;
     }
 
-    result.total_results = doc.value("totalResults", 0);
+    // totalResults is now integrity-load-bearing (the empty-window checks key off it), so
+    // read it defensively: a non-integer/missing value → 0 rather than a thrown type_error
+    // (#1889 review r5). value() would throw on e.g. "totalResults":"x".
+    result.total_results = doc.contains("totalResults") && doc["totalResults"].is_number_integer()
+                               ? doc["totalResults"].get<int>()
+                               : 0;
 
     // A well-formed NVD response always carries a "vulnerabilities" array (empty
     // for a genuinely-empty window). Its absence means an unexpected body shape —
@@ -393,6 +398,18 @@ NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
 
     spdlog::debug("NVD parsed {} records from {} vulnerabilities", result.records.size(),
                   doc["vulnerabilities"].size());
+
+    // Self-contradictory response: NVD's totalResults claims CVEs exist but we parsed
+    // none (a stale cache/proxy serving a well-formed empty page, or a truncated body).
+    // Treat as a FAILURE so the caller holds its cursor and retries rather than skipping a
+    // populated window (#1889 review r5). A genuinely-empty window is totalResults==0,
+    // which stays ok=true and is handled as verified-empty upstream.
+    if (result.records.empty() && result.total_results > 0) {
+        spdlog::warn("NVD parse: totalResults={} but 0 usable records — treating as failure "
+                     "(won't skip a populated window)",
+                     result.total_results);
+        result.ok = false;
+    }
 
     return result;
 }

@@ -18,6 +18,7 @@
 #include <sqlite3.h>
 
 #include <chrono>
+#include <functional>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -679,6 +680,9 @@ struct MockFetcher : INvdFetcher {
     std::vector<std::pair<std::string, std::string>> modified_calls;
     bool fail = false;
     bool empty_ok = false; // fetch succeeds (ok=true) but returns zero records (NVD outage shape)
+    // Per-call override: given the 1-based published-window call index, return true for a
+    // data window or false for an ok+empty window. Lets a test script "data then empty".
+    std::function<bool(std::size_t)> data_predicate;
 
     static CveRecord one_cve(std::size_t n) {
         CveRecord rec;
@@ -696,7 +700,10 @@ struct MockFetcher : INvdFetcher {
         published_calls.emplace_back(s, e);
         NvdFetchResult r;
         r.ok = !fail;
-        if (r.ok && !empty_ok)
+        bool give_data = r.ok && !empty_ok;
+        if (give_data && data_predicate)
+            give_data = data_predicate(published_calls.size());
+        if (give_data)
             r.records.push_back(one_cve(published_calls.size()));
         return r;
     }
@@ -1013,6 +1020,65 @@ TEST_CASE("NvdSyncManager: capped empty-catalog recovery resumes when NVD data r
         mgr.sync_now(); // probe detects data → full re-walk → complete
     REQUIRE(mgr.status().backfill_complete);
     REQUIRE(db->nvd_cve_count() > 0);
+}
+
+TEST_CASE("NvdSyncManager: a suspicious empty window after real data is HELD, not skipped",
+          "[nvd][backfill]") {
+    // #1889 review r5 (Blocker): once real NVD data has landed, an ok+empty older window is
+    // suspicious (a stale cache/proxy serving an empty page for a populated range). The walk
+    // must HOLD at the last data window rather than advance past the empty one and risk
+    // reporting the mirror complete over a hole.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->data_predicate = [](std::size_t call) { return call == 1; }; // window 1 data, rest ok+empty
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/1);
+    mgr.sync_now();
+    REQUIRE(m->published_calls.size() == 2);       // window 1 (data) + window 2 (empty → held)
+    REQUIRE(db->nvd_cve_count() == 1);             // window 1's CVE persisted
+    REQUIRE_FALSE(mgr.status().backfill_complete); // held at window 1; not complete over the hole
+}
+
+TEST_CASE("NvdSyncManager: a stably-empty window is accepted after re-confirmation (no wedge)",
+          "[nvd][backfill]") {
+    // The hold must not wedge on a GENUINELY-empty window (e.g. near the 1999 floor before
+    // NVD's earliest published CVE): after kSuspiciousEmptyConfirmations checks it accepts the
+    // empty and advances, so the backfill still reaches the floor and completes.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->data_predicate = [](std::size_t call) { return call == 1; }; // only window 1 ever has data
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/1);
+    for (int i = 0; i < 12; ++i)
+        mgr.sync_now(); // each empty window is re-confirmed then accepted
+    REQUIRE(mgr.status().backfill_complete); // reached the floor — never wedged
+    REQUIRE(db->nvd_cve_count() == 1);       // window 1 had data; the rest were genuinely empty
+}
+
+TEST_CASE("NvdSyncManager: a transient empty window recovers on retry — the hole is filled",
+          "[nvd][backfill]") {
+    // A window that returns ok+empty transiently (stale cache) then real data on retry must
+    // NOT be skipped — the hold re-fetches it and fills the hole.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    // Window 2's FIRST fetch (call 2) is empty; every other call — including its retry — has data.
+    m->data_predicate = [](std::size_t call) { return call != 2; };
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/1);
+    for (int i = 0; i < 6; ++i)
+        mgr.sync_now();
+    REQUIRE(mgr.status().backfill_complete);
+    REQUIRE(db->nvd_cve_count() >= 2); // window 2's data was recovered on retry, not skipped
+}
+
+TEST_CASE("NvdClient::parse_response: totalResults>0 with empty vulnerabilities is a failure",
+          "[nvd][parse]") {
+    // #1889 review r5 (minor #3): a self-contradictory NVD response (claims results but returns
+    // none — a stale cache/proxy or truncated body) must be a FAILURE so the caller holds and
+    // retries, not treated as a verified-empty window. A genuine totalResults==0 stays ok=true.
+    NvdClient client;
+    REQUIRE_FALSE(client.parse_response(R"({"totalResults":100,"vulnerabilities":[]})").ok);
+    REQUIRE(client.parse_response(R"({"totalResults":0,"vulnerabilities":[]})").ok); // genuinely empty
 }
 
 TEST_CASE("NvdDatabase::upsert_cves returns false when the DB is not open", "[nvd][db]") {
