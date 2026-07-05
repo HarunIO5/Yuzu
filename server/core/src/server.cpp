@@ -5922,7 +5922,7 @@ private:
                     "application/json");
                 return;
             }
-            // Parse inventory: array of {name, version} or pipe-delimited lines
+            // Parse inventory: JSON body with an "inventory" array of {name, version}.
             std::vector<SoftwareItem> inventory;
             try {
                 auto body = nlohmann::json::parse(req.body);

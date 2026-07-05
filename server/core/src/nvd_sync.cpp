@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <format>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -27,21 +28,27 @@ long long epoch_secs(std::chrono::system_clock::time_point tp) {
     return std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch()).count();
 }
 
-// NVD's first CVEs are from 1999; anything older than 2000 in a cursor is
-// corruption, not a legitimate position. Rejecting it prevents a garbage/negative
-// sync_meta value from parsing to ~1970 and either false-completing the backfill
-// (cursor <= floor) or livelocking it (governance UP-3/UP-4).
-constexpr long long kMinSaneEpochSecs = 946684800; // 2000-01-01T00:00:00Z
-
 // Cursors are stored in sync_meta as epoch-seconds strings (no ISO parsing —
-// avoids std::chrono::parse portability differences). Malformed/empty/insane →
-// nullopt (caller restarts from `now`, which is idempotent).
-std::optional<std::chrono::system_clock::time_point> parse_cursor(const std::string& s) {
+// avoids std::chrono::parse portability differences). A cursor is rejected →
+// nullopt (caller restarts from a safe idempotent default) when it is empty,
+// unparseable, or older than `min_epoch_secs` — the caller's *configured* backfill
+// floor (now - backfill_years).
+//
+// Tying the reject bound to the configured floor rather than a hard-coded
+// 2000-01-01 is load-bearing for full-history mode (`--nvd-backfill-years 0`,
+// floor ~1926): that walk legitimately drives the cursor below 2000, and a fixed
+// 2000 bound would reject the persisted cursor on every restart and silently
+// re-run the entire multi-year backfill from `now` (#1889). The floor bound still
+// rejects a garbage/negative value that parses to ~1970 under any bounded-year
+// config (floor > 1970), preventing a false backfill completion (cursor <= floor)
+// or livelock (governance UP-3/UP-4).
+std::optional<std::chrono::system_clock::time_point> parse_cursor(const std::string& s,
+                                                                  long long min_epoch_secs) {
     if (s.empty())
         return std::nullopt;
     try {
         const long long v = std::stoll(s);
-        if (v < kMinSaneEpochSecs)
+        if (v < min_epoch_secs)
             return std::nullopt;
         return std::chrono::system_clock::time_point{std::chrono::seconds{v}};
     } catch (...) {
@@ -145,7 +152,15 @@ NvdSyncManager::SyncStatus NvdSyncManager::status() const {
     // Surface backfill progress (cpp/consistency S1 + sre): the store is the
     // source of truth for completion + the newest-first cursor.
     st.backfill_complete = db_->get_meta("backfill_complete") == "1";
-    if (auto cur = parse_cursor(db_->get_meta("backfill_oldest_published")))
+    // Display-only: show the stored cursor whenever it parses. Unlike the
+    // do_backfill walk (which floors the cursor to avoid a false-complete), status()
+    // must NOT reject a legitimately-completed cursor. The walk floor is now-relative
+    // and drifts forward with wall-clock, so a completed backfill's cursor (pinned to
+    // the floor at completion time) sits BELOW today's floor after any restart — a
+    // now-relative bound here would blank a valid completed cursor (#1889 review, S1).
+    // std::stoll range (via the catch in parse_cursor) is the only sanity gate needed.
+    if (auto cur = parse_cursor(db_->get_meta("backfill_oldest_published"),
+                                std::numeric_limits<long long>::min()))
         st.backfill_oldest_published = iso_of(*cur);
     // Survive restart: last_sync_time lives in meta, not just memory (S1).
     if (st.last_sync_time.empty())
@@ -251,19 +266,27 @@ void NvdSyncManager::do_sync() {
     }
 }
 
+std::chrono::system_clock::time_point
+NvdSyncManager::backfill_floor(std::chrono::system_clock::time_point now) const {
+    // backfill_years <= 0 means "full history"; 100y back covers NVD's start (1999).
+    const int years = backfill_years_ <= 0 ? 100 : backfill_years_;
+    return now - std::chrono::years(years);
+}
+
 void NvdSyncManager::do_backfill() {
     const auto now = std::chrono::system_clock::now();
-    // backfill_years <= 0 means "full history"; 100y back covers NVD's start.
-    const int years = backfill_years_ <= 0 ? 100 : backfill_years_;
-    const auto floor = now - std::chrono::years(years);
+    const auto floor = backfill_floor(now);
     const auto max_window = std::chrono::days(120); // NVD caps a pub/lastMod range at 120 days
 
     // Resume from the oldest published date reached so far (newest-first walk).
     // Clamp to `now`: a future cursor (clock skew) would otherwise ask NVD for a
-    // future window forever (livelock, UP-4). A missing/insane cursor restarts
-    // from `now` — idempotent (re-fetch), so no corruption, just repeated work.
-    auto cursor = std::min(parse_cursor(db_->get_meta("backfill_oldest_published")).value_or(now),
-                           now);
+    // future window forever (livelock, UP-4). A missing/below-floor cursor restarts
+    // from `now` — idempotent (re-fetch), so no corruption, just repeated work. The
+    // sanity bound is the *configured* floor, so full-history mode's legitimate
+    // sub-2000 cursor resumes instead of restarting every boot (#1889).
+    auto cursor = std::min(
+        parse_cursor(db_->get_meta("backfill_oldest_published"), epoch_secs(floor)).value_or(now),
+        now);
 
     // On a fresh backfill start, pin the freshness cursor to now so that after a
     // multi-day backfill the first freshness pass re-checks everything modified
@@ -312,9 +335,16 @@ void NvdSyncManager::do_freshness() {
     const auto max_window = std::chrono::days(120);
 
     // Re-check everything modified since the last freshness pass, split into
-    // <=120-day windows (fixes the >120-day incremental-range error).
-    const auto start =
-        parse_cursor(db_->get_meta("last_freshness_check")).value_or(now - std::chrono::days(2));
+    // <=120-day windows (fixes the >120-day incremental-range error). A future
+    // last_freshness_check (backward clock skew or a manual DB edit) is treated as
+    // missing and reset to the 2-day default, so the next window actually fetches
+    // and re-advances the cursor to `now` — self-healing parity with the backfill
+    // cursor's clamp (#1889). A bare std::min(cursor, now) would NOT self-heal here:
+    // nvd_split_windows returns empty for start >= end, so a future cursor clamped
+    // to `now` still yields no window and the stale future cursor would persist.
+    const auto parsed =
+        parse_cursor(db_->get_meta("last_freshness_check"), epoch_secs(backfill_floor(now)));
+    const auto start = (parsed && *parsed <= now) ? *parsed : (now - std::chrono::days(2));
     std::size_t total = 0;
 
     for (const auto& [ws, we] : nvd_split_windows(start, now, max_window)) {

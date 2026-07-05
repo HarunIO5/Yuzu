@@ -30,24 +30,6 @@ constexpr auto kApiKeyInterval = std::chrono::milliseconds(600);  // 50 req / 30
 constexpr time_t kConnectTimeoutSec = 30;
 constexpr time_t kReadTimeoutSec = 60;
 
-std::string current_iso_timestamp() {
-    auto now = std::chrono::system_clock::now();
-    auto time_t_now = std::chrono::system_clock::to_time_t(now);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-
-    std::tm utc_tm{};
-#ifdef _WIN32
-    gmtime_s(&utc_tm, &time_t_now);
-#else
-    gmtime_r(&time_t_now, &utc_tm);
-#endif
-
-    std::ostringstream oss;
-    oss << std::put_time(&utc_tm, "%Y-%m-%dT%H:%M:%S") << '.' << std::setfill('0') << std::setw(3)
-        << ms.count();
-    return oss.str();
-}
-
 std::string url_encode(const std::string& value) {
     std::ostringstream escaped;
     escaped.fill('0');

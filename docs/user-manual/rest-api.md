@@ -4870,7 +4870,10 @@ expected, not data loss.)
 has reached its configured floor. `backfill_oldest_published` (ISO 8601 string)
 is the progress cursor — the `published` date of the oldest CVE fetched so far,
 walking backwards. During the initial backfill `total_cves` climbs continuously
-and `last_sync_time` stays empty until the backfill floor is first reached.
+and `last_sync_time` advances after **every** successful fetch window — so a
+non-empty `last_sync_time` does **not** mean the mirror is complete. Use
+`backfill_complete` (with the `backfill_oldest_published` cursor for progress) as
+the authoritative "initial mirror built" signal, not `last_sync_time`.
 
 #### `POST /api/nvd/sync`
 

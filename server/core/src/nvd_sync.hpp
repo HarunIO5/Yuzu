@@ -95,6 +95,11 @@ private:
     void do_backfill();  // newest-first publish-window catalog build (cursor-resumable)
     void do_freshness(); // periodic lastMod re-check once backfill reaches the floor
     bool backfill_complete() const;
+    // Oldest published date the backfill walks toward: now - backfill_years
+    // (backfill_years <= 0 means full history ≈ 100y). Single source of truth for
+    // both the backfill walk floor and the parse_cursor sanity bound (#1889).
+    std::chrono::system_clock::time_point
+    backfill_floor(std::chrono::system_clock::time_point now) const;
 };
 
 } // namespace yuzu::server
