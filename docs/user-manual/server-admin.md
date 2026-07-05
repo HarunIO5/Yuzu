@@ -1019,7 +1019,7 @@ re-checks. Configuration is via CLI flags at startup (each has an env-var equiva
 | `--nvd-api-key` | `YUZU_NVD_API_KEY` | *(none)* | NVD API key. Raises the NVD rate limit substantially — the difference between the initial backfill taking minutes versus hours. |
 | `--nvd-proxy` | `YUZU_NVD_PROXY` | *(none)* | HTTP proxy URL for egress to `services.nvd.nist.gov`, for deployments with restricted outbound network access. |
 | `--nvd-sync-interval` | `YUZU_NVD_SYNC_INTERVAL` | `4` | Freshness re-check cadence, in hours, once the backfill has completed. |
-| `--nvd-backfill-years` | `YUZU_NVD_BACKFILL_YEARS` | `8` | How far back (in years) the newest-first backfill walks. `0` = full history. |
+| `--nvd-backfill-years` | `YUZU_NVD_BACKFILL_YEARS` | `8` | How far back (in years) the newest-first backfill walks. `0` = full history. The floor is clamped to NVD's catalog start (1999-01-01) and to a 200-year effective maximum, so no value reaches before the catalog begins. |
 | `--no-nvd-sync` | — | off | Disable NVD sync entirely. |
 
 > **Note:** the initial backfill makes sustained HTTPS requests to `services.nvd.nist.gov`

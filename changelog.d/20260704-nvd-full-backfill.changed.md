@@ -6,4 +6,7 @@
   catalog scale. **Operator-visible:** `GET /api/nvd/status` `total_cves` grows substantially and the
   local NVD database reaches into the hundreds of MB; the initial backfill is NVD-rate-limited (hours
   without an `--nvd-api-key`, minutes with one) and resumes where it left off if interrupted. Set
-  `--no-nvd-sync` to disable, `--nvd-proxy` for restricted egress.
+  `--no-nvd-sync` to disable, `--nvd-proxy` for restricted egress. The mirror is never reported
+  `backfill_complete` while the local catalog is empty (so a vulnerability scan can't silently
+  trust a mirror that never populated), and an out-of-band-emptied catalog self-heals by
+  re-fetching.

@@ -164,9 +164,13 @@ NvdSyncManager::SyncStatus NvdSyncManager::status() const {
     // Display the stored cursor whenever it clears the fixed catalog-start bound
     // (pre-1999 = garbage → blank). This does NOT blank a legitimately-completed
     // cursor: the walk floor is >= the catalog start in every config, so a completed
-    // cursor is always >= 1999 and survives (#1889 review, S1).
+    // cursor is always >= 1999 and survives (#1889 review, S1). Clamp to `now`: a
+    // corrupt far-future cursor must never reach iso_of()/std::format (which can throw
+    // on an extreme year and 500 the status endpoint), and "oldest published" is never
+    // legitimately in the future (governance Gate 4 UP-6).
+    const auto now = std::chrono::system_clock::now();
     if (auto cur = parse_cursor(db_->get_meta("backfill_oldest_published"), kNvdCatalogStartEpoch))
-        st.backfill_oldest_published = iso_of(*cur);
+        st.backfill_oldest_published = iso_of(std::min(*cur, now));
     // Survive restart: last_sync_time lives in meta, not just memory (S1).
     if (st.last_sync_time.empty())
         st.last_sync_time = db_->get_meta("last_sync_time");
@@ -187,7 +191,14 @@ bool NvdSyncManager::backfill_complete() const {
     try {
         const auto cursor =
             parse_cursor(db_->get_meta("backfill_oldest_published"), kNvdCatalogStartEpoch);
-        return cursor.has_value() && *cursor <= backfill_floor(std::chrono::system_clock::now());
+        // Position AND content: the cursor must have reached the floor AND the catalog
+        // must actually hold CVEs. Without the content check, a corrupt at/below-floor
+        // cursor — or an NVD outage that returns empty windows — would report the mirror
+        // "complete" over an EMPTY catalog, making every vuln scan silently return clean
+        // (a false-negative). The count is short-circuited so it only runs once the cheap
+        // floor test already passed (governance Gate 4 UP-1/UP-2).
+        return cursor.has_value() && *cursor <= backfill_floor(std::chrono::system_clock::now()) &&
+               db_->total_cve_count() > 0;
     } catch (const std::exception& e) {
         spdlog::warn("NVD backfill_complete() meta read failed: {} (assuming not complete)",
                      e.what());
@@ -316,6 +327,17 @@ void NvdSyncManager::do_backfill() {
                      .value_or(now),
                  now);
 
+    // Recovery: if the walk would be a no-op (cursor already at/below the floor) but the
+    // catalog is EMPTY, the mirror was emptied out-of-band (corruption / manual truncate /
+    // disk loss) without a matching cursor reset. Restart from `now` so we actually
+    // re-fetch, rather than sitting "incomplete" (per the content guard in
+    // backfill_complete()) forever while the loop does nothing (governance Gate 6 SRE).
+    if (cursor <= floor && db_->total_cve_count() == 0) {
+        spdlog::warn("NVD backfill: cursor at/below the floor but the catalog is empty — "
+                     "resetting the cursor to `now` to re-fetch the full range");
+        cursor = now;
+    }
+
     // On a fresh backfill start, pin the freshness cursor to now so that after a
     // multi-day backfill the first freshness pass re-checks everything modified
     // *during* the build, not just the last 2 days (UP-6).
@@ -361,8 +383,17 @@ void NvdSyncManager::do_backfill() {
         // No sticky "backfill_complete" flag is written: completion is DERIVED from the
         // persisted cursor vs the current floor (see backfill_complete()), so a later
         // config deepening correctly re-opens the backfill instead of trusting a flag
-        // written under the old, shallower config (#1889 review r2).
-        spdlog::info("NVD backfill complete — floor reached ({} CVEs upserted this pass)", total);
+        // written under the old, shallower config (#1889 review r2). Gate the "complete"
+        // log on the SAME content check backfill_complete() uses, so the log can never
+        // claim "complete" while the status API / gauge correctly report incomplete over
+        // an empty catalog (governance Gate 6 compliance).
+        if (db_->total_cve_count() > 0) {
+            spdlog::info("NVD backfill complete — floor reached ({} CVEs upserted this pass)",
+                         total);
+        } else {
+            spdlog::warn("NVD backfill reached the floor but the catalog is EMPTY "
+                         "(NVD returned no data?) — not reporting complete");
+        }
     }
 }
 
@@ -380,6 +411,9 @@ void NvdSyncManager::do_freshness() {
     // to `now` still yields no window and the stale future cursor would persist.
     const auto parsed =
         parse_cursor(db_->get_meta("last_freshness_check"), kNvdCatalogStartEpoch);
+    if (parsed && *parsed > now)
+        spdlog::warn("NVD freshness cursor is in the future (backward clock skew / manual edit) "
+                     "— resetting to the 2-day default to self-heal");
     const auto start = (parsed && *parsed <= now) ? *parsed : (now - std::chrono::days(2));
     std::size_t total = 0;
 

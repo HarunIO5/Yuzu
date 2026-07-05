@@ -757,10 +757,11 @@ TEST_CASE("NvdSyncManager: a failed backfill window leaves the cursor and doesn'
 
 TEST_CASE("NvdSyncManager: freshness splits a >120-day gap into windows", "[nvd][freshness]") {
     auto db = std::make_shared<NvdDatabase>(":memory:");
-    // Completion is derived from the cursor vs the floor: a cursor older than the
-    // 8-year floor (here ~9y ago) means the backfill reached its floor → complete.
+    // Completion is derived from the cursor vs the floor AND a non-empty catalog: a
+    // cursor older than the 8-year floor (~9y ago) plus stored CVEs → complete.
     db->set_meta("backfill_oldest_published", std::to_string(secs_ago(365 * 9)));
     db->set_meta("last_freshness_check", std::to_string(secs_ago(300)));
+    db->upsert_cves({MockFetcher::one_cve(1)}); // content guard: complete requires CVEs
     auto mock = std::make_unique<MockFetcher>();
     auto* m = mock.get();
     NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 8);
@@ -910,11 +911,46 @@ TEST_CASE("NvdSyncManager: a completed bounded backfill stays complete + display
         duration_cast<seconds>((system_clock::now() - years(9)).time_since_epoch()).count();
     auto db = std::make_shared<NvdDatabase>(":memory:");
     db->set_meta("backfill_oldest_published", std::to_string(cursor_9y_ago));
+    db->upsert_cves({MockFetcher::one_cve(1)}); // content guard: complete requires CVEs
     auto mock = std::make_unique<MockFetcher>();
     NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
     const auto st = mgr.status();
-    REQUIRE(st.backfill_complete);                        // cursor (~9y) <= floor (~8y) → complete
+    REQUIRE(st.backfill_complete);                        // cursor (~9y) <= floor (~8y) + CVEs → complete
     REQUIRE_FALSE(st.backfill_oldest_published.empty());  // >= 1999 → displayed, not blanked
+}
+
+TEST_CASE("NvdSyncManager: an at-floor cursor with an EMPTY catalog is NOT complete (content guard)",
+          "[nvd][backfill]") {
+    // Governance Gate 4 UP-1/UP-2: completion must reflect stored CONTENT, not just
+    // cursor position. A corrupt/at-floor cursor with zero CVEs — from a writable/corrupt
+    // nvd.db, or an NVD outage returning empty windows — must NOT report the mirror
+    // complete, or a vuln scan silently returns clean (false-negative). The content guard
+    // keeps it "incomplete" so the backfill re-runs.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(secs_ago(365 * 9))); // below 8y floor
+    auto mock = std::make_unique<MockFetcher>();
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
+    REQUIRE_FALSE(mgr.status().backfill_complete);        // empty catalog → not complete
+    db->upsert_cves({MockFetcher::one_cve(1)});           // add content...
+    REQUIRE(mgr.status().backfill_complete);              // ...now genuinely complete
+}
+
+TEST_CASE("NvdSyncManager: an emptied catalog with a stuck at-floor cursor re-fetches (recovery)",
+          "[nvd][backfill]") {
+    // Governance Gate 6 SRE: if the catalog is emptied out-of-band (corruption / manual
+    // truncate / disk loss) while backfill_oldest_published is still pinned at the floor,
+    // the walk would be a no-op and the mirror would sit incomplete forever. do_backfill
+    // must detect empty+at-floor and reset the cursor to `now` to actually re-fetch.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(secs_ago(365 * 9))); // at/below 8y floor
+    // catalog is EMPTY — no upsert
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
+    mgr.sync_now();
+    REQUIRE_FALSE(m->published_calls.empty()); // it re-fetched instead of sitting idle
+    REQUIRE(db->total_cve_count() > 0);         // catalog repopulated
+    REQUIRE(mgr.status().backfill_complete);    // and is now genuinely complete
 }
 
 TEST_CASE("NvdClient::parse_response: 200-with-bad-body is ok=false, empty window is ok=true",
