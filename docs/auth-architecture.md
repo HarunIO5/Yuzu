@@ -206,7 +206,9 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   be eligible **and** present a mandatory second factor **and** pass a fresh MFA
   step-up. The mandatory second factor is **local TOTP enrollment** for a local
   session, or a **fresh IdP-attested MFA `amr` proof** for an OIDC session when
-  `--jit-oidc-amr-elevation` is enabled (see "OIDC-amr elevation" below). This
+  `--jit-oidc-amr-elevation` is enabled (the OIDC path is **temporarily severed**
+  on this branch — an OIDC session is denied at the eligibility gate; see
+  "OIDC-amr elevation" below and #1852). This
   requirement is mandatory **unconditionally** here, NOT gated on
   `--mfa-enforcement`: elevation is the privilege-crossing boundary (non-admin →
   full admin), so — unlike the other step-up sites where the actor is already
@@ -255,7 +257,19 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   tokens resolve through `synthesize_token_session` (no cookie, no
   `elevated_until`), so a long-lived automation credential can **never** be
   elevated.
-- **OIDC-amr elevation (shipped follow-up).** An OIDC operator whose SSO
+- **OIDC-amr elevation — TEMPORARILY SEVERED by the #1837/#1857 principal
+  re-key (restoration tracked in #1852).** As of the `oidc:<iss>#<sub>` principal
+  re-key, an OIDC session's principal is **not** a valid local-`users` username
+  (it contains `:`/`#`), so `is_elevation_eligible` fails closed and the elevate
+  route denies an OIDC session at the **eligibility gate** — before the OIDC-amr
+  branch below is ever reached. OIDC operators therefore **cannot JIT-elevate**
+  on this branch. This is deliberate: it severs the pre-#1837 accident where an
+  SSO display name that coincidentally equalled a provisioned *local* username
+  borrowed that local user's eligibility + TOTP. The `amr`/`--jit-oidc-amr-elevation`
+  mechanism described below is retained (currently unreachable-for-success) and
+  documents the **intended** path that #1852 restores against the stable
+  principal; treat the rest of this subsection as the restored-state design.
+- **OIDC-amr elevation (design — restored by #1852).** An OIDC operator whose SSO
   session was authenticated with IdP MFA — asserted via the OIDC `amr` claim
   at `/auth/callback`, which seeds `Session::mfa_verified_at` when
   `amr_asserts_mfa(claims.amr)` is true (see `docs/auth-mfa-design.md` "OIDC
