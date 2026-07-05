@@ -108,11 +108,12 @@ consult the server NVD database (V2.2).
 when `nvd_sync_enabled`; CLI `--nvd-sync-interval` / `--nvd-api-key` / `--nvd-proxy` /
 `--nvd-backfill-years` / `--no-nvd-sync`, env `YUZU_NVD_SYNC_INTERVAL` /
 `YUZU_NVD_BACKFILL_YEARS`; status REST endpoint.
-> **Gap (two layers):**
-> 1. **Schema can't represent CPE ranges.** The store is a flat `cve(product, affected_below)`
->    with a single upper bound — it cannot hold NVD's `cpeMatch` criteria
->    (`versionStartIncluding/Excluding`, `versionEndIncluding/Excluding`, multiple ranges per CVE).
->    Reshaping to the real CPE-range model is required; **"widen the keywords" does NOT fix this.**
+> **Gap (was two layers; layer 1 now CLOSED):**
+> 1. **Schema now represents CPE ranges — CLOSED.** The store was reshaped (v1→v2 migration)
+>    from the flat `cve(product, affected_below)` into a normalized `cve` + `cve_match` model
+>    that holds NVD's `cpeMatch` range bounds (`version_start/end_including/excluding`, multiple
+>    ranges per CVE) — see the `cve_match` schema in `nvd_db.cpp`. Delivered by the
+>    CPE-range-matching PR.
 > 2. **Corpus is now a full newest-first backfill** (configurable depth via
 >    `--nvd-backfill-years`, default 8y, `0` = full history; resumable across restarts,
 >    then periodic freshness), no longer keyword-scoped — that gap is **CLOSED**. The
@@ -124,16 +125,18 @@ when `nvd_sync_enabled`; CLI `--nvd-sync-interval` / `--nvd-api-key` / `--nvd-pr
 > It is now verified E2E-populating. Treat "NVD sync works" as true only from that fix onward.
 
 ### V2.3 NVD → inventory correlation join :large_orange_diamond: `T2`
-`NvdDatabase::match_inventory` exists but matches by `product LIKE ?` + a **naive
-`compare_versions < affected_below`** — substring identity, no CPE, no range semantics, no
-epoch/release/semver awareness. It is consumed by the **fleet-topology vuln overlay** only
-(`FleetTopologyStore`, `include_vuln=true`); the agent plugin's findings are **not** correlated
-against it.
-> **Gap:** replace with a real correlation engine — typed-identity→CPE mapping (curated +
-> pgvector fuzzy, Lane 1's NVD-fallback and Lane 3's future federation) + range-aware comparator
-> (recover the #1206 comparator) + `cpeMatch` range test, alongside Lane 1's OVAL-primary (V2.4)
-> and Lane 2's OSV.dev-by-PURL (V2.9) — as part of the single server correlation engine.
-> *(roadmap M1a; topology attach is M3)*
+`NvdDatabase::match_inventory` now matches with **real CPE range semantics**: it builds a
+`VersionRange` from each `cve_match` row and calls `nvd_version_in_range` (`nvd_db.cpp`),
+honouring `versionStart/EndIncluding/Excluding`. Product selection is still name-based
+(`product LIKE ?`), so range evaluation is only as precise as the product-name match feeding
+it. It is consumed by the **fleet-topology vuln overlay** only (`FleetTopologyStore`,
+`include_vuln=true`); the agent plugin's findings are **not** correlated against it.
+> **Gap (range comparator now DONE; identity is the remaining gap):** the range-aware
+> comparator + `cpeMatch` range test shipped with the CPE-range PR. What remains is
+> **vendor-precise identity** — typed-identity→CPE mapping (curated + pgvector fuzzy, Lane 1's
+> NVD-fallback and Lane 3's future federation) to replace the `product LIKE ?` substring match
+> (ADR-0018) — alongside Lane 1's OVAL-primary (V2.4) and Lane 2's OSV.dev-by-PURL (V2.9), as
+> part of the single server correlation engine. *(roadmap M1a; topology attach is M3)*
 
 ### V2.4 Distro advisory / OVAL backport correlation :x: `T1`
 **Not ingested.** No OVAL/OVD anywhere in code — design-doc only

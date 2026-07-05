@@ -5880,7 +5880,12 @@ private:
                                  return;
                              }
                              nlohmann::json j;
-                             j["enabled"] = true;
+                             // "enabled" reflects whether the sync manager exists, not
+                             // merely whether the DB file is open: under --no-nvd-sync the
+                             // catalog DB is still open (for matching) but sync is off, so
+                             // reporting enabled=true then 503-ing POST /api/nvd/sync was
+                             // contradictory (#1889 review r2).
+                             j["enabled"] = (nvd_sync_ != nullptr);
                              j["total_cves"] = nvd_db_->total_cve_count();
                              if (nvd_sync_) {
                                  auto st = nvd_sync_->status();

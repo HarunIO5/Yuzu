@@ -729,8 +729,8 @@ TEST_CASE("NvdSyncManager: backfill walks newest-first, contiguous, to the floor
     // Contiguous: window[i].start == window[i+1].end (walking backward).
     for (std::size_t i = 0; i + 1 < m->published_calls.size(); ++i)
         REQUIRE(m->published_calls[i].first == m->published_calls[i + 1].second);
-    // Completed + upserted; no freshness yet.
-    REQUIRE(db->get_meta("backfill_complete") == "1");
+    // Completed + upserted; no freshness yet. Completion is derived (cursor vs floor).
+    REQUIRE(mgr.status().backfill_complete);
     REQUIRE(db->total_cve_count() == m->published_calls.size());
     REQUIRE(m->modified_calls.empty());
 
@@ -750,14 +750,16 @@ TEST_CASE("NvdSyncManager: a failed backfill window leaves the cursor and doesn'
 
     mgr.sync_now();
 
-    REQUIRE(m->published_calls.size() == 1);          // stopped after the first failure
-    REQUIRE(db->get_meta("backfill_complete") != "1"); // not complete
+    REQUIRE(m->published_calls.size() == 1);              // stopped after the first failure
+    REQUIRE_FALSE(mgr.status().backfill_complete);        // not complete (no cursor to reach floor)
     REQUIRE(db->get_meta("backfill_oldest_published").empty()); // cursor never advanced (#1875)
 }
 
 TEST_CASE("NvdSyncManager: freshness splits a >120-day gap into windows", "[nvd][freshness]") {
     auto db = std::make_shared<NvdDatabase>(":memory:");
-    db->set_meta("backfill_complete", "1");
+    // Completion is derived from the cursor vs the floor: a cursor older than the
+    // 8-year floor (here ~9y ago) means the backfill reached its floor → complete.
+    db->set_meta("backfill_oldest_published", std::to_string(secs_ago(365 * 9)));
     db->set_meta("last_freshness_check", std::to_string(secs_ago(300)));
     auto mock = std::make_unique<MockFetcher>();
     auto* m = mock.get();
@@ -765,7 +767,7 @@ TEST_CASE("NvdSyncManager: freshness splits a >120-day gap into windows", "[nvd]
 
     mgr.sync_now();
 
-    REQUIRE(m->published_calls.empty());       // backfill already complete
+    REQUIRE(m->published_calls.empty());       // backfill already complete → freshness path
     REQUIRE(m->modified_calls.size() == 3);    // 300 days / 120 → 3 windows
 }
 
@@ -773,15 +775,13 @@ TEST_CASE("NvdSyncManager: freshness splits a >120-day gap into windows", "[nvd]
 
 TEST_CASE("NvdSyncManager: a corrupt/absurd cursor does NOT false-complete the backfill",
           "[nvd][backfill]") {
-    // #1889 / UP-3: parse_cursor rejects a cursor below the *configured* backfill
-    // floor (now - backfill_years), so the backfill restarts from `now` and actually
-    // builds — never jumps below the floor and false-completes with an empty store.
-    // backfill_years=1 → floor ~last year, so every value below is rejected —
-    // including "1300000000" (2011), which the OLD hard-coded-2000 bound would have
-    // wrongly ACCEPTED and then false-completed (2011 < floor → while-loop skipped →
-    // backfill_complete with zero windows). That value is the regression guard.
-    for (const char* bad : {"-5", "0", "500000000" /* 1985 */,
-                            "1300000000" /* 2011: >2000 but below the 1-year floor */}) {
+    // #1889 / UP-3: parse_cursor rejects a pre-catalog cursor (below NVD's fixed
+    // 1999-01-01 start), so the backfill restarts from `now` and actually builds —
+    // never jumps to ~1970 and false-completes with an empty store. These three are
+    // all pre-1999 garbage. (A post-1999 value below the *configured* floor is NOT
+    // garbage — it's a legitimately-deeper cursor — so it's tested separately as a
+    // resume/complete case, not here.)
+    for (const char* bad : {"-5" /* 1969 */, "0" /* 1970 */, "500000000" /* 1985 */}) {
         auto db = std::make_shared<NvdDatabase>(":memory:");
         db->set_meta("backfill_oldest_published", bad);
         auto mock = std::make_unique<MockFetcher>();
@@ -789,8 +789,8 @@ TEST_CASE("NvdSyncManager: a corrupt/absurd cursor does NOT false-complete the b
         NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1);
         mgr.sync_now();
         INFO("bad cursor = " << bad);
-        REQUIRE(m->published_calls.size() >= 3);          // it walked, not false-completed
-        REQUIRE(db->get_meta("backfill_complete") == "1"); // legitimately reached floor
+        REQUIRE(m->published_calls.size() >= 3);  // it walked from now, not false-completed
+        REQUIRE(mgr.status().backfill_complete);   // legitimately reached the floor
         REQUIRE(db->total_cve_count() == m->published_calls.size());
     }
 }
@@ -809,57 +809,112 @@ TEST_CASE("NvdSyncManager: a future cursor is clamped to now (no livelock)", "[n
     NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1);
     mgr.sync_now();
     REQUIRE(m->published_calls.size() >= 3);
-    REQUIRE(db->get_meta("backfill_complete") == "1");
+    REQUIRE(mgr.status().backfill_complete);
     // Newest window's end (first call) is ~now, well before the +400d future.
     const auto now_iso_year = std::to_string(1900); // sanity: string compare below
     (void)now_iso_year;
     REQUIRE(m->published_calls.front().second < std::to_string(2100)); // not a year-2100+ future
 }
 
-TEST_CASE("NvdSyncManager: full-history (backfill_years=0) resumes from a pre-2000 cursor",
+TEST_CASE("NvdSyncManager: full-history (backfill_years=0) resumes from a valid in-catalog cursor",
           "[nvd][backfill]") {
-    // #1889 blocker: in full-history mode the floor is ~1926, so the persisted
-    // backfill_oldest_published cursor legitimately walks below 2000. parse_cursor
-    // must validate against the CONFIGURED floor, not a hard-coded 2000 — otherwise
-    // every restart rejects the sub-2000 cursor and silently re-runs the entire
-    // multi-year backfill from `now`. Seed a 1995 cursor; the next fetch window must
-    // RESUME near 1995, not restart at ~now.
+    // #1889: a persisted cursor within the catalog (>= NVD's 1999 start) must RESUME,
+    // not restart. Full-history floor is the fixed 1999 start; seed a 2005 cursor and
+    // the next fetch window must resume near 2005, not jump back to `now`.
     using namespace std::chrono;
-    const auto cursor_1995 =
-        duration_cast<seconds>(sys_days{1995y / June / 1}.time_since_epoch()).count();
+    const auto cursor_2005 =
+        duration_cast<seconds>(sys_days{2005y / June / 1}.time_since_epoch()).count();
     auto db = std::make_shared<NvdDatabase>(":memory:");
-    db->set_meta("backfill_oldest_published", std::to_string(cursor_1995));
+    db->set_meta("backfill_oldest_published", std::to_string(cursor_2005));
     auto mock = std::make_unique<MockFetcher>();
     auto* m = mock.get();
     m->fail = true; // stop after the first window so we can inspect the resume point
     NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/0);
     mgr.sync_now();
     REQUIRE(m->published_calls.size() == 1); // resumed and attempted exactly one window
-    // Window END = the resumed cursor (~1995), NOT a restart from ~now.
-    REQUIRE(m->published_calls.front().second.substr(0, 4) == "1995");
+    // Window END = the resumed cursor (~2005), NOT a restart from ~now.
+    REQUIRE(m->published_calls.front().second.substr(0, 4) == "2005");
     // Fetch failed → cursor held unchanged (no false advance), proving pure resume.
-    REQUIRE(db->get_meta("backfill_oldest_published") == std::to_string(cursor_1995));
+    REQUIRE(db->get_meta("backfill_oldest_published") == std::to_string(cursor_2005));
 }
 
-TEST_CASE("NvdSyncManager: status shows the completed cursor after a floor-drift restart",
+TEST_CASE("NvdSyncManager: full-history REJECTS a pre-catalog garbage cursor (no false-complete)",
           "[nvd][backfill]") {
-    // #1889 review S1: the walk floor is now-relative and moves forward with
-    // wall-clock, but a completed backfill's cursor is pinned to the floor at
-    // completion time. status() must still DISPLAY that cursor after a restart — it
-    // must not re-reject it as "below the (now-advanced) floor" and blank it.
-    // Simulate a completed 8-year backfill whose cursor sits at a floor as-of a year
-    // ago (now-9y) — i.e. below today's now-8y floor.
+    // #1889 review r2 (Blocker 1): the full-history floor is anchored at NVD's fixed
+    // 1999 catalog start, NOT now-100y (~1926, a negative epoch). So a garbage sub-1999
+    // cursor like "-5" (→1969) must be REJECTED and the backfill restarted from `now` —
+    // never walk 1969→1926 and mark itself complete, silently skipping 1969→present.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", "-5"); // parses to 1969: pre-catalog garbage
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->fail = true; // inspect the first (restarted) window, then stop
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/0);
+    mgr.sync_now();
+    REQUIRE(m->published_calls.size() == 1);
+    // Restarted from ~now (recent year), NOT resumed at the garbage 1969 point.
+    REQUIRE(m->published_calls.front().second.substr(0, 4) >= "2020");
+    REQUIRE_FALSE(mgr.status().backfill_complete); // fetch failed → not falsely completed
+}
+
+TEST_CASE("NvdSyncManager: deepening backfill_years reopens a completed shallow backfill",
+          "[nvd][backfill]") {
+    // #1889 review r2 (Blocker 2): completion is derived from the stored cursor vs the
+    // CURRENT floor, not a sticky flag. An 8-year backfill that completed, then restarts
+    // as full-history (years=0), must RESUME fetching the older range — not run freshness
+    // forever while reporting the catalog complete.
     using namespace std::chrono;
-    const auto floor_last_year =
+    const auto cursor_8y_ago =
+        duration_cast<seconds>((system_clock::now() - years(8)).time_since_epoch()).count();
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(cursor_8y_ago)); // shallow-complete
+    db->set_meta("last_freshness_check", std::to_string(secs_ago(1)));         // freshness would be a no-op
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->fail = true; // one window is enough to prove backfill (not freshness) ran
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/0);
+    mgr.sync_now();
+    REQUIRE_FALSE(m->published_calls.empty()); // BACKFILL ran (older range reopened)...
+    REQUIRE(m->modified_calls.empty());        // ...not the freshness-only path (the defect)
+}
+
+TEST_CASE("NvdSyncManager: an absurd backfill_years clamps the floor (no overflow/false-complete)",
+          "[nvd][backfill]") {
+    // Defensive: --nvd-backfill-years is unbounded at config parse; a huge value must
+    // not overflow the years->clock subtraction into a garbage (far-future) floor that
+    // would false-complete. The floor clamps to NVD's 1999 start, so a 2005 cursor is
+    // still ABOVE the floor and resumes (not complete) rather than false-completing.
+    using namespace std::chrono;
+    const auto cursor_2005 =
+        duration_cast<seconds>(sys_days{2005y / June / 1}.time_since_epoch()).count();
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(cursor_2005));
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->fail = true;
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/100000);
+    mgr.sync_now();
+    REQUIRE_FALSE(mgr.status().backfill_complete);   // floor≈1999 < 2005 cursor → not complete
+    REQUIRE(m->published_calls.size() == 1);          // resumed a real window (no false-complete)
+    REQUIRE(m->published_calls.front().second.substr(0, 4) == "2005"); // resumed at the cursor
+}
+
+TEST_CASE("NvdSyncManager: a completed bounded backfill stays complete + displayed across drift",
+          "[nvd][backfill]") {
+    // #1889 review r2/S1: completion is derived from cursor <= current floor, and the
+    // cursor display uses the fixed 1999 bound. A completed 8-year backfill whose cursor
+    // sits below today's (wall-clock-drifted) floor must STILL report complete AND
+    // display its cursor — never flip to "incomplete" (a re-backfill storm) or blank it.
+    using namespace std::chrono;
+    const auto cursor_9y_ago =
         duration_cast<seconds>((system_clock::now() - years(9)).time_since_epoch()).count();
     auto db = std::make_shared<NvdDatabase>(":memory:");
-    db->set_meta("backfill_complete", "1");
-    db->set_meta("backfill_oldest_published", std::to_string(floor_last_year));
+    db->set_meta("backfill_oldest_published", std::to_string(cursor_9y_ago));
     auto mock = std::make_unique<MockFetcher>();
     NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
     const auto st = mgr.status();
-    REQUIRE(st.backfill_complete);
-    REQUIRE_FALSE(st.backfill_oldest_published.empty()); // not blanked by the walk-floor bound
+    REQUIRE(st.backfill_complete);                        // cursor (~9y) <= floor (~8y) → complete
+    REQUIRE_FALSE(st.backfill_oldest_published.empty());  // >= 1999 → displayed, not blanked
 }
 
 TEST_CASE("NvdClient::parse_response: 200-with-bad-body is ok=false, empty window is ok=true",

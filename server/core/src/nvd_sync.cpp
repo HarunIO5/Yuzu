@@ -6,7 +6,6 @@
 #include <chrono>
 #include <cstddef>
 #include <format>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -28,20 +27,27 @@ long long epoch_secs(std::chrono::system_clock::time_point tp) {
     return std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch()).count();
 }
 
+// NVD's published-date catalog effectively starts 1999-01-01T00:00:00Z; no
+// legitimate CVE predates it. This fixed epoch is used two ways:
+//   1. the floor for a full-history (`--nvd-backfill-years 0`) backfill, and the
+//      lower clamp for any bounded floor (see backfill_floor), so a floor is never
+//      a pre-epoch NEGATIVE value; and
+//   2. the fixed lower sanity bound passed to parse_cursor — anything below it is
+//      pre-catalog garbage, never a real resume position.
+// Anchoring to this FIXED positive bound (not a rolling `now - N years`) is
+// load-bearing: `now - years(100)` is ~1926, a negative epoch, which as a
+// parse_cursor bound would accept pre-catalog garbage like "-5" (→1969) and let
+// the backfill walk 1969→1926 and false-complete, skipping 1969→present
+// (#1889 review r2 / governance UP-3/UP-4).
+constexpr long long kNvdCatalogStartEpoch = 915148800; // 1999-01-01T00:00:00Z
+
 // Cursors are stored in sync_meta as epoch-seconds strings (no ISO parsing —
 // avoids std::chrono::parse portability differences). A cursor is rejected →
 // nullopt (caller restarts from a safe idempotent default) when it is empty,
-// unparseable, or older than `min_epoch_secs` — the caller's *configured* backfill
-// floor (now - backfill_years).
-//
-// Tying the reject bound to the configured floor rather than a hard-coded
-// 2000-01-01 is load-bearing for full-history mode (`--nvd-backfill-years 0`,
-// floor ~1926): that walk legitimately drives the cursor below 2000, and a fixed
-// 2000 bound would reject the persisted cursor on every restart and silently
-// re-run the entire multi-year backfill from `now` (#1889). The floor bound still
-// rejects a garbage/negative value that parses to ~1970 under any bounded-year
-// config (floor > 1970), preventing a false backfill completion (cursor <= floor)
-// or livelock (governance UP-3/UP-4).
+// unparseable, or older than `min_epoch_secs` (callers pass the FIXED
+// kNvdCatalogStartEpoch — see above). Whether the walk has reached the *configured*
+// floor is decided separately by the caller comparing the parsed cursor to
+// backfill_floor(now); parse_cursor only screens out pre-catalog garbage.
 std::optional<std::chrono::system_clock::time_point> parse_cursor(const std::string& s,
                                                                   long long min_epoch_secs) {
     if (s.empty())
@@ -151,16 +157,15 @@ NvdSyncManager::SyncStatus NvdSyncManager::status() const {
     SyncStatus st = status_;
     // Surface backfill progress (cpp/consistency S1 + sre): the store is the
     // source of truth for completion + the newest-first cursor.
-    st.backfill_complete = db_->get_meta("backfill_complete") == "1";
-    // Display-only: show the stored cursor whenever it parses. Unlike the
-    // do_backfill walk (which floors the cursor to avoid a false-complete), status()
-    // must NOT reject a legitimately-completed cursor. The walk floor is now-relative
-    // and drifts forward with wall-clock, so a completed backfill's cursor (pinned to
-    // the floor at completion time) sits BELOW today's floor after any restart — a
-    // now-relative bound here would blank a valid completed cursor (#1889 review, S1).
-    // std::stoll range (via the catch in parse_cursor) is the only sanity gate needed.
-    if (auto cur = parse_cursor(db_->get_meta("backfill_oldest_published"),
-                                std::numeric_limits<long long>::min()))
+    // Completion is DERIVED (cursor vs current floor), not read from a sticky flag —
+    // the same source of truth as do_sync's branch, so status can't report "complete"
+    // while the loop is still backfilling a newly-deepened range (#1889 review r2).
+    st.backfill_complete = backfill_complete();
+    // Display the stored cursor whenever it clears the fixed catalog-start bound
+    // (pre-1999 = garbage → blank). This does NOT blank a legitimately-completed
+    // cursor: the walk floor is >= the catalog start in every config, so a completed
+    // cursor is always >= 1999 and survives (#1889 review, S1).
+    if (auto cur = parse_cursor(db_->get_meta("backfill_oldest_published"), kNvdCatalogStartEpoch))
         st.backfill_oldest_published = iso_of(*cur);
     // Survive restart: last_sync_time lives in meta, not just memory (S1).
     if (st.last_sync_time.empty())
@@ -169,12 +174,20 @@ NvdSyncManager::SyncStatus NvdSyncManager::status() const {
 }
 
 bool NvdSyncManager::backfill_complete() const {
-    // Defensive: this is called from the sync_loop header (outside do_sync's
-    // try/catch), so a throwing SQLite read must not escape the thread and
-    // std::terminate the process. Treat an unreadable flag as "not complete"
-    // (safe default — keeps backfilling; do_sync's catch logs the real error).
+    // Completion is DERIVED from the persisted cursor vs the CURRENTLY-configured
+    // floor, never a sticky flag: a flag written under a past --nvd-backfill-years
+    // would wrongly report "complete" after an operator deepens the config, leaving
+    // the newly-requested older range unfetched forever (#1889 review r2). The cursor
+    // is parsed against the FIXED catalog-start bound (not backfill_floor(now)) so a
+    // legitimately-completed cursor pinned at an older, now-drifted bounded floor is
+    // NOT rejected — only pre-catalog garbage is. Defensive try/catch: this runs in
+    // the sync_loop header outside do_sync's guard, so a throwing SQLite read must not
+    // escape the thread and std::terminate (unreadable → "not complete", safe: keeps
+    // backfilling).
     try {
-        return db_->get_meta("backfill_complete") == "1";
+        const auto cursor =
+            parse_cursor(db_->get_meta("backfill_oldest_published"), kNvdCatalogStartEpoch);
+        return cursor.has_value() && *cursor <= backfill_floor(std::chrono::system_clock::now());
     } catch (const std::exception& e) {
         spdlog::warn("NVD backfill_complete() meta read failed: {} (assuming not complete)",
                      e.what());
@@ -268,9 +281,22 @@ void NvdSyncManager::do_sync() {
 
 std::chrono::system_clock::time_point
 NvdSyncManager::backfill_floor(std::chrono::system_clock::time_point now) const {
-    // backfill_years <= 0 means "full history"; 100y back covers NVD's start (1999).
-    const int years = backfill_years_ <= 0 ? 100 : backfill_years_;
-    return now - std::chrono::years(years);
+    const auto nvd_start =
+        std::chrono::system_clock::time_point{std::chrono::seconds{kNvdCatalogStartEpoch}};
+    // Full history (backfill_years <= 0) walks back to NVD's catalog start. A bounded
+    // config is clamped to that same start: no CVEs predate it, and a sub-1999 floor
+    // (backfill_years > ~56 gives a pre-1970 negative-epoch floor) would reintroduce
+    // the pre-catalog-garbage accept bug (#1889 review r2). Clamping keeps
+    // epoch_secs(floor) a sane positive bound in every configuration.
+    if (backfill_years_ <= 0)
+        return nvd_start;
+    // Clamp the year count before the subtraction: --nvd-backfill-years is unbounded
+    // at config parse, and an absurd value would overflow the years->system_clock
+    // conversion (UB). 200y is far past NVD's ~27y catalog — the max() below pins any
+    // real deep config to nvd_start regardless — and stays well inside int64 range.
+    constexpr int kMaxSaneBackfillYears = 200;
+    const int years = std::min(backfill_years_, kMaxSaneBackfillYears);
+    return std::max(now - std::chrono::years(years), nvd_start);
 }
 
 void NvdSyncManager::do_backfill() {
@@ -280,13 +306,15 @@ void NvdSyncManager::do_backfill() {
 
     // Resume from the oldest published date reached so far (newest-first walk).
     // Clamp to `now`: a future cursor (clock skew) would otherwise ask NVD for a
-    // future window forever (livelock, UP-4). A missing/below-floor cursor restarts
-    // from `now` — idempotent (re-fetch), so no corruption, just repeated work. The
-    // sanity bound is the *configured* floor, so full-history mode's legitimate
-    // sub-2000 cursor resumes instead of restarting every boot (#1889).
-    auto cursor = std::min(
-        parse_cursor(db_->get_meta("backfill_oldest_published"), epoch_secs(floor)).value_or(now),
-        now);
+    // future window forever (livelock, UP-4). The parse bound is the FIXED catalog
+    // start — a pre-1999 garbage cursor is rejected and restarts from `now` (idempotent
+    // re-fetch); a valid cursor already at/below the configured floor simply makes the
+    // while-loop below exit immediately (no re-fetch). Floor gating lives in the loop,
+    // not in the parse bound (#1889 review r2).
+    auto cursor =
+        std::min(parse_cursor(db_->get_meta("backfill_oldest_published"), kNvdCatalogStartEpoch)
+                     .value_or(now),
+                 now);
 
     // On a fresh backfill start, pin the freshness cursor to now so that after a
     // multi-day backfill the first freshness pass re-checks everything modified
@@ -312,20 +340,28 @@ void NvdSyncManager::do_backfill() {
             total += result.records.size();
         }
         cursor = window_start;
+        // Re-capture the wall clock per window so last_sync_time actually advances
+        // during a multi-hour backfill (#1889 review r2). `now` is deliberately NOT
+        // reassigned — the floor and cursor clamp stay pinned to the pass start; only
+        // the "last progress" timestamp tracks real time.
+        const auto window_now_iso = iso_of(std::chrono::system_clock::now());
         db_->set_meta("backfill_oldest_published", std::to_string(epoch_secs(cursor)));
-        db_->set_meta("last_sync_time", iso_of(now)); // persist so status survives restart (S1)
+        db_->set_meta("last_sync_time", window_now_iso); // persist so status survives restart (S1)
         // Compute the count OUTSIDE the status lock so a concurrent status()
         // reader never blocks on a SQLite query (cpp-safety SHOULD).
         const auto count = db_->total_cve_count();
         {
             std::lock_guard<std::mutex> lock{mu_};
             status_.total_cves = count;
-            status_.last_sync_time = iso_of(now);
+            status_.last_sync_time = window_now_iso;
         }
     }
 
     if (cursor <= floor) {
-        db_->set_meta("backfill_complete", "1");
+        // No sticky "backfill_complete" flag is written: completion is DERIVED from the
+        // persisted cursor vs the current floor (see backfill_complete()), so a later
+        // config deepening correctly re-opens the backfill instead of trusting a flag
+        // written under the old, shallower config (#1889 review r2).
         spdlog::info("NVD backfill complete — floor reached ({} CVEs upserted this pass)", total);
     }
 }
@@ -343,7 +379,7 @@ void NvdSyncManager::do_freshness() {
     // nvd_split_windows returns empty for start >= end, so a future cursor clamped
     // to `now` still yields no window and the stale future cursor would persist.
     const auto parsed =
-        parse_cursor(db_->get_meta("last_freshness_check"), epoch_secs(backfill_floor(now)));
+        parse_cursor(db_->get_meta("last_freshness_check"), kNvdCatalogStartEpoch);
     const auto start = (parsed && *parsed <= now) ? *parsed : (now - std::chrono::days(2));
     std::size_t total = 0;
 
