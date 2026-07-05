@@ -61,7 +61,11 @@ public:
 
     bool is_open() const;
     void upsert_cve(const CveRecord& record);
-    void upsert_cves(const std::vector<CveRecord>& records); // batch in transaction
+    // Batch upsert in one transaction. Returns false if the batch was NOT fully
+    // persisted — BEGIN/COMMIT failed, or any record rolled back to its prior state.
+    // Callers that advance a resume cursor MUST check this and hold the cursor on
+    // false, or they skip past fetched-but-unpersisted CVEs (#1889 review r4).
+    [[nodiscard]] bool upsert_cves(const std::vector<CveRecord>& records);
     std::vector<CveMatch> match_inventory(const std::vector<SoftwareItem>& inventory) const;
 
     // Sync metadata
@@ -72,6 +76,11 @@ public:
     void seed_builtin_rules();
 
     std::size_t total_cve_count() const;
+    // Count of real NVD-sourced CVEs only (source='nvd'), excluding the built-in
+    // fallback rules seeded at startup. Completion/recovery checks must use THIS, not
+    // total_cve_count(), or seeded builtins masquerade as a populated mirror
+    // (#1889 review r4).
+    std::size_t nvd_cve_count() const;
 
 private:
     sqlite3* db_ = nullptr;
@@ -82,7 +91,8 @@ private:
     // upsert_cve_impl is atomic per CVE (savepoint) and returns false if the
     // CVE was rolled back, leaving its prior match set intact (governance UP-1).
     bool upsert_cve_impl(const CveRecord& record);
-    void upsert_cves_impl(const std::vector<CveRecord>& records);
+    // Returns false if the batch was not fully persisted (see upsert_cves).
+    bool upsert_cves_impl(const std::vector<CveRecord>& records);
 };
 
 /// Compare two version strings numerically (e.g. "1.10.0" > "1.9.0").

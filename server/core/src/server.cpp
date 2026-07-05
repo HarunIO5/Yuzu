@@ -293,6 +293,10 @@ public:
           api_rate_limiter_(cfg_.rate_limit), login_rate_limiter_(cfg_.login_rate_limit) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
+        metrics_.describe("yuzu_nvd_total_cves", "Distinct CVEs in the local NVD catalog", "gauge");
+        metrics_.describe("yuzu_nvd_backfill_complete",
+                          "1 when the newest-first NVD backfill has reached its floor, else 0",
+                          "gauge");
         metrics_.describe("yuzu_server_default_certs_active",
                           "1 when running with built-in per-install default certificates, else 0",
                           "gauge");
@@ -1156,7 +1160,8 @@ public:
 
         if (cfg_.nvd_sync_enabled && nvd_db_->is_open()) {
             nvd_sync_ = std::make_unique<NvdSyncManager>(nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy,
-                                                         cfg_.nvd_sync_interval);
+                                                         cfg_.nvd_sync_interval,
+                                                         cfg_.nvd_backfill_years);
             // #1867: do NOT start the background thread here. Its first action is
             // an uncancellable NVD fetch; if a LATER ctor step fails closed (e.g.
             // the Postgres substrate probe below sets startup_failed_), ~ServerImpl
@@ -4795,6 +4800,16 @@ private:
                 metrics_.gauge("yuzu_server_group_members_total")
                     .set(static_cast<double>(mgmt_group_store_->count_all_members()));
             }
+            // Refresh NVD backfill gauges (multi-hour background job — needs to be
+            // observable; governance sre BLOCKING).
+            if (nvd_db_ && nvd_db_->is_open()) {
+                metrics_.gauge("yuzu_nvd_total_cves")
+                    .set(static_cast<double>(nvd_db_->total_cve_count()));
+                if (nvd_sync_) {
+                    auto st = nvd_sync_->status();
+                    metrics_.gauge("yuzu_nvd_backfill_complete").set(st.backfill_complete ? 1 : 0);
+                }
+            }
             res.set_content(metrics_.serialize(), "text/plain; version=0.0.4; charset=utf-8");
         });
 
@@ -5874,13 +5889,20 @@ private:
                                  return;
                              }
                              nlohmann::json j;
-                             j["enabled"] = true;
+                             // "enabled" reflects whether the sync manager exists, not
+                             // merely whether the DB file is open: under --no-nvd-sync the
+                             // catalog DB is still open (for matching) but sync is off, so
+                             // reporting enabled=true then 503-ing POST /api/nvd/sync was
+                             // contradictory (#1889 review r2).
+                             j["enabled"] = (nvd_sync_ != nullptr);
                              j["total_cves"] = nvd_db_->total_cve_count();
                              if (nvd_sync_) {
                                  auto st = nvd_sync_->status();
                                  j["syncing"] = st.syncing;
                                  j["last_sync_time"] = st.last_sync_time;
                                  j["last_error"] = st.last_error;
+                                 j["backfill_complete"] = st.backfill_complete;
+                                 j["backfill_oldest_published"] = st.backfill_oldest_published;
                              }
                              res.set_content(j.dump(), "application/json");
                          });
@@ -5896,8 +5918,10 @@ private:
                     "application/json");
                 return;
             }
-            // Run sync in a detached thread so we don't block the HTTP response
-            std::thread([this] { nvd_sync_->sync_now(); }).detach();
+            // Ask the background loop to sync at its next wake and return at once.
+            // (A detached thread here could outlive the manager and use-after-free
+            // db_/fetcher_ during the hours-long backfill — governance BLOCKING.)
+            nvd_sync_->request_sync();
             res.set_content(R"({"status":"sync_started"})", "application/json");
         });
 
@@ -5912,7 +5936,7 @@ private:
                     "application/json");
                 return;
             }
-            // Parse inventory: array of {name, version} or pipe-delimited lines
+            // Parse inventory: JSON body with an "inventory" array of {name, version}.
             std::vector<SoftwareItem> inventory;
             try {
                 auto body = nlohmann::json::parse(req.body);

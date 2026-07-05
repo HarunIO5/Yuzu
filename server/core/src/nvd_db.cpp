@@ -322,6 +322,18 @@ void NvdDatabase::create_tables() {
             CREATE INDEX IF NOT EXISTS idx_cve_match_product ON cve_match(cpe_product);
             CREATE INDEX IF NOT EXISTS idx_cve_match_cveid   ON cve_match(cve_id);
         )"},
+        // v2's idx_cve_match_product is BINARY-collated, but match_inventory
+        // filters with a case-insensitive `LIKE 'name%'`. SQLite only uses an
+        // index for a LIKE prefix when the index collation matches the LIKE's
+        // case-mode — a BINARY index does NOT qualify for the default
+        // (case-insensitive) LIKE, so the "prefix-anchor" query still full-scans
+        // cve_match. Rebuild the index NOCASE so the prefix seek actually engages
+        // at full-catalog scale (governance perf-P1). NOCASE is safe here: the
+        // values are already stored lowercased.
+        {3, R"(
+            DROP INDEX IF EXISTS idx_cve_match_product;
+            CREATE INDEX idx_cve_match_product ON cve_match(cpe_product COLLATE NOCASE);
+        )"},
     };
     const int before = MigrationRunner::current_version(db_, "nvd_database");
     if (!MigrationRunner::run(db_, "nvd_database", kMigrations)) {
@@ -458,21 +470,23 @@ bool NvdDatabase::upsert_cve_impl(const CveRecord& record) {
     return ok;
 }
 
-void NvdDatabase::upsert_cves(const std::vector<CveRecord>& records) {
+bool NvdDatabase::upsert_cves(const std::vector<CveRecord>& records) {
     std::unique_lock lock(mtx_);
-    upsert_cves_impl(records);
+    return upsert_cves_impl(records);
 }
 
-void NvdDatabase::upsert_cves_impl(const std::vector<CveRecord>& records) {
-    if (!db_ || records.empty())
-        return;
+bool NvdDatabase::upsert_cves_impl(const std::vector<CveRecord>& records) {
+    if (!db_)
+        return false; // no connection — nothing was persisted
+    if (records.empty())
+        return true; // nothing to persist is not a failure
 
     char* err_msg = nullptr;
     int rc = sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
         spdlog::error("NvdDatabase: BEGIN failed: {}", err_msg ? err_msg : "unknown");
         sqlite3_free(err_msg);
-        return;
+        return false;
     }
 
     // INVARIANT: at most one CveRecord per cve_id per batch. upsert_cve_impl
@@ -497,7 +511,18 @@ void NvdDatabase::upsert_cves_impl(const std::vector<CveRecord>& records) {
         sqlite3_free(err_msg);
         // Attempt rollback
         sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        return false;
     }
+    // Return false if the batch was not FULLY persisted — BEGIN/COMMIT failed (handled
+    // above) or ANY record rolled back to its prior state (failed > 0). The caller HOLDS
+    // its resume cursor on false and retries, so it never advances past unpersisted CVEs
+    // (#1889 review r4). It deliberately does not advance-and-drop after N retries: for a
+    // vuln mirror a dropped window is a permanent false-negative, so a persistent failure
+    // fails safe (the mirror stays incomplete + the error is surfaced) rather than silently
+    // losing CVEs. In practice this schema (all-TEXT, no CHECK/UNIQUE) can't produce a
+    // data-dependent per-record failure, so a persistent hold only happens on catastrophic
+    // I/O/corruption where the whole server is already degraded.
+    return failed == 0;
 }
 
 std::vector<CveMatch>
@@ -550,7 +575,13 @@ NvdDatabase::match_inventory(const std::vector<SoftwareItem>& inventory) const {
         if (item.name.empty() || item.version.empty())
             continue;
 
-        std::string pattern = "%" + like_escape(to_lower(item.name)) + "%";
+        // PREFIX-anchored, not substring: `name%` (no leading `%`) so
+        // idx_cve_match_product turns this into an index seek instead of a full
+        // cve_match scan per item — required at full-catalog scale (perf-P1 hard
+        // gate). Narrower than substring: the inventory name must be a PREFIX of
+        // the CPE product (canonical tokens, so acceptable; vendor-precise
+        // identity waits for ADR-0018).
+        std::string pattern = like_escape(to_lower(item.name)) + "%";
 
         sqlite3_reset(stmt);
         sqlite3_bind_text(stmt, 1, pattern.c_str(), -1, SQLITE_TRANSIENT);
@@ -688,8 +719,10 @@ void NvdDatabase::seed_builtin_rules() {
         records.push_back(std::move(rec));
     }
 
-    upsert_cves_impl(records);
-    spdlog::info("NvdDatabase: seeded {} builtin CVE rules", records.size());
+    if (upsert_cves_impl(records))
+        spdlog::info("NvdDatabase: seeded {} builtin CVE rules", records.size());
+    else
+        spdlog::warn("NvdDatabase: some builtin CVE rules failed to seed");
 }
 
 std::size_t NvdDatabase::total_cve_count() const {
@@ -702,6 +735,31 @@ std::size_t NvdDatabase::total_cve_count() const {
     int rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("NvdDatabase: total_cve_count prepare failed: {}", sqlite3_errmsg(db_));
+        return 0;
+    }
+
+    std::size_t count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = static_cast<std::size_t>(sqlite3_column_int64(stmt, 0));
+    }
+
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+std::size_t NvdDatabase::nvd_cve_count() const {
+    std::shared_lock lock(mtx_);
+    if (!db_)
+        return 0;
+
+    // Only real NVD rows — NOT the source='builtin' fallback rules seeded at startup —
+    // so a mirror holding only builtins is never mistaken for a populated NVD catalog
+    // (#1889 review r4).
+    const char* sql = "SELECT COUNT(*) FROM cve WHERE source = 'nvd'";
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("NvdDatabase: nvd_cve_count prepare failed: {}", sqlite3_errmsg(db_));
         return 0;
     }
 
