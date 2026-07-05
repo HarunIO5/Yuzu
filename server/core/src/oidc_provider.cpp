@@ -8,6 +8,16 @@
 #include <cstdio>
 #include <sstream>
 
+// OpenSSL is an unconditional server dependency on every platform (vcpkg.json;
+// server/core/meson.build). RSA JWKS parsing and JWT signature verification use
+// the OpenSSL EVP path on all platforms, including Windows (#1856/#1782). Include
+// the OpenSSL headers before <windows.h> so OpenSSL's X509_NAME type is declared
+// before wincrypt.h (pulled by windows.h) redefines X509_NAME as a macro.
+#include <openssl/bn.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h> // RAND_bytes — non-Windows random_bytes() only (Windows uses BCryptGenRandom)
+#include <openssl/rsa.h>
+
 #ifdef _WIN32
 // clang-format off
 #include <windows.h>
@@ -16,11 +26,6 @@
 // clang-format on
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "winhttp.lib")
-#else
-#include <openssl/bn.h>
-#include <openssl/evp.h>
-#include <openssl/rand.h>
-#include <openssl/rsa.h>
 #endif
 
 namespace yuzu::server::oidc {
@@ -572,7 +577,6 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
 
 // ── JWKS fetching and JWT signature verification (G2-SEC-A1-001) ─────────────
 
-#ifndef _WIN32
 // Convert base64url-encoded big-endian integer to BIGNUM
 static BIGNUM* base64url_to_bn(const std::string& b64url) {
     auto bytes = OidcProvider::base64url_decode(b64url);
@@ -599,9 +603,18 @@ static std::shared_ptr<EVP_PKEY> jwk_to_pkey(const nlohmann::json& jwk) {
         return nullptr;
     }
 
-    // Build RSA public key and wrap in EVP_PKEY
+    // Build RSA public key and wrap in EVP_PKEY.
+    // RSA_new / RSA_set0_key / EVP_PKEY_assign_RSA are OSSL_DEPRECATEDIN_3_0.
+    // Suppress the deprecation on every compiler now that this compiles on
+    // Windows too (MSVC C4996; GCC/Clang -Wdeprecated-declarations). The GCC
+    // pragma is guarded away from MSVC so it does not itself warn (C4068).
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#elif defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
     RSA* rsa = RSA_new();
     if (!rsa) {
         BN_free(bn_n);
@@ -609,7 +622,12 @@ static std::shared_ptr<EVP_PKEY> jwk_to_pkey(const nlohmann::json& jwk) {
         return nullptr;
     }
     if (RSA_set0_key(rsa, bn_n, bn_e, nullptr) != 1) {
-        RSA_free(rsa); // frees bn_n and bn_e
+        // On failure RSA_set0_key does NOT take ownership (it rejects before
+        // assigning), so RSA_free won't touch the BIGNUMs — free them here to
+        // avoid a leak.
+        BN_free(bn_n);
+        BN_free(bn_e);
+        RSA_free(rsa);
         return nullptr;
     }
     // bn_n and bn_e now owned by rsa
@@ -624,12 +642,15 @@ static std::shared_ptr<EVP_PKEY> jwk_to_pkey(const nlohmann::json& jwk) {
         RSA_free(rsa);
         return nullptr;
     }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
+#endif
     // rsa now owned by pkey
 
     return std::shared_ptr<EVP_PKEY>(pkey, EVP_PKEY_free);
 }
-#endif // !_WIN32
 
 void OidcProvider::fetch_jwks() {
     if (config_.jwks_uri.empty()) {
@@ -693,13 +714,11 @@ void OidcProvider::fetch_jwks() {
             cached.kid = key.value("kid", "");
             cached.alg = key.value("alg", "RS256");
 
-#ifndef _WIN32
             cached.pkey = jwk_to_pkey(key);
             if (!cached.pkey) {
                 spdlog::warn("OidcProvider: failed to parse JWK kid={}", cached.kid);
                 continue;
             }
-#endif
             new_keys.push_back(std::move(cached));
         }
 
@@ -742,11 +761,6 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
     if (alg != "RS256" && alg != "RS384" && alg != "RS512")
         return std::unexpected("unsupported JWT algorithm: " + alg);
 
-#ifdef _WIN32
-    // TODO: Implement BCrypt-based JWT signature verification for Windows
-    spdlog::warn("OidcProvider: JWT signature verification not yet implemented on Windows");
-    return {};
-#else
     // Ensure JWKS is cached and fresh
     {
         std::lock_guard lock(jwks_mu_);
@@ -833,7 +847,28 @@ find_key:;
 
     spdlog::debug("OidcProvider: JWT signature verified (alg={}, kid={})", alg, kid);
     return {};
-#endif // !_WIN32
+}
+
+bool OidcProvider::add_test_jwks_key(const std::string& kid, const std::string& n_b64url,
+                                     const std::string& e_b64url) {
+    // Reuse the real JWK→EVP_PKEY parser so tests exercise the same code the
+    // production JWKS fetch does.
+    nlohmann::json jwk = {{"kty", "RSA"}, {"n", n_b64url}, {"e", e_b64url}};
+    auto pkey = jwk_to_pkey(jwk);
+    if (!pkey)
+        return false;
+
+    CachedJwk cached;
+    cached.kid = kid;
+    cached.alg = "RS256";
+    cached.pkey = std::move(pkey);
+
+    std::lock_guard lock(jwks_mu_);
+    jwks_cache_.push_back(std::move(cached));
+    // Mark the cache fresh so verify_jwt_signature uses the injected key without
+    // attempting a (test-absent) network fetch.
+    jwks_fetched_at_ = std::chrono::steady_clock::now();
+    return true;
 }
 
 // ── OidcProvider ─────────────────────────────────────────────────────────────
