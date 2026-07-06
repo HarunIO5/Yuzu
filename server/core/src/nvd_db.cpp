@@ -338,6 +338,14 @@ void NvdDatabase::create_tables() {
             DROP INDEX IF EXISTS idx_cve_match_product;
             CREATE INDEX idx_cve_match_product ON cve_match(cpe_product COLLATE NOCASE);
         )"},
+        // v4: composite (vendor, product) index for assess()'s vendor-scoped identity
+        // lookups (ADR-0018 typed-identity path). cpe_vendor stays BINARY (default —
+        // both stored data and the query are lowercased, so an equality seek engages),
+        // while cpe_product is COLLATE NOCASE so a vendor+prefix `LIKE 'x%'` still uses
+        // the index. The v3 single-column idx_cve_match_product is KEPT: match_inventory
+        // and vendor-less prefix assess() queries still seek on it (no regression).
+        {4, R"(CREATE INDEX IF NOT EXISTS idx_cve_match_vendor_product
+                ON cve_match(cpe_vendor, cpe_product COLLATE NOCASE);)"},
     };
     const int before = MigrationRunner::current_version(db_, "nvd_database");
     if (!MigrationRunner::run(db_, "nvd_database", kMigrations)) {
@@ -488,12 +496,14 @@ bool NvdDatabase::upsert_cve_impl(const CveRecord& record) {
     return ok;
 }
 
-bool NvdDatabase::upsert_cves(const std::vector<CveRecord>& records) {
+bool NvdDatabase::upsert_cves(const std::vector<CveRecord>& records,
+                             std::vector<std::string>* changed_ids) {
     std::unique_lock lock(mtx_);
-    return upsert_cves_impl(records);
+    return upsert_cves_impl(records, changed_ids);
 }
 
-bool NvdDatabase::upsert_cves_impl(const std::vector<CveRecord>& records) {
+bool NvdDatabase::upsert_cves_impl(const std::vector<CveRecord>& records,
+                                  std::vector<std::string>* changed_ids) {
     if (!db_)
         return false; // no connection — nothing was persisted
     if (records.empty())
@@ -567,8 +577,15 @@ bool NvdDatabase::upsert_cves_impl(const std::vector<CveRecord>& records) {
 
     std::size_t failed = 0;
     for (const auto& record : *to_upsert) {
-        if (!upsert_cve_one(db_, record, hdr.get(), del.get(), ins.get()))
+        if (!upsert_cve_one(db_, record, hdr.get(), del.get(), ins.get())) {
             ++failed; // this CVE rolled back to its prior state; batch continues
+        } else if (changed_ids) {
+            // Record the successfully-persisted cve_id from the per-CVE success bool
+            // (NOT sqlite3_changes(), #1033). `*to_upsert` is already deduped by cve_id
+            // (the merge path folds duplicates), so this delta is deduped within the
+            // batch without a second dedup set.
+            changed_ids->push_back(record.cve_id);
+        }
     }
 
     if (failed > 0) {
@@ -693,6 +710,172 @@ NvdDatabase::match_inventory(const std::vector<SoftwareItem>& inventory) const {
 
     sqlite3_finalize(stmt);
     return matches;
+}
+
+AssessResult NvdDatabase::assess(const CpeQuery& q) const {
+    std::shared_lock lock(mtx_);
+    AssessResult out;
+
+    // Guard 1 (before any vendor branch): no connection or no product → nothing to assess.
+    if (!db_ || q.product.empty())
+        return out;
+    // Guard 2: a bare unqualified prefix must be long enough to seek meaningfully — a
+    // <3-char prefix with no vendor scope would sweep half the catalog. Exact-product or
+    // vendor-scoped queries are exempt (they seek on an equality column).
+    if (!q.exact_product && q.vendor.empty() && q.product.size() < 3)
+        return out;
+
+    // ALWAYS lowercase internally — never trust the caller to have done it (the stored
+    // cpe_vendor/cpe_product are lowercased at ingest; cpe_vendor uses a BINARY equality
+    // seek so both sides must match case).
+    const std::string prod = to_lower(q.product);
+    const std::string vend = to_lower(q.vendor);
+
+    // Escape LIKE metacharacters so a '_'/'%' in the product name can't broaden the
+    // prefix match (same guard as match_inventory). Pairs with ESCAPE '\' below.
+    auto like_escape = [](std::string_view s) {
+        std::string res;
+        res.reserve(s.size());
+        for (char c : s) {
+            if (c == '\\' || c == '%' || c == '_')
+                res.push_back('\\');
+            res.push_back(c);
+        }
+        return res;
+    };
+
+    // ONE query. The is_vulnerable=1 filter is both the correctness fix (never count an
+    // is_vulnerable=0 platform operand as a vulnerable identity) and the perf fix.
+    std::string sql =
+        "SELECT m.cve_id, m.cpe_version, "
+        "       m.version_start_including, m.version_start_excluding, "
+        "       m.version_end_including,  m.version_end_excluding, "
+        "       c.severity, c.description, c.published "
+        "FROM   cve_match m JOIN cve c ON c.cve_id = m.cve_id "
+        "WHERE  m.is_vulnerable = 1 AND ";
+    sql += q.exact_product ? "m.cpe_product = ? COLLATE NOCASE"
+                           : "m.cpe_product LIKE ? ESCAPE '\\'";
+    // INVARIANT (load-bearing): cpe_vendor is compared BINARY (no COLLATE NOCASE),
+    // deliberately. Vendors are stored lowercased at ingest (nvd_client.cpp) and
+    // assess() lowercases `vend` above, so a BINARY equality seek engages the
+    // (cpe_vendor, cpe_product) composite index. Do NOT add COLLATE NOCASE here —
+    // it would defeat the vendor seek (the exact reason the schema kept vendor
+    // BINARY while product is NOCASE). A future non-lowercasing CveRecord producer
+    // is the only way this misses; the fix for that is to lowercase on ingest, not
+    // to relax the query.
+    if (!vend.empty())
+        sql += " AND m.cpe_vendor = ?";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("NvdDatabase: assess prepare failed: {}", sqlite3_errmsg(db_));
+        return out;
+    }
+
+    const std::string product_bind = q.exact_product ? prod : (like_escape(prod) + "%");
+    int bind_idx = 1;
+    sqlite3_bind_text(stmt, bind_idx++, product_bind.c_str(), -1, SQLITE_TRANSIENT);
+    if (!vend.empty())
+        sqlite3_bind_text(stmt, bind_idx++, vend.c_str(), -1, SQLITE_TRANSIENT);
+
+    auto col = [](sqlite3_stmt* s, int i) -> std::string {
+        const char* t = reinterpret_cast<const char*>(sqlite3_column_text(s, i));
+        return t ? t : "";
+    };
+
+    std::unordered_map<std::string, std::size_t> idx; // cve_id -> position in out.hits
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        // Every stepped row is is_vulnerable=1 for this identity → the product is known.
+        out.product_known = true;
+
+        // Empty installed version: the product is known but no hit passes the range
+        // check (do NOT fabricate a clean-or-vulnerable verdict without a version).
+        if (q.version.empty())
+            continue;
+
+        const std::string cve_id = col(stmt, 0);
+        const std::string cpe_version = col(stmt, 1);
+        const std::string vsi = col(stmt, 2);
+        const std::string vse = col(stmt, 3);
+        const std::string vei = col(stmt, 4);
+        const std::string vee = col(stmt, 5);
+
+        VersionRange range{cpe_version, vsi, vse, vei, vee};
+        if (!nvd_version_in_range(q.version, range))
+            continue;
+
+        auto it = idx.find(cve_id);
+        if (it == idx.end()) {
+            idx.emplace(cve_id, out.hits.size());
+            out.hits.push_back(CveHit{cve_id, col(stmt, 6), col(stmt, 7), col(stmt, 8),
+                                      /*fixed_in=*/vee});
+        } else if (!vee.empty()) {
+            // Reconcile fixed_in across multiple in-range vulnerable rows for the same
+            // cve_id (real NVD data has several `configurations` branches per CVE+
+            // product). The correct answer is the MINIMUM versionEndExcluding across the
+            // in-range rows — the smallest version that lifts the installed version out
+            // of range. An empty vee carries no fix boundary, so a non-empty candidate
+            // always wins over empty; among non-empty candidates take the numeric min
+            // via the NVD comparator (NOT string compare — "8.0" < "10.0" lexically is
+            // wrong). Deterministic regardless of row order.
+            std::string& cur = out.hits[it->second].fixed_in;
+            if (cur.empty() || nvd_version_compare(vee, cur) < 0)
+                cur = vee;
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+std::vector<std::pair<std::string, std::string>>
+NvdDatabase::products_for_cves(const std::vector<std::string>& cve_ids) const {
+    std::shared_lock lock(mtx_);
+    std::vector<std::pair<std::string, std::string>> result;
+    if (!db_ || cve_ids.empty())
+        return result;
+
+    // Accumulate DISTINCT (vendor, product) ACROSS chunks — SQL DISTINCT only
+    // dedupes within a single IN(...) query, so a product appearing in two chunks
+    // would otherwise be emitted twice.
+    std::unordered_set<std::string> seen; // "vendor\x1fproduct" key
+    auto col = [](sqlite3_stmt* s, int i) -> std::string {
+        const char* t = reinterpret_cast<const char*>(sqlite3_column_text(s, i));
+        return t ? t : "";
+    };
+
+    constexpr std::size_t kChunk = 500;
+    for (std::size_t base = 0; base < cve_ids.size(); base += kChunk) {
+        const std::size_t n = std::min(kChunk, cve_ids.size() - base);
+
+        std::string sql = "SELECT DISTINCT cpe_vendor, cpe_product FROM cve_match "
+                          "WHERE is_vulnerable = 1 AND cve_id IN (";
+        for (std::size_t i = 0; i < n; ++i)
+            sql += (i == 0) ? "?" : ",?";
+        sql += ")";
+
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("NvdDatabase: products_for_cves prepare failed: {}", sqlite3_errmsg(db_));
+            return result;
+        }
+        for (std::size_t i = 0; i < n; ++i)
+            sqlite3_bind_text(stmt, static_cast<int>(i + 1), cve_ids[base + i].c_str(), -1,
+                              SQLITE_TRANSIENT);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            std::string vendor = col(stmt, 0);
+            std::string product = col(stmt, 1);
+            std::string key = vendor;
+            key.push_back('\x1f');
+            key += product;
+            if (seen.insert(std::move(key)).second)
+                result.emplace_back(std::move(vendor), std::move(product));
+        }
+        sqlite3_finalize(stmt);
+    }
+    return result;
 }
 
 std::string NvdDatabase::get_meta(const std::string& key) const {
