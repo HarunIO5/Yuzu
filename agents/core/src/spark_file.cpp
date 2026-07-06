@@ -26,6 +26,13 @@
 
 #ifdef _WIN32
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include "guard_win_handle.hpp" // detail::DirHandle, detail::EventHandle
 
 #include <spdlog/spdlog.h>
@@ -63,10 +70,24 @@ constexpr DWORD kFilter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_
 // DirWatch pointer) from a control wake (watch/unwatch/stop posted the queue).
 constexpr ULONG_PTR kControlKey = 0;
 
-std::wstring lower_w(std::wstring_view s) {
-    std::wstring out(s);
-    std::transform(out.begin(), out.end(), out.begin(),
-                   [](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
+// Locale-INDEPENDENT case fold for directory + filename matching (sec-M1).
+// NTFS is case-insensitive via an upcase table; guard_file.cpp matches changed
+// names with CompareStringOrdinal(...,TRUE). The previous per-wchar ::towlower is
+// C-locale (ASCII-only), so a non-ASCII filename differing only in case between
+// the spark's watched name and the FILE_NOTIFY_INFORMATION name would MISS — a
+// silently dropped spark (fail-open detection, worse than a crash for a Stage-2
+// enforce consumer). LCMapStringEx with the INVARIANT locale folds the full
+// Unicode range deterministically, matching NTFS case-insensitive semantics.
+std::wstring fold_ci(std::wstring_view s) {
+    if (s.empty())
+        return {};
+    const int n = ::LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, s.data(),
+                                  static_cast<int>(s.size()), nullptr, 0, nullptr, nullptr, 0);
+    if (n <= 0)
+        return std::wstring(s); // fold unavailable → exact match (safe; only over-strict on case)
+    std::wstring out(static_cast<std::size_t>(n), L'\0');
+    ::LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, s.data(), static_cast<int>(s.size()),
+                    out.data(), n, nullptr, nullptr, 0);
     return out;
 }
 
@@ -81,6 +102,10 @@ struct DirWatch {
     std::unordered_map<std::wstring, std::unordered_set<std::string>> keys; ///< fname → spark keys
     bool io_pending{false};         ///< a ReadDirectoryChangesW is outstanding
     bool removing{false};           ///< unwatch drained this dir; free once the last I/O returns
+    // Ancestor bookkeeping (S1: ancestors_ otherwise leak on churn).
+    int refcount{0};             ///< ancestor watch: # of absent dirs depending on it
+    std::wstring ancestor_key;   ///< real dir: which ancestor it currently depends on ("" = none)
+    bool faulted{false};         ///< real dir: last health reported through the fault channel (B1)
 };
 
 /// Windows file-change mechanism. Thread-safe: watch/unwatch (engine threads)
@@ -91,11 +116,12 @@ class WindowsFileMechanism final : public ISparkMechanism {
 public:
     ~WindowsFileMechanism() override { stop(); }
 
-    void start(SparkEmitFn emit) override {
+    void start(SparkEmitFn emit, SparkFaultFn fault) override {
         std::lock_guard lk(mu_);
         if (iocp_)
             return; // idempotent
         emit_ = std::move(emit);
+        fault_ = std::move(fault);
         iocp_.reset(::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, kControlKey, 1));
         if (!iocp_) {
             spdlog::error("spark_file: CreateIoCompletionPort failed (err={}) — file sparks inert",
@@ -113,8 +139,8 @@ public:
             return std::unexpected("file mechanism: params are not FileSparkParams");
         fs::path target = fs::path(fp->path);
         fs::path parent = target.has_parent_path() ? target.parent_path() : fs::current_path();
-        const std::wstring fname = lower_w(target.filename().wstring());
-        const std::wstring dirkey = lower_w(parent.wstring());
+        const std::wstring fname = fold_ci(target.filename().wstring());
+        const std::wstring dirkey = fold_ci(parent.wstring());
 
         std::lock_guard lk(mu_);
         if (!iocp_)
@@ -126,8 +152,8 @@ public:
             if (!arm_dir(*slot)) {
                 // Directory absent/unopenable: keep the (empty-of-I/O) entry so
                 // the key is recorded, and watch the nearest ancestor for the
-                // parent's (re)creation. arm_ancestor is best-effort.
-                arm_ancestor(parent);
+                // parent's (re)creation. arm_ancestor is best-effort + refcounted.
+                arm_ancestor(*slot);
             }
         }
         slot->keys[fname].insert(key);
@@ -153,10 +179,11 @@ public:
                 w.keys.erase(fi);
         }
         if (w.keys.empty()) {
-            // No spark cares about this dir any more. If an I/O is outstanding,
-            // cancel it and let the worker free the DirWatch when the (aborted)
-            // completion drains — never free memory a pending completion points
-            // at. If nothing is outstanding, drop it now.
+            // No spark cares about this dir any more. Drop its ancestor dependency
+            // (S1) first, then free. If an I/O is outstanding, cancel it and let
+            // the worker free the DirWatch when the (aborted) completion drains —
+            // never free memory a pending completion points at. Else drop now.
+            release_ancestor(w);
             if (w.io_pending) {
                 w.removing = true;
                 if (w.handle)
@@ -179,9 +206,92 @@ public:
         if (worker_.joinable())
             worker_.join();
         std::lock_guard lk(mu_);
-        dirs_.clear(); // worker is joined; safe to drop every DirWatch
+        // F2: the worker is joined, but a ReadDirectoryChangesW may still be
+        // outstanding — the kernel writes into buf/ov until it completes, so a
+        // bare CloseHandle+free races that write (UAF). Cancel every outstanding
+        // read across ALL three containers (dirs_, ancestors_, retiring_ — the
+        // prior code cleared only dirs_, leaking ancestor handles) and then REAP
+        // the cancelled completions from the IOCP before freeing.
+        //
+        // Reap via GetQueuedCompletionStatus, NOT GetOverlappedResult(wait=TRUE):
+        // the completion of an IOCP-associated handle is delivered to the PORT,
+        // and the dir OVERLAPPED has no hEvent, so GetOverlappedResult(TRUE) would
+        // wait on a handle that is never signaled → deadlock (caught on DGRHP).
+        // CancelIoEx makes each read complete promptly (ERROR_OPERATION_ABORTED),
+        // so one packet per outstanding read lands on the port; dequeue exactly
+        // that many (skipping our control wake), with a bounded wait so a lost
+        // completion can never hang shutdown.
+        std::size_t pending = 0;
+        auto cancel = [&](DirWatch& w) {
+            if (w.handle && w.io_pending) {
+                ::CancelIoEx(w.handle.get(), &w.ov);
+                ++pending;
+            }
+        };
+        for (auto& [k, w] : dirs_)
+            cancel(*w);
+        for (auto& [k, w] : ancestors_)
+            cancel(*w);
+        for (auto& w : retiring_)
+            cancel(*w);
+        bool lost_completion = false;
+        while (pending > 0) {
+            DWORD bytes = 0;
+            ULONG_PTR ckey = 0;
+            LPOVERLAPPED ov = nullptr;
+            const BOOL ok = ::GetQueuedCompletionStatus(iocp_.get(), &bytes, &ckey, &ov, 2000);
+            if (!ok && ov == nullptr) {
+                lost_completion = true; // 2s with no packet — a completion was lost
+                break;
+            }
+            if (ckey == kControlKey)
+                continue; // our own PostQueuedCompletionStatus wake(s)
+            --pending;    // a cancelled/normal read drained — kernel is done with its buf/ov
+        }
+        if (lost_completion) {
+            // A cancelled read's completion never arrived within the budget, so a
+            // read may still be live — the kernel could still write its buf/ov.
+            // Freeing it would be a use-after-free (governance UP2-4). Instead
+            // QUARANTINE every still-outstanding watch to PROCESS lifetime: its
+            // handle stays open and its buf/ov live forever, so a late kernel
+            // write is harmless. A bounded shutdown-only leak, only on this
+            // near-unreachable path (CancelIoEx on an open IOCP handle normally
+            // posts a prompt ABORTED packet), is the safe trade vs a UAF.
+            static std::vector<std::unique_ptr<DirWatch>> s_quarantine;
+            std::size_t leaked = 0;
+            for (auto it = dirs_.begin(); it != dirs_.end();) {
+                if (it->second && it->second->io_pending) {
+                    s_quarantine.push_back(std::move(it->second));
+                    it = dirs_.erase(it);
+                    ++leaked;
+                } else {
+                    ++it;
+                }
+            }
+            for (auto it = ancestors_.begin(); it != ancestors_.end();) {
+                if (it->second && it->second->io_pending) {
+                    s_quarantine.push_back(std::move(it->second));
+                    it = ancestors_.erase(it);
+                    ++leaked;
+                } else {
+                    ++it;
+                }
+            }
+            for (auto& w : retiring_)
+                if (w && w->io_pending) {
+                    s_quarantine.push_back(std::move(w));
+                    ++leaked;
+                }
+            spdlog::error("spark_file: shutdown drain lost a completion — quarantined {} "
+                          "outstanding watch(es) to process lifetime to avoid a UAF",
+                          leaked);
+        }
+        dirs_.clear();
+        ancestors_.clear();
+        retiring_.clear();
         iocp_.reset();
         emit_ = nullptr;
+        fault_ = nullptr;
     }
 
 private:
@@ -215,34 +325,81 @@ private:
         return w.io_pending;
     }
 
-    /// Best-effort: watch the nearest existing ancestor of a missing parent for
-    /// its (re)creation, so a deleted+recreated directory re-arms. The ancestor
-    /// watch is itself a DirWatch keyed under its own path with an empty key set
-    /// and a `removing`-immune sentinel; on any ancestor change the worker
-    /// re-resolves absent dirs. Mirrors guard_file's ancestor resilience.
-    void arm_ancestor(const fs::path& missing_parent) {
-        fs::path anc = missing_parent;
+    /// Best-effort: point `dependent` (a real dir whose parent is absent) at a
+    /// watch on the nearest existing ancestor, so a (re)created parent re-arms it.
+    /// Refcounts the shared ancestor watch (S1). Returns true if an ancestor is
+    /// being watched for it. Idempotent when the ancestor is unchanged.
+    bool arm_ancestor(DirWatch& dependent) {
+        fs::path anc = fs::path(dependent.dir);
         std::error_code ec;
         while (!anc.empty() && !fs::is_directory(anc, ec))
             anc = anc.parent_path();
-        if (anc.empty())
-            return;
-        const std::wstring akey = lower_w(anc.wstring());
+        if (anc.empty()) {
+            release_ancestor(dependent);
+            return false;
+        }
+        const std::wstring akey = fold_ci(anc.wstring());
+        if (dependent.ancestor_key == akey)
+            return true; // already depending on exactly this ancestor — no churn
+        release_ancestor(dependent);
         auto& slot = ancestors_[akey];
-        if (slot)
-            return; // already watching this ancestor
-        slot = std::make_unique<DirWatch>();
-        slot->dir = anc.wstring();
-        if (!arm_dir(*slot))
-            ancestors_.erase(akey);
+        if (!slot) {
+            slot = std::make_unique<DirWatch>();
+            slot->dir = anc.wstring();
+            if (!arm_dir(*slot)) {
+                ancestors_.erase(akey);
+                return false;
+            }
+        }
+        slot->refcount++;
+        dependent.ancestor_key = akey;
+        return true;
+    }
+
+    /// Drop `dependent`'s dependency on its ancestor watch; tear the ancestor down
+    /// when no absent dir still needs it (S1 — ancestors_ otherwise leak forever).
+    void release_ancestor(DirWatch& dependent) {
+        if (dependent.ancestor_key.empty())
+            return;
+        auto it = ancestors_.find(dependent.ancestor_key);
+        dependent.ancestor_key.clear();
+        if (it == ancestors_.end())
+            return;
+        if (--it->second->refcount > 0)
+            return; // another absent dir still depends on this ancestor
+        // Last dependent gone. If a read is outstanding, an IOCP packet still
+        // references its &ov, so the worker must free it on the drained completion
+        // — move it to retiring_ (freeing the map key for reuse) and mark removing.
+        // Otherwise drop it now.
+        if (it->second->handle && it->second->io_pending) {
+            it->second->removing = true;
+            ::CancelIoEx(it->second->handle.get(), &it->second->ov);
+            retiring_.push_back(std::move(it->second));
+        }
+        ancestors_.erase(it);
+    }
+
+    /// Record a health transition for every key in a real dir `w` (B1). Faults are
+    /// fired by the caller AFTER releasing mu_. No-op when the state is unchanged,
+    /// so fault_ sees only edges, not every fire.
+    void collect_health(DirWatch& w, bool faulted,
+                        std::vector<std::pair<std::string, bool>>& out) {
+        if (w.faulted == faulted)
+            return;
+        w.faulted = faulted;
+        for (auto& [fname, keys] : w.keys)
+            for (const auto& k : keys)
+                out.emplace_back(k, faulted);
     }
 
     /// Re-attempt every absent directory watch (an ancestor fired). Any that now
-    /// opens re-arms and drops its ancestor.
-    void reresolve_absent() {
+    /// opens re-arms, drops its ancestor dependency, and clears any prior fault.
+    void reresolve_absent(std::vector<std::pair<std::string, bool>>& faults) {
         for (auto& [dirkey, slot] : dirs_) {
-            if (slot && !slot->handle && !slot->keys.empty())
-                arm_dir(*slot);
+            if (slot && !slot->handle && !slot->keys.empty() && arm_dir(*slot)) {
+                release_ancestor(*slot);
+                collect_health(*slot, false, faults); // recovered
+            }
         }
     }
 
@@ -266,7 +423,7 @@ private:
             if (off + offsetof(FILE_NOTIFY_INFORMATION, FileName) + name_bytes > bytes)
                 break;
             const std::wstring fname =
-                lower_w(std::wstring_view(info->FileName, name_bytes / sizeof(WCHAR)));
+                fold_ci(std::wstring_view(info->FileName, name_bytes / sizeof(WCHAR)));
             auto fi = w.keys.find(fname);
             if (fi != w.keys.end())
                 fire.insert(fire.end(), fi->second.begin(), fi->second.end());
@@ -295,37 +452,67 @@ private:
             auto* w = reinterpret_cast<DirWatch*>(ckey);
             const bool is_ancestor = is_ancestor_watch(w);
             w->io_pending = false;
+
+            // Collect fires + health transitions under mu_; dispatch them AFTER
+            // releasing it (emit_/fault_ re-enter the engine under its lock, and
+            // an inline consumer may re-arm → back into watch()/mu_).
+            std::vector<std::string> emits;
+            std::vector<std::pair<std::string, bool>> faults;
+
             if (w->removing) {
-                drop_watch(w); // its aborted completion drained — free it now
-                continue;
-            }
-            if (!ok) {
-                // Directory handle went bad (deleted). Fall back to an ancestor
-                // watch so a recreate re-arms us.
+                drop_watch(w); // its aborted completion drained — free it now (do NOT touch w after)
+            } else if (!ok) {
+                // Directory handle went bad (deleted).
                 w->handle.reset();
-                if (!is_ancestor)
-                    arm_ancestor(fs::path(w->dir));
-                continue;
-            }
-            if (is_ancestor) {
+                if (!is_ancestor) {
+                    // A real dir with NO ancestor armable is fully deaf → fault (B1).
+                    collect_health(*w, !arm_ancestor(*w), faults);
+                } else {
+                    // UP2-2: the ANCESTOR dir itself was deleted. Left alone, its
+                    // dead (handle-null) slot strands every dependent — they only
+                    // recover on an ancestor fire this dead handle can never
+                    // deliver — and leaks the zombie slot + poisons a later
+                    // arm_ancestor that reuses its key. Re-point every dependent to
+                    // a fresh (higher) ancestor; arm_ancestor releases the dead one
+                    // (refcount→0 → erased; handle already null, so no drain). w may
+                    // be freed by that release — copy its key first and don't touch
+                    // w afterward.
+                    const std::wstring dead_akey = fold_ci(w->dir);
+                    for (auto& [dirkey, slot] : dirs_) {
+                        if (slot && slot->ancestor_key == dead_akey)
+                            collect_health(*slot, !arm_ancestor(*slot), faults);
+                    }
+                }
+            } else if (is_ancestor) {
                 // Something under the ancestor changed — a previously-absent
                 // parent may now exist. Re-arm the ancestor and re-resolve.
                 route_noop_rearm(*w);
-                reresolve_absent();
-                continue;
+                reresolve_absent(faults);
+            } else {
+                // Re-arm BEFORE processing (the #1907 condition-4 discipline: no
+                // dropped-change window). UP-2: if the dir vanished at re-arm, the
+                // ignored return used to leave the watch permanently deaf — now
+                // fall back to an ancestor watch (matching the !ok branch) and
+                // report health so a truly-deaf watch is observable.
+                emits = collect_fire(*w, bytes);
+                if (!arm_dir(*w))
+                    collect_health(*w, !arm_ancestor(*w), faults);
+                else
+                    collect_health(*w, false, faults); // healthy — clears any prior fault
             }
-            // Re-arm BEFORE processing (the #1907 condition-4 discipline: no
-            // dropped-change window), collect under the lock, then emit with the
-            // lock RELEASED — emit_ re-enters the SparkEngine under its lock and
-            // an inline consumer may re-arm (calling back into watch()/mu_).
-            std::vector<std::string> fire = collect_fire(*w, bytes);
-            arm_dir(*w);
-            SparkEmitFn emit = emit_;
-            lk.unlock();
-            for (const auto& key : fire)
-                if (emit)
-                    emit(key, SparkData{std::monostate{}});
-            lk.lock();
+
+            if (!emits.empty() || !faults.empty()) {
+                SparkEmitFn emit = emit_;
+                SparkFaultFn fault = fault_;
+                lk.unlock();
+                for (const auto& key : emits)
+                    if (emit)
+                        emit(key, SparkData{std::monostate{}});
+                for (const auto& [key, faulted] : faults)
+                    if (fault)
+                        fault(key, faulted, faulted ? "file re-arm failed" : "recovered");
+                lk.lock();
+            }
         }
     }
 
@@ -353,15 +540,22 @@ private:
                 ancestors_.erase(it);
                 return;
             }
+        for (auto it = retiring_.begin(); it != retiring_.end(); ++it)
+            if (it->get() == w) {
+                retiring_.erase(it);
+                return;
+            }
     }
 
     std::mutex mu_;
     detail::EventHandle iocp_; ///< IOCP handle (closed via CloseHandle)
     SparkEmitFn emit_;
+    SparkFaultFn fault_;
     std::thread worker_;
     std::atomic<bool> stop_{true};
     std::unordered_map<std::wstring, std::unique_ptr<DirWatch>> dirs_;      ///< real watched dirs
     std::unordered_map<std::wstring, std::unique_ptr<DirWatch>> ancestors_; ///< recreate-recovery
+    std::vector<std::unique_ptr<DirWatch>> retiring_; ///< ancestors awaiting a drained completion
     std::unordered_map<std::string, std::pair<std::wstring, std::wstring>> key_index_; ///< key→(dir,fname)
 };
 

@@ -22,6 +22,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -63,9 +64,10 @@ struct Collector {
 /// engine's watch/unwatch/start/stop calls and lets a test drive a fire.
 class FakeMechanism final : public ISparkMechanism {
 public:
-    void start(SparkEmitFn emit) override {
+    void start(SparkEmitFn emit, SparkFaultFn fault) override {
         std::lock_guard lk(mu_);
         emit_ = std::move(emit);
+        fault_ = std::move(fault);
         started_ = true;
         ++start_calls_;
     }
@@ -98,6 +100,16 @@ public:
         if (e)
             e(key, SparkData{std::monostate{}});
     }
+    // Drive the fault/health channel as a real mechanism would (lock released).
+    void fire_fault(const std::string& key, bool faulted, std::string_view reason) {
+        SparkFaultFn f;
+        {
+            std::lock_guard lk(mu_);
+            f = fault_;
+        }
+        if (f)
+            f(key, faulted, reason);
+    }
     bool is_watching(const std::string& key) {
         std::lock_guard lk(mu_);
         return watched_.count(key) > 0;
@@ -126,6 +138,7 @@ public:
 private:
     std::mutex mu_;
     SparkEmitFn emit_;
+    SparkFaultFn fault_;
     std::set<std::string> watched_;
     bool started_{false};
     bool fail_watch_{false};
@@ -311,8 +324,61 @@ TEST_CASE("File spark: a mechanism watch failure rolls the arm back", "[spark][m
 
     auto sub = engine.arm(*c, file_spec("/etc/hosts"));
     CHECK_FALSE(sub.has_value());          // watch failed → arm reported failure
-    CHECK(engine.stats().armed_sparks == 0); // and the spark was rolled back
+    CHECK(engine.stats().armed_sparks == 0); // and the whole key was torn down (B1)
     CHECK(engine.stats().subscriptions == 0);
+    engine.stop();
+}
+
+TEST_CASE("File spark: a pre-start replay watch failure marks the spark faulted, not silent",
+          "[spark][mechanism]") {
+    // A spark armed BEFORE start defers its watch to start()'s replay. If that
+    // replay fails, subscribers already hold ids, so (unlike the post-start arm
+    // which rolls back) the entry stays — but it must be flagged deaf via the
+    // fault channel so "armed but not watching" is observable, never silent (B1).
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    const auto spec = file_spec("/etc/hosts");
+    const std::string key = spark_key(spec);
+    REQUIRE(engine.arm(*c, spec).has_value()); // armed before start (watch deferred)
+    fake->set_fail_watch(true);                // the start() replay watch will fail
+
+    engine.start();
+    CHECK(eventually([&] { return fake->watch_calls() == 1; }));
+    CHECK_FALSE(fake->is_watching(key));       // watch never came up
+    CHECK(engine.stats().armed_sparks == 1);   // entry retained (ids outstanding)
+    CHECK(engine.stats().armed_faulted == 1);  // …but flagged deaf, not silent
+    CHECK(engine.stats().watch_faults_total == 1);
+    engine.stop();
+}
+
+TEST_CASE("Mechanism fault channel: fault flags health on the transition, recovery clears it (B1)",
+          "[spark][mechanism]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+    const auto spec = file_spec("/etc/hosts");
+    const std::string key = spark_key(spec);
+    REQUIRE(engine.arm(*c, spec).has_value());
+    CHECK(engine.stats().armed_faulted == 0);
+
+    fake->fire_fault(key, true, "watch died after arm");
+    CHECK(engine.stats().armed_faulted == 1);
+    CHECK(engine.stats().watch_faults_total == 1);
+    // Re-reporting the same faulted state is a no-op edge — the counter is a
+    // transition count, not a per-report count.
+    fake->fire_fault(key, true, "still dead");
+    CHECK(engine.stats().watch_faults_total == 1);
+
+    fake->fire_fault(key, false, "recovered");
+    CHECK(engine.stats().armed_faulted == 0);
+    CHECK(engine.stats().watch_faults_total == 1); // recovery does not bump the fault counter
+    // A fault for an unknown/disarmed key is ignored (no crash, no drift).
+    fake->fire_fault("registry|nope", true, "ghost");
+    CHECK(engine.stats().armed_faulted == 0);
     engine.stop();
 }
 

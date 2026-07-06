@@ -18,21 +18,40 @@
  *               (queued_dropped_total), so a stuck consumer can neither stall
  *               a watcher nor starve a sibling consumer. Queued handlers may
  *               block, dispatch plugins, do network I/O.
- *   - Inline  — runs synchronously on the watcher thread. Core-internal
- *               (never reachable from the plugin ABI); enforce-class only.
- *               Every inline call is timed — the duration counters
- *               (inline_us_*, inline_over_*) are the ADR §3 watchdog that
- *               feeds the Stage-11 resource gate. SLO is µs-MEDIAN, rare-ms
- *               tolerated (owner decision 2026-07-06).
+ *   - Inline  — runs synchronously on the PRODUCING watcher thread: the wheel
+ *               for timer sparks, OR the mechanism's own thread (the file
+ *               IOCP worker, a registry TP_WAIT pool thread) for event-driven
+ *               sparks. Core-internal (never reachable from the plugin ABI);
+ *               enforce-class only. Every inline call is timed — the duration
+ *               counters (inline_us_*, inline_over_*) are the ADR §3 watchdog
+ *               that feeds the Stage-11 resource gate. SLO is µs-MEDIAN,
+ *               rare-ms tolerated (owner decision 2026-07-06).
  *
  * Lifecycle: construct → register consumers / arm sparks (any order) →
  * start() → … → stop(). Single-shot: the engine does not restart after
- * stop(). stop() is prompt — undelivered queued events are dropped and
- * counted, watcher + consumer threads are joined (shutdown-budget kindness).
+ * stop(). stop() drops + counts undelivered queued events and quiesces the
+ * watcher + consumer threads. It is prompt FOR WELL-BEHAVED HANDLERS: a queued
+ * handler that blocks past kConsumerJoinBudgetMs is detached + counted, not
+ * joined, so a hung handler can never hang shutdown (governance UP-1 / #1311).
  *
  * Threading contract for callers: arm/disarm/register/stats are safe from any
- * thread, including from inside a handler. unregister_consumer joins that
- * consumer's thread — never call it from the consumer's own handler.
+ * thread, and from inside a handler WHILE THE ENGINE IS ALIVE. THREE exceptions:
+ *   (1) unregister_consumer quiesces that consumer's thread — never call it
+ *       from the consumer's own handler (self-join).
+ *   (2) An INLINE handler on an EVENT-DRIVEN spark runs on the mechanism's own
+ *       thread. Calling disarm() for that SAME registry spark from inside its
+ *       inline handler can self-deadlock in the current TP_WAIT teardown (the
+ *       callback waits on its own wait object). Queued handlers, and inline
+ *       handlers disarming a DIFFERENT spark, are safe. The registry mechanism
+ *       must defer teardown before an inline registry consumer is wired
+ *       (Stage 2) — governance F3.
+ *   (3) A QUEUED handler that may BLOCK must not call back into the engine
+ *       (arm/disarm/stats). It can be DETACHED at shutdown (see above), and the
+ *       engine — reached via the captured `this` such a call would use — may be
+ *       destroyed by the time the blocked handler resumes → use-after-free
+ *       (governance UP2-1). "Safe from inside a handler" holds only for the
+ *       non-blocking, engine-outlives-the-call case; a blockable handler must
+ *       treat the engine as possibly-gone once it has blocked.
  */
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
@@ -51,6 +70,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -60,9 +80,16 @@ namespace yuzu::agent {
 /// wiring (the agent has no /metrics — the dex/guardian convention).
 struct SparkEngineStats {
     std::uint64_t armed_sparks{0};       ///< deduped watcher entries
+    std::uint64_t armed_faulted{0};      ///< armed sparks a mechanism reported deaf (B1 health)
     std::uint64_t subscriptions{0};      ///< live subscriptions across all armed sparks
     std::uint64_t consumers{0};          ///< registered queued consumers
-    std::uint64_t watcher_threads{0};    ///< mechanism threads currently running
+    /// Watcher UNITS while running: the wheel + one per registered event-driven
+    /// mechanism. NOT an OS thread count — a mechanism may run a small pool (the
+    /// registry TP_WAIT pool is 2–4 threads). Named `_units` deliberately so a
+    /// resource-gate cross-check doesn't mistake it for `ps -T` (governance S1).
+    std::uint64_t watcher_units{0};
+    std::uint64_t watch_faults_total{0}; ///< mechanism fault reports (post-arm deaf edges), monotonic
+    std::uint64_t consumer_threads_detached{0}; ///< handlers that blocked past the shutdown budget
     std::uint64_t events_total{0};       ///< spark fires (post-dedup, pre-fan-out)
     std::uint64_t queued_delivered_total{0};
     std::uint64_t queued_dropped_total{0}; ///< bounded-queue overflow + shutdown drops
@@ -92,6 +119,9 @@ public:
     /// A disk spark's FIRST poll runs within this of start — early, but
     /// timer-driven, never at-arm (the dex_win_poll macOS lesson).
     static constexpr std::uint64_t kFirstDiskPollCapMs = 60'000;
+    /// Per-consumer shutdown budget: a dispatch thread still inside a handler
+    /// past this on stop()/unregister is detached, not joined (governance UP-1).
+    static constexpr std::uint64_t kConsumerJoinBudgetMs = 2'000;
 
     SparkEngine();
     ~SparkEngine();
@@ -106,27 +136,41 @@ public:
     /// a watcher is running". Rejects a null mechanism, a timer-driven type
     /// (interval/startup/disk are the wheel's), a duplicate registration, and
     /// any call after start().
-    std::expected<void, std::string>
+    [[nodiscard]] std::expected<void, std::string>
     register_mechanism(SparkType type, std::unique_ptr<ISparkMechanism> mechanism);
 
     /// Register a queued consumer. Its dispatch thread starts immediately;
     /// events flow once the engine starts and the consumer arms sparks.
-    std::expected<ConsumerId, std::string>
+    /// CAPTURE-LIFETIME CONTRACT (governance UP2-1): because a hung handler is
+    /// DETACHED at shutdown (see unregister_consumer / stop()), its dispatch
+    /// thread may still be executing `handler(ev)` after this engine — and its
+    /// caller — return. Anything the handler CAPTURES (a plugin host, a network
+    /// client, a Reflex context) must therefore be process-lifetime-stable, or
+    /// its owner must outlive a possibly-detached dispatch. Capturing a
+    /// stack/short-lived object by reference into a queued handler is a
+    /// use-after-free waiting for a slow-handler shutdown.
+    [[nodiscard]] std::expected<ConsumerId, std::string>
     register_consumer(std::string name, QueuedHandler handler,
                       std::size_t queue_cap = kDefaultQueueCap);
 
-    /// Drop a consumer: disarms its subscriptions, then joins its dispatch
-    /// thread. Never call from inside the consumer's own handler (self-join).
+    /// Drop a consumer: disarms its subscriptions, then BOUNDED-joins its
+    /// dispatch thread (kConsumerJoinBudgetMs). A handler still running past the
+    /// budget (queued handlers may block on I/O) is DETACHED and counted
+    /// (consumer_threads_detached) rather than hanging the caller — the detached
+    /// thread touches only its own refcounted state, never the engine, so it is
+    /// memory-safe. Never call from inside the consumer's own handler (self-join).
     void unregister_consumer(ConsumerId id);
 
     /// Arm a spark for queued delivery to `consumer`. Dedup: an equal spec
     /// already armed (by anyone) adds a subscription to the existing watcher.
-    /// Rejects malformed specs and mechanisms not yet built in this slice
-    /// (file / service / registry — PR 1b/1c).
-    std::expected<SubscriptionId, std::string> arm(ConsumerId consumer, SparkSpec spec);
+    /// Rejects a malformed spec or an event-driven type with no registered
+    /// mechanism (armed == a watcher is running).
+    [[nodiscard]] std::expected<SubscriptionId, std::string> arm(ConsumerId consumer,
+                                                                 SparkSpec spec);
 
     /// Arm a spark for INLINE delivery (see tier contract above). Core-internal.
-    std::expected<SubscriptionId, std::string> arm_inline(SparkSpec spec, InlineHandler handler);
+    [[nodiscard]] std::expected<SubscriptionId, std::string> arm_inline(SparkSpec spec,
+                                                                        InlineHandler handler);
 
     /// Remove one subscription; the watcher itself disarms when its last
     /// subscription goes. Unknown ids are ignored (idempotent).
@@ -136,8 +180,11 @@ public:
     /// the start instant; startup sparks fire immediately. Single-shot.
     void start();
 
-    /// Stop watchers, then consumer dispatch threads (prompt; undelivered
-    /// events are dropped + counted). Idempotent.
+    /// Stop watchers (wheel + mechanisms), then consumer dispatch threads.
+    /// PROMPT FOR WELL-BEHAVED HANDLERS ONLY: a queued handler that blocks past
+    /// kConsumerJoinBudgetMs is DETACHED + counted rather than joined, so a hung
+    /// handler can never hang agent shutdown (governance UP-1 / #1311 class).
+    /// Undelivered queued events are dropped + counted. Idempotent.
     void stop();
 
     [[nodiscard]] bool is_running() const noexcept;
@@ -149,6 +196,9 @@ public:
     /// Test seam: lower the interval/poll cadence floor so tests run in ms.
     /// Set BEFORE any arm().
     void set_cadence_floor_for_test(std::uint64_t floor_ms);
+    /// Test seam: shrink the per-consumer shutdown budget so the detach-a-hung-
+    /// handler path (UP-1) is exercised in ms, not kConsumerJoinBudgetMs.
+    void set_consumer_join_budget_for_test(std::uint64_t ms);
 
 private:
     struct Subscriber {
@@ -172,7 +222,21 @@ private:
         std::chrono::steady_clock::time_point next_due{};
         bool scheduled{false};    ///< on the wheel (false once a one-shot fired)
         bool disk_latched{false}; ///< Disk sparks: poll-and-latch state
+        /// A mechanism reported this event-driven spark's watch deaf after a
+        /// successful arm (B1). Health-only: surfaced in stats, never blocks
+        /// firing. Cleared when the mechanism reports recovery.
+        bool faulted{false};
         std::vector<Subscriber> subs;
+    };
+
+    /// Delivery counters touched by consumer dispatch threads. Heap-owned via a
+    /// shared_ptr the threads capture, so a DETACHED consumer thread (a handler
+    /// that blocked past the shutdown budget, UP-1) can keep writing them safely
+    /// after the engine is destroyed — the thread never dereferences the engine.
+    struct DeliveryCounters {
+        std::atomic<std::uint64_t> delivered{0};
+        std::atomic<std::uint64_t> dropped{0};
+        std::atomic<std::uint64_t> errors{0};
     };
 
     struct Consumer {
@@ -183,6 +247,12 @@ private:
         std::condition_variable cv;
         std::deque<SparkEvent> queue;
         bool stopping{false};
+        /// Bounded-shutdown signal: the dispatch thread sets `finished` + notifies
+        /// `done_cv` on clean exit, so stop()/unregister can wait_for the budget
+        /// then join-or-detach. A hung handler never sets it → we detach (UP-1).
+        std::mutex done_mu;
+        std::condition_variable done_cv;
+        bool finished{false};
         std::thread thread;
     };
 
@@ -202,9 +272,28 @@ private:
     /// simply skipped. Distinct from the wheel's commit path, which also owns
     /// reschedule + per-subscriber startup semantics.
     void emit_event(const std::string& key, SparkData data);
+    /// Mechanism health entry point (B1): a mechanism reports that a watch it had
+    /// armed went deaf (faulted=true) or recovered (faulted=false). Folds the
+    /// edge into Armed::faulted + the fault counter under mu_. Never blocks
+    /// firing — health only. Called with the engine lock released.
+    void report_fault(const std::string& key, bool faulted, std::string_view reason);
     void wheel_loop();
     void deliver(const SparkEvent& ev, const std::vector<Subscriber>& subs);
-    void consumer_loop(const std::shared_ptr<Consumer>& consumer);
+    /// Signal one consumer to stop (set stopping + notify). Non-blocking.
+    static void signal_stop(const std::shared_ptr<Consumer>& consumer);
+    /// Wait for one already-signalled consumer to finish until `deadline`, then
+    /// join it; detach + count if it is still inside a handler at the deadline
+    /// (UP-1). Caller holds NO lock.
+    void await_consumer(const std::shared_ptr<Consumer>& consumer,
+                        std::chrono::steady_clock::time_point deadline);
+    /// signal_stop + await_consumer against a fresh per-consumer budget (the
+    /// single-consumer path, unregister_consumer). Idempotent per consumer.
+    void quiesce_consumer(const std::shared_ptr<Consumer>& consumer);
+    /// Static (captures no `this`): a detached consumer thread must reference only
+    /// the two shared_ptrs it was handed, so it stays memory-safe after the engine
+    /// dies (UP-1).
+    static void consumer_loop(std::shared_ptr<Consumer> consumer,
+                              std::shared_ptr<DeliveryCounters> counters);
 
     // armed sparks + subscription index + wheel state, all under mu_.
     mutable std::mutex mu_;
@@ -229,12 +318,18 @@ private:
     DiskReaderFn disk_reader_; ///< test seam; null = read_disk_level (set before start; the
                                ///< wheel snapshots it once at thread start — set-then-start)
     std::atomic<std::uint64_t> cadence_floor_ms_{kMinCadenceMs}; ///< atomic: read at arm, set by test seam
+    std::atomic<std::uint64_t> consumer_join_budget_ms_{kConsumerJoinBudgetMs}; ///< test seam
+
+    // Delivery counters touched by consumer dispatch threads live in a shared
+    // block so a detached thread can write them after ~SparkEngine (UP-1). The
+    // producer-side drop-oldest path (deliver, on watcher threads joined before
+    // destruction) writes the same block via this handle.
+    std::shared_ptr<DeliveryCounters> delivery_{std::make_shared<DeliveryCounters>()};
+    std::atomic<std::uint64_t> consumer_threads_detached_{0};
+    std::atomic<std::uint64_t> watch_faults_{0}; ///< monotonic mechanism fault-report count
 
     // Counters updated outside mu_ (delivery paths) — atomics.
     std::atomic<std::uint64_t> events_total_{0};
-    std::atomic<std::uint64_t> queued_delivered_{0};
-    std::atomic<std::uint64_t> queued_dropped_{0};
-    std::atomic<std::uint64_t> consumer_errors_{0};
     std::atomic<std::uint64_t> inline_calls_{0};
     std::atomic<std::uint64_t> inline_errors_{0};
     std::atomic<std::uint64_t> inline_us_total_{0};

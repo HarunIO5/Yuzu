@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <future>
 #include <mutex>
 #include <stdexcept>
@@ -91,6 +92,35 @@ TEST_CASE("SparkEngine: interval spark delivers to a queued consumer", "[spark][
     const auto stats = engine.stats();
     CHECK(stats.events_total >= 3);
     CHECK(stats.queued_delivered_total >= 3);
+}
+
+TEST_CASE("SparkEngine: two distinct sparks due in one wheel tick both fire (no double-lock)",
+          "[spark][engine]") {
+    // Regression (governance HP-1): two DISTINCT-key timer sparks that clamp to
+    // the same cadence floor get an identical next_due from start()'s shared
+    // `now` and land in one wheel scan (due.size()==2). The prior wheel re-locked
+    // mu_ per due item, so the second item's commit lk.lock() double-locked →
+    // std::system_error, uncaught on the wheel thread → std::terminate (agent
+    // crash). Every other multi-arm test reuses an IDENTICAL spec (dedup →
+    // due.size()==1), so this path was never exercised. Without the fix this
+    // test crashes the process.
+    SparkEngine engine;
+    engine.set_cadence_floor_for_test(10); // both specs below clamp to 10ms
+    Collector a;
+    Collector b;
+    auto ca = engine.register_consumer("a", a.handler());
+    auto cb = engine.register_consumer("b", b.handler());
+    REQUIRE(ca.has_value());
+    REQUIRE(cb.has_value());
+    // Raw intervals 5 and 8 → distinct spark_keys (not deduped) but BOTH floored
+    // to the 10ms test floor → identical cadence → identical next_due at start().
+    REQUIRE(engine.arm(*ca, interval_spec(5)).has_value());
+    REQUIRE(engine.arm(*cb, interval_spec(8)).has_value());
+    CHECK(engine.stats().armed_sparks == 2); // two distinct armed sparks, not one
+
+    engine.start(); // both scheduled off one `now` → collide on the first tick
+    CHECK(eventually([&] { return a.count() >= 2 && b.count() >= 2; }));
+    engine.stop();
 }
 
 TEST_CASE("SparkEngine: equal specs dedup to one armed spark, fan out to all subscribers",
@@ -243,6 +273,119 @@ TEST_CASE("SparkEngine: full queue drops oldest and counts, never blocks",
 
     unstick.set_value();
     engine.stop();
+}
+
+TEST_CASE("SparkEngine: bounded queue drops the OLDEST — newest survives (drop identity)",
+          "[spark][engine][isolation]") {
+    // A count-only assertion passes even for a drop-NEWEST bug. Assert identity:
+    // the surviving events are the most recent, and an early one was dropped.
+    SparkEngine engine;
+    engine.set_cadence_floor_for_test(10);
+    std::promise<void> unstick;
+    std::shared_future<void> uf = unstick.get_future().share();
+    std::mutex m;
+    std::vector<std::uint64_t> got;
+    std::atomic<int> calls{0};
+    auto consumer = engine.register_consumer(
+        "slow",
+        [&](const SparkEvent& ev) {
+            if (++calls == 1)
+                uf.wait(); // wedge on the first fire so later fires pile up + drop
+            std::lock_guard lk(m);
+            got.push_back(ev.seq);
+        },
+        /*queue_cap=*/2);
+    REQUIRE(consumer.has_value());
+    REQUIRE(engine.arm(*consumer, interval_spec(15)).has_value());
+
+    engine.start();
+    CHECK(eventually([&] { return calls.load() >= 1; }));                    // wedged on seq 1
+    CHECK(eventually([&] { return engine.stats().queued_dropped_total >= 3; })); // middle seqs dropped
+    unstick.set_value();
+    CHECK(eventually([&] {
+        std::lock_guard lk(m);
+        return got.size() >= 3;
+    }));
+    engine.stop();
+
+    std::lock_guard lk(m);
+    REQUIRE(got.size() >= 3);
+    CHECK(got[0] == 1);      // the wedged first fire
+    CHECK(got[1] > 2);       // seq 2 was dropped as oldest → a NEWER seq survived
+    CHECK(got[2] > got[1]);  // monotonic — most-recent-wins, not most-recent-lost
+}
+
+TEST_CASE("SparkEngine: a handler blocked past the shutdown budget is detached, not hung (UP-1)",
+          "[spark][engine]") {
+    // Queued handlers may block (network/plugin I/O). stop() must bound the join
+    // and DETACH a hung handler rather than hang agent shutdown (#1311 class).
+    SparkEngine engine;
+    engine.set_cadence_floor_for_test(10);
+    engine.set_consumer_join_budget_for_test(120); // shrink the budget for the test
+    std::mutex m;
+    std::condition_variable cv;
+    bool release = false;
+    std::atomic<bool> in_handler{false};
+    auto consumer = engine.register_consumer("blocker", [&](const SparkEvent&) {
+        in_handler.store(true);
+        std::unique_lock lk(m);
+        cv.wait(lk, [&] { return release; }); // block until the test frees us
+    });
+    REQUIRE(consumer.has_value());
+    REQUIRE(engine.arm(*consumer, interval_spec(20)).has_value());
+
+    engine.start();
+    CHECK(eventually([&] { return in_handler.load(); })); // handler is now wedged
+
+    const auto t0 = std::chrono::steady_clock::now();
+    engine.stop(); // MUST return within ~budget, not block on the wedged handler
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(elapsed < 2000ms); // bounded (budget 120ms + generous slack), not hung
+    CHECK(engine.stats().consumer_threads_detached >= 1);
+
+    // Free the detached handler so its thread exits cleanly (no leaked blocker).
+    {
+        std::lock_guard lk(m);
+        release = true;
+    }
+    cv.notify_all();
+}
+
+TEST_CASE("SparkEngine: N blocked handlers detach against ONE shared budget, not N× (UP2-3)",
+          "[spark][engine]") {
+    SparkEngine engine;
+    engine.set_cadence_floor_for_test(10);
+    engine.set_consumer_join_budget_for_test(200);
+    std::mutex m;
+    std::condition_variable cv;
+    bool release = false;
+    std::atomic<int> wedged{0};
+    auto blocker = [&](const SparkEvent&) {
+        wedged.fetch_add(1);
+        std::unique_lock lk(m);
+        cv.wait(lk, [&] { return release; });
+    };
+    for (int i = 0; i < 3; ++i) {
+        auto c = engine.register_consumer("blk" + std::to_string(i), blocker);
+        REQUIRE(c.has_value());
+        REQUIRE(engine.arm(*c, interval_spec(20)).has_value()); // dedups → 1 spark, 3 subs
+    }
+    engine.start();
+    CHECK(eventually([&] { return wedged.load() >= 3; })); // all 3 handlers wedged
+
+    const auto t0 = std::chrono::steady_clock::now();
+    engine.stop();
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    // Serial join-then-detach would be 3×200ms=600ms; the shared deadline makes
+    // it ~200ms. Assert well under the serial cost (generous ceiling for CI jitter).
+    CHECK(elapsed < 450ms);
+    CHECK(engine.stats().consumer_threads_detached >= 3);
+
+    {
+        std::lock_guard lk(m);
+        release = true;
+    }
+    cv.notify_all();
 }
 
 TEST_CASE("SparkEngine: inline tier runs on the watcher thread and is duration-accounted",

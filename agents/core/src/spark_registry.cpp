@@ -28,6 +28,13 @@
 
 #ifdef _WIN32
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include "guard_win_handle.hpp" // detail::EventHandle
 
 #include <spdlog/spdlog.h>
@@ -132,6 +139,7 @@ struct RegWatch {
     PTP_WAIT wait{nullptr};
     WatchMode mode{WatchMode::Target};
     bool active{true};
+    bool faulted{false}; ///< last-reported health, so fault_ fires only on transitions
     WindowsRegistryMechanism* owner{nullptr};
 };
 
@@ -139,11 +147,12 @@ class WindowsRegistryMechanism final : public ISparkMechanism {
 public:
     ~WindowsRegistryMechanism() override { stop(); }
 
-    void start(SparkEmitFn emit) override {
+    void start(SparkEmitFn emit, SparkFaultFn fault) override {
         std::lock_guard lk(mu_);
         if (pool_)
             return; // idempotent
         emit_ = std::move(emit);
+        fault_ = std::move(fault);
         pool_ = ::CreateThreadpool(nullptr);
         if (!pool_) {
             spdlog::error("spark_registry: CreateThreadpool failed (err={}) — registry sparks inert",
@@ -186,8 +195,14 @@ public:
             return std::unexpected("registry mechanism: CreateThreadpoolWait failed");
         // Arm-before-check: establish the notify + TP_WAIT before returning. A
         // registry change spark fires on a CHANGE, so there is no initial emit.
-        if (!reconcile(*w))
+        if (!reconcile(*w)) {
+            // F1: reconcile failed after CreateThreadpoolWait succeeded — release
+            // the TP_WAIT before the unique_ptr drops it, or it leaks on every
+            // failed arm. SetThreadpoolWait was never called on this path, so
+            // teardown()'s CloseThreadpoolWait is the operative cleanup.
+            teardown(*w);
             return std::unexpected("registry mechanism: could not arm any watch for the key");
+        }
         watches_.emplace(key, std::move(w));
         return {};
     }
@@ -236,6 +251,7 @@ public:
         }
         started_ = false;
         emit_ = nullptr;
+        fault_ = nullptr;
     }
 
 private:
@@ -291,7 +307,10 @@ private:
 
     void on_fire(RegWatch& w) {
         SparkEmitFn emit;
+        SparkFaultFn fault;
         bool do_emit = false;
+        bool fault_changed = false;
+        bool now_faulted = false;
         {
             std::lock_guard lk(mu_);
             if (!w.active)
@@ -300,10 +319,14 @@ private:
             // Re-arm BEFORE processing (condition 4): reconcile re-issues the
             // RegNotify + SetThreadpoolWait for the next change. A failure here
             // (neither target nor even the hive root armable) leaves the watch
-            // deaf — rare, but logged so it is not silent. A degraded retry-timer
-            // is a follow-up (guard_registry had kArmFailRetryMs; the TP_WAIT
-            // model needs a pool timer, deferred).
-            if (!reconcile(w))
+            // deaf — now reported through the fault channel (B1) instead of only
+            // a log, so a deaf watch is observable in SparkEngineStats.
+            now_faulted = !reconcile(w);
+            if (w.faulted != now_faulted) {
+                w.faulted = now_faulted; // report the fault edge only, not every fire
+                fault_changed = true;
+            }
+            if (now_faulted)
                 spdlog::warn("spark_registry: re-arm failed for '{}' — watch is now deaf",
                              w.spark_key);
             // Emit when the key existed before this fire (it changed/was deleted)
@@ -311,13 +334,19 @@ private:
             // changed while our target stays absent) does not emit.
             do_emit = (old_mode == WatchMode::Target) || (w.mode == WatchMode::Target);
             emit = emit_;
+            fault = fault_;
         }
+        // Fire emit + fault with mu_ RELEASED: both re-enter the engine under its
+        // own lock, and an inline re-arm would take our mu_ → deadlock if held.
         if (do_emit && emit)
             emit(w.spark_key, SparkData{std::monostate{}});
+        if (fault_changed && fault)
+            fault(w.spark_key, now_faulted, now_faulted ? "registry re-arm failed" : "recovered");
     }
 
     std::mutex mu_;
     SparkEmitFn emit_;
+    SparkFaultFn fault_;
     PTP_POOL pool_{nullptr};
     TP_CALLBACK_ENVIRON env_{};
     bool started_{false};

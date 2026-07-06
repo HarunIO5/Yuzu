@@ -48,8 +48,22 @@ namespace yuzu::agent {
 /// that re-arms takes that lock).
 using SparkEmitFn = std::function<void(const std::string& key, SparkData data)>;
 
+/// The engine's fault/health callback (ADR-0021 Stage 1, governance B1). A
+/// mechanism calls it — from its OWN thread — when a watch it had SUCCESSFULLY
+/// armed can no longer be maintained (`faulted=true`: the watched key/dir was
+/// deleted and re-arm failed, a registry re-arm returned an error, a future
+/// sd-bus/SCM connection collapsed), and again when that watch recovers
+/// (`faulted=false`). `reason` is a short human string for the log. This closes
+/// the gap where "armed == a watcher is running" (spark.hpp) could silently
+/// drift AFTER a successful arm: the engine folds the fault into per-key health
+/// (SparkEngineStats::armed_faulted + watch_faults_total) so a deaf watch is
+/// observable, never silent. Called with the engine lock released (like emit).
+/// Idempotent per state — repeating the same faulted value is a no-op edge.
+using SparkFaultFn =
+    std::function<void(const std::string& key, bool faulted, std::string_view reason)>;
+
 /// One watch mechanism for one event-driven SparkType. Lifecycle mirrors the
-/// engine: register (pre-start) → start(emit) → watch/unwatch as sparks
+/// engine: register (pre-start) → start(emit, fault) → watch/unwatch as sparks
 /// arm/disarm while running → stop(). The engine calls start / watch / unwatch
 /// / stop with NO engine lock held — a mechanism method may block on OS handle
 /// setup without stalling every other arm/disarm/emit.
@@ -61,10 +75,10 @@ public:
     ISparkMechanism(const ISparkMechanism&) = delete;
     ISparkMechanism& operator=(const ISparkMechanism&) = delete;
 
-    /// Begin the mechanism thread(s). `emit` is retained for the mechanism's
-    /// lifetime. Called exactly once by SparkEngine::start(), BEFORE the engine
-    /// replays any watch() for a spark armed before start.
-    virtual void start(SparkEmitFn emit) = 0;
+    /// Begin the mechanism thread(s). `emit` and `fault` are retained for the
+    /// mechanism's lifetime. Called exactly once by SparkEngine::start(), BEFORE
+    /// the engine replays any watch() for a spark armed before start.
+    virtual void start(SparkEmitFn emit, SparkFaultFn fault) = 0;
 
     /// Begin watching one armed spark. `params` is the variant alternative
     /// matching this mechanism's type (the engine guarantees the match).

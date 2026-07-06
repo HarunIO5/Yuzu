@@ -19,8 +19,12 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <chrono>
+#include <iterator>
 #include <optional>
+#include <string_view>
 #include <utility>
+#include <variant>
 
 namespace yuzu::agent {
 
@@ -92,7 +96,9 @@ SparkEngine::register_consumer(std::string name, QueuedHandler handler, std::siz
     consumer->name = std::move(name);
     consumer->handler = std::move(handler);
     consumer->cap = queue_cap;
-    consumer->thread = std::thread([this, consumer] { consumer_loop(consumer); });
+    // Capture only the two shared_ptrs, NEVER `this`: the thread may be detached
+    // at shutdown (UP-1) and outlive the engine, so it must not dereference it.
+    consumer->thread = std::thread(&SparkEngine::consumer_loop, consumer, delivery_);
     {
         std::lock_guard lk(consumers_mu_);
         consumers_.emplace(id, std::move(consumer));
@@ -116,7 +122,7 @@ void SparkEngine::unregister_consumer(ConsumerId id) {
             it = subs.empty() ? armed_.erase(it) : std::next(it);
         }
     }
-    // 2) Take the consumer out of the fan-out map, then stop + join its thread.
+    // 2) Take the consumer out of the fan-out map, then bounded-join its thread.
     std::shared_ptr<Consumer> consumer;
     {
         std::lock_guard lk(consumers_mu_);
@@ -126,16 +132,51 @@ void SparkEngine::unregister_consumer(ConsumerId id) {
         consumer = std::move(it->second);
         consumers_.erase(it);
     }
+    quiesce_consumer(consumer);
+}
+
+void SparkEngine::signal_stop(const std::shared_ptr<Consumer>& consumer) {
     {
         std::lock_guard lk(consumer->mu);
         consumer->stopping = true;
     }
     consumer->cv.notify_all();
-    if (consumer->thread.joinable())
-        consumer->thread.join();
 }
 
-void SparkEngine::consumer_loop(const std::shared_ptr<Consumer>& consumer) {
+void SparkEngine::await_consumer(const std::shared_ptr<Consumer>& consumer,
+                                 std::chrono::steady_clock::time_point deadline) {
+    // Bound the join against a shared deadline: a queued handler is explicitly
+    // permitted to block (network / plugin I/O), so a hung one must not hang
+    // shutdown (UP-1 / #1311). A SHARED deadline (not a fresh per-consumer
+    // budget) keeps N hung consumers to ~1×budget total, not N×budget (UP2-3).
+    // On expiry DETACH — safe because the thread captured only its own
+    // shared_ptr<Consumer> + shared_ptr<DeliveryCounters>, never the engine.
+    bool finished = false;
+    {
+        std::unique_lock lk(consumer->done_mu);
+        finished = consumer->done_cv.wait_until(lk, deadline, [&] { return consumer->finished; });
+    }
+    if (!consumer->thread.joinable())
+        return;
+    if (finished) {
+        consumer->thread.join();
+    } else {
+        consumer->thread.detach();
+        consumer_threads_detached_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::warn("SparkEngine: consumer '{}' handler did not finish within budget — detached "
+                     "(shutdown not blocked)",
+                     consumer->name);
+    }
+}
+
+void SparkEngine::quiesce_consumer(const std::shared_ptr<Consumer>& consumer) {
+    signal_stop(consumer);
+    await_consumer(consumer, std::chrono::steady_clock::now() + std::chrono::milliseconds(
+                                 consumer_join_budget_ms_.load(std::memory_order_relaxed)));
+}
+
+void SparkEngine::consumer_loop(std::shared_ptr<Consumer> consumer,
+                                std::shared_ptr<DeliveryCounters> counters) {
     for (;;) {
         SparkEvent ev;
         {
@@ -144,26 +185,32 @@ void SparkEngine::consumer_loop(const std::shared_ptr<Consumer>& consumer) {
             if (consumer->stopping) {
                 // Prompt shutdown: whatever is still queued is dropped + counted
                 // rather than delivered late into a tearing-down agent.
-                queued_dropped_.fetch_add(consumer->queue.size(), std::memory_order_relaxed);
+                counters->dropped.fetch_add(consumer->queue.size(), std::memory_order_relaxed);
                 consumer->queue.clear();
-                return;
+                break;
             }
             ev = std::move(consumer->queue.front());
             consumer->queue.pop_front();
         }
         try {
             consumer->handler(ev);
-            queued_delivered_.fetch_add(1, std::memory_order_relaxed);
+            counters->delivered.fetch_add(1, std::memory_order_relaxed);
         } catch (const std::exception& e) {
-            consumer_errors_.fetch_add(1, std::memory_order_relaxed);
+            counters->errors.fetch_add(1, std::memory_order_relaxed);
             spdlog::warn("SparkEngine: consumer '{}' handler threw on spark '{}': {}",
                          consumer->name, ev.key, e.what());
         } catch (...) {
-            consumer_errors_.fetch_add(1, std::memory_order_relaxed);
+            counters->errors.fetch_add(1, std::memory_order_relaxed);
             spdlog::warn("SparkEngine: consumer '{}' handler threw on spark '{}'", consumer->name,
                          ev.key);
         }
     }
+    // Signal clean exit so a bounded quiesce_consumer join succeeds (vs detach).
+    {
+        std::lock_guard lk(consumer->done_mu);
+        consumer->finished = true;
+    }
+    consumer->done_cv.notify_all();
 }
 
 // ── Arming ────────────────────────────────────────────────────────────────────
@@ -317,12 +364,27 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     }
 
     // Arm the OS watch with mu_ RELEASED — watch() may block on handle setup,
-    // and an inline emit from the mechanism re-enters under mu_. On failure roll
-    // the subscription back so we never leave a spark armed without a watcher.
+    // and an inline emit from the mechanism re-enters under mu_. `mech` is set
+    // only for a NEWLY-INSERTED event-driven key, so a failure here means the
+    // watcher for this whole key never came up.
     if (mech) {
         auto w = mech->watch(key, watch_params);
         if (!w) {
-            disarm(id);
+            // Tear down the ENTIRE key, not just our own subscription (governance
+            // B1): between our unlock above and here, a concurrent arm() of an
+            // equal spec may have deduped ONTO this key (adding its own sub with
+            // a valid id it believes is armed). disarm(id) would remove only ours
+            // and leave that sibling armed with NO watcher — violating "armed ==
+            // a watcher is running". Dropping the whole key makes any sibling id
+            // inert (idempotent disarm), which is correct: a failed watch is a
+            // failed arm for everyone sharing it.
+            std::lock_guard lk(mu_);
+            auto it = armed_.find(key);
+            if (it != armed_.end()) {
+                for (const auto& s : it->second.subs)
+                    sub_keys_.erase(s.id);
+                armed_.erase(it);
+            }
             return std::unexpected(std::string("watch mechanism failed to arm '") + key +
                                    "': " + w.error());
         }
@@ -404,21 +466,26 @@ void SparkEngine::start() {
         armed_count = armed_.size();
         wheel_thread_ = std::thread([this] { wheel_loop(); });
     }
-    // Start mechanisms (wire the emit callback), THEN replay pre-start watches —
-    // both with mu_ released (handle setup blocks). Mechanisms are started
-    // before any watch() reaches them.
+    // Start mechanisms (wire the emit + fault callbacks), THEN replay pre-start
+    // watches — both with mu_ released (handle setup blocks). Mechanisms are
+    // started before any watch() reaches them.
     for (auto* m : mechs)
-        m->start([this](const std::string& key, SparkData data) {
-            emit_event(key, std::move(data));
-        });
+        m->start([this](const std::string& key, SparkData data) { emit_event(key, std::move(data)); },
+                 [this](const std::string& key, bool faulted, std::string_view reason) {
+                     report_fault(key, faulted, reason);
+                 });
     for (auto& r : replays) {
         auto w = r.mech->watch(r.key, r.params);
-        if (!w)
-            // Pre-start replay failure leaves the spark armed-without-watcher
-            // (logged, unlike the post-start arm which rolls back) — a valid
-            // path/key rarely fails here; surfaced for the resource gate.
+        if (!w) {
+            // Pre-start replay failure leaves the spark armed-without-watcher —
+            // mark it faulted so the drift is observable (B1) rather than a
+            // silent log, mirroring the runtime fault channel. (The post-start
+            // arm path rolls back instead; a pre-start replay's subscribers
+            // already hold ids, so we keep the entry but flag it deaf.)
             spdlog::error("SparkEngine: mechanism failed to arm pre-start watch '{}': {}", r.key,
                           w.error());
+            report_fault(r.key, true, "pre-start replay watch failed");
+        }
     }
     spdlog::info("SparkEngine started ({} spark(s) armed)", armed_count);
 }
@@ -444,21 +511,23 @@ void SparkEngine::stop() {
     for (auto& [type, m] : mechanisms_)
         m->stop();
 
-    // 3) Stop consumer dispatch threads (prompt; leftovers dropped + counted).
+    // 3) Stop consumer dispatch threads (bounded join, detach-if-hung — UP-1;
+    // leftovers dropped + counted).
     std::map<ConsumerId, std::shared_ptr<Consumer>> consumers;
     {
         std::lock_guard lk(consumers_mu_);
         consumers.swap(consumers_);
     }
-    for (auto& [id, consumer] : consumers) {
-        {
-            std::lock_guard lk(consumer->mu);
-            consumer->stopping = true;
-        }
-        consumer->cv.notify_all();
-        if (consumer->thread.joinable())
-            consumer->thread.join();
-    }
+    // Two-phase so N hung consumers cost ~1×budget total, not N×budget (UP2-3):
+    // signal every consumer to stop first, THEN await them all against ONE
+    // shared deadline.
+    for (auto& [id, consumer] : consumers)
+        signal_stop(consumer);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(consumer_join_budget_ms_.load(
+                              std::memory_order_relaxed));
+    for (auto& [id, consumer] : consumers)
+        await_consumer(consumer, deadline);
     spdlog::info("SparkEngine stopped");
 }
 
@@ -561,8 +630,14 @@ void SparkEngine::wheel_loop() {
                 events_total_.fetch_add(1, std::memory_order_relaxed);
                 deliver(*event, subs);
             }
-            lk.lock();
+            // Loop tail: mu_ is RELEASED here. The next iteration must compute its
+            // decision (which does filesystem I/O for Disk) lock-free, so we do
+            // NOT re-lock per item — re-locking inside the loop double-locks the
+            // next iteration's commit lk.lock() (std::system_error, uncaught on
+            // the wheel thread → terminate) whenever ≥2 sparks are due in one
+            // scan. Re-acquire ONCE below for the outer wheel scan.
         }
+        lk.lock(); // re-hold for the next wheel scan (reads armed_ under mu_)
     }
 }
 
@@ -587,6 +662,22 @@ void SparkEngine::emit_event(const std::string& key, SparkData data) {
     // mu_ released before delivery — an inline consumer that re-arms takes mu_.
     events_total_.fetch_add(1, std::memory_order_relaxed);
     deliver(event, subs);
+}
+
+void SparkEngine::report_fault(const std::string& key, bool faulted, std::string_view reason) {
+    std::lock_guard lk(mu_);
+    auto it = armed_.find(key);
+    if (it == armed_.end())
+        return; // disarmed between the mechanism's report and here
+    if (it->second.faulted == faulted)
+        return; // no edge — idempotent per state
+    it->second.faulted = faulted;
+    if (faulted) {
+        watch_faults_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::warn("SparkEngine: watch '{}' FAULTED — armed but not watching ({})", key, reason);
+    } else {
+        spdlog::info("SparkEngine: watch '{}' recovered", key);
+    }
 }
 
 void SparkEngine::deliver(const SparkEvent& ev, const std::vector<Subscriber>& subs) {
@@ -640,7 +731,7 @@ void SparkEngine::deliver(const SparkEvent& ev, const std::vector<Subscriber>& s
                 continue;
             if (consumer->queue.size() >= consumer->cap) {
                 consumer->queue.pop_front();
-                queued_dropped_.fetch_add(1, std::memory_order_relaxed);
+                delivery_->dropped.fetch_add(1, std::memory_order_relaxed);
                 spdlog::warn("SparkEngine: consumer '{}' queue full (cap {}) — dropped oldest",
                              consumer->name, consumer->cap);
             }
@@ -657,20 +748,26 @@ SparkEngineStats SparkEngine::stats() const {
     {
         std::lock_guard lk(mu_);
         s.armed_sparks = armed_.size();
+        s.armed_faulted = static_cast<std::uint64_t>(
+            std::count_if(armed_.begin(), armed_.end(), [](const auto& kv) {
+                return kv.second.faulted;
+            }));
         s.subscriptions = sub_keys_.size();
         // Watcher units while running: the wheel + one per registered event-driven
         // mechanism (a mechanism may itself run a small pool — this is a unit
-        // count, not an OS-thread count).
-        s.watcher_threads = running_ ? (1 + mechanisms_.size()) : 0;
+        // count, not an OS-thread count; hence _units, not _threads).
+        s.watcher_units = running_ ? (1 + mechanisms_.size()) : 0;
     }
     {
         std::lock_guard lk(consumers_mu_);
         s.consumers = consumers_.size();
     }
+    s.watch_faults_total = watch_faults_.load(std::memory_order_relaxed);
+    s.consumer_threads_detached = consumer_threads_detached_.load(std::memory_order_relaxed);
     s.events_total = events_total_.load(std::memory_order_relaxed);
-    s.queued_delivered_total = queued_delivered_.load(std::memory_order_relaxed);
-    s.queued_dropped_total = queued_dropped_.load(std::memory_order_relaxed);
-    s.consumer_errors_total = consumer_errors_.load(std::memory_order_relaxed);
+    s.queued_delivered_total = delivery_->delivered.load(std::memory_order_relaxed);
+    s.queued_dropped_total = delivery_->dropped.load(std::memory_order_relaxed);
+    s.consumer_errors_total = delivery_->errors.load(std::memory_order_relaxed);
     s.inline_calls_total = inline_calls_.load(std::memory_order_relaxed);
     s.inline_errors_total = inline_errors_.load(std::memory_order_relaxed);
     s.inline_us_total = inline_us_total_.load(std::memory_order_relaxed);
@@ -687,6 +784,10 @@ void SparkEngine::set_disk_reader_for_test(DiskReaderFn reader) {
 
 void SparkEngine::set_cadence_floor_for_test(std::uint64_t floor_ms) {
     cadence_floor_ms_.store(floor_ms, std::memory_order_relaxed);
+}
+
+void SparkEngine::set_consumer_join_budget_for_test(std::uint64_t ms) {
+    consumer_join_budget_ms_.store(ms, std::memory_order_relaxed);
 }
 
 } // namespace yuzu::agent
