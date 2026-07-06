@@ -152,16 +152,38 @@ std::vector<NetConnection> enumerate_connections();
 
 /**
  * Sample per-connection TCP quality (RTT + jitter + current loss + lifetime
- * retrans/segs context) for the netqual warehouse tier. Linux: netlink
- * SOCK_DIAG / INET_DIAG TCP_INFO over ESTABLISHED connections, owning process
- * resolved via the socket inode. Empty off Linux (Windows / macOS are kPlanned
- * — see the `netqual` source in the schema registry).
+ * retrans/segs context) for the netqual warehouse tier.
+ *
+ * Linux: netlink SOCK_DIAG / INET_DIAG TCP_INFO over ESTABLISHED connections,
+ * owning process resolved via the socket inode.
+ *
+ * Windows (ADR-0020): TCP ESTATS (Get/SetPerTcp[6]ConnectionEStats) over the
+ * ESTABLISHED table. Enabling stats is admin-only, so a NON-ELEVATED agent
+ * latches to "records nothing" for the session (status reports
+ * netqual_capture_method=none). Counters accrue from stats-enable — first
+ * sight of a connection baselines it and emits nothing; samples start one
+ * tick later, with the Windows field semantics documented in tar_netqual.hpp.
+ *
+ * Empty on macOS (kPlanned — see the `netqual` source in the schema registry).
  *
  * Returns RAW remote addresses; the caller MUST pass the result through
  * select_netqual_rows (which buckets the address away) before persisting —
  * raw destinations never reach the warehouse.
  */
 std::vector<TcpQualitySample> collect_tcp_quality();
+
+/**
+ * The netqual capture method actually in effect on this host right now:
+ * "inetdiag" (Linux), "estats" (Windows once the elevation gate has latched
+ * active), "estats_pending" (Windows, netqual enabled but the first collect tick
+ * has not yet tested elevation — or netqual disabled), "none" (Windows after the
+ * ACCESS_DENIED latch, macOS, unsupported). The pending token exists so a
+ * non-elevated agent does not advertise "estats" for the first interval before
+ * flipping to "none". Surfaced by the status action as
+ * `config|netqual_capture_method|<token>` — mirrors the process/module
+ * capture-method pattern.
+ */
+std::string_view netqual_effective_capture_method();
 
 /** Enumerate installed system services on the current host. */
 std::vector<ServiceInfo> enumerate_services();
