@@ -37,8 +37,9 @@ clear, in order:
 1. **Eligibility** — `AuthDB::is_elevation_eligible(principal)` reads
    `users.elevation_eligible`, fail-closed on any read error or absent row.
 2. **Identity-source scope (NEW this round, UP-6/UP-7/cons-N2)** — the row's
-   `identity_source` must match the session's `auth_source` (`oidc`↔`oidc`,
-   anything else↔`local`). See "Source-scope guard" below.
+   `identity_source` must equal the session's `auth_source`, a direct mapping
+   (`local`↔`local`, `oidc`↔`oidc`, `saml`↔`saml`), not "oidc-or-else-local".
+   See "Source-scope guard" below.
 3. **MFA basis** — local sessions require an enrolled TOTP secret (existing
    `mfa_status` check); OIDC sessions require `mfa_verified_at` to carry a live
    IdP-attested `amr` proof from login (existing #1852 check). Both are followed
@@ -73,8 +74,7 @@ fetches the target row via `get_user(session->username)` immediately after the
 eligibility check and requires:
 
 ```cpp
-const std::string expected_identity_source =
-    (session->auth_source == "oidc") ? "oidc" : "local";
+const std::string& expected_identity_source = session->auth_source;
 if (row->identity_source != expected_identity_source) {
     audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
                             auth::role_to_string(session->role), "User", session->username,
@@ -85,11 +85,14 @@ if (row->identity_source != expected_identity_source) {
 }
 ```
 
-An OIDC session can only spend a grant recorded on an `identity_source='oidc'`
-row; every other session (local, and SAML until it gets its own provisioning
-path) can only spend one recorded on `identity_source='local'`. `identity_source`
-is read fresh at every elevate call (not cached on `Session`), so a future
-deprovisioning/re-source event is honoured immediately.
+The check is a **direct equality** between the session's own `auth_source` and
+the eligible row's `identity_source` (`local`↔`local`, `oidc`↔`oidc`,
+`saml`↔`saml`) — NOT an "oidc-or-else-local" fallback. A local session can only
+spend a grant recorded on an `identity_source='local'` row; a SAML session
+would need an `identity_source='saml'` row, which no row carries today (SAML
+provisioning is a fast-follow), so SAML fails closed at this gate too, same as
+before. `identity_source` is read fresh at every elevate call (not cached on
+`Session`), so a future deprovisioning/re-source event is honoured immediately.
 
 **Regression tests** (`tests/unit/server/test_auth_sso_identity.cpp`, `[sso][jit][routes]`):
 an OIDC session cannot borrow a `identity_source='local'` row's grant even when

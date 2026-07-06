@@ -751,8 +751,9 @@ record.** Four fixes on top of the base restoration above:
   with `elevation_eligible=1`, would otherwise let a session borrow a grant
   never made against its own identity source. The elevate handler now fetches
   the target row's `identity_source` (`AuthDB::get_user`, which selects it)
-  immediately after the eligibility check and requires it match the session's
-  `auth_source` (`oidc`↔`oidc`; everything else↔`local`) — denying with
+  immediately after the eligibility check and requires it EQUAL the session's
+  `auth_source` — a direct mapping (`local`↔`local`, `oidc`↔`oidc`,
+  `saml`↔`saml`), not "oidc-or-else-local" — denying with
   `role.elevation.denied` / `detail=identity-source mismatch` otherwise.
 - **`upsert_sso_identity` no longer resurrects a deactivated row.** The
   `ON CONFLICT` refresh arm dropped `is_active = 1` from its `SET` clause — a

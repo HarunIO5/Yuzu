@@ -108,11 +108,24 @@ public:
     );
 
     /// Auto-provision (or refresh) a durable row for an SSO-authenticated
-    /// principal (#1852). `principal` must be the stable `"oidc:"`/`"saml:"`/
-    /// `"ad:"`-prefixed identity (`is_valid_principal`, NOT
-    /// `is_valid_username` — rejected otherwise, InvalidUsername). On first
-    /// login this INSERTs a row with `password_hash`/`salt_hex` = '' (never
-    /// resolvable on the local login path — see file header note),
+    /// principal (#1852). The gate is `is_valid_principal` — a SUPERSET of
+    /// `is_valid_username`: it accepts EITHER a strict local username OR a
+    /// `"oidc:"`/`"saml:"`/`"ad:"`-reserved-prefixed identity; it does NOT
+    /// require the reserved prefix (a bare local-shaped string is also
+    /// accepted — rejected only when neither shape matches, InvalidUsername).
+    /// `source` is NOT validated against `{oidc,saml,ad}` — it is written
+    /// verbatim into `identity_source`, so a caller can construct a row
+    /// with any `identity_source` string (a security test deliberately does
+    /// this, passing `source="local"`, to build a legacy-shaped attack row
+    /// for the elevate handler's source-scope guard — see
+    /// `docs/security-reviews/sso-durable-identity-2026-07-03.md`).
+    /// TODO(#1915): tighten this seam to enforce a reserved prefix
+    /// on `principal` and `source ∈ {oidc,saml,ad}` — this call site is the
+    /// ONLY intended caller (the OIDC callback), so today's looseness is
+    /// latent, not actively exploitable, but it is a landmine for any future
+    /// caller.
+    /// On first login this INSERTs a row with `password_hash`/`salt_hex` = ''
+    /// (never resolvable on the local login path — see file header note),
     /// `role='user'`, `elevation_eligible=0`. On every subsequent login the
     /// `ON CONFLICT` arm refreshes ONLY `display_name`/`last_seen_at`/
     /// `is_active` — it deliberately does NOT touch `role` or

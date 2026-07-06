@@ -384,6 +384,22 @@ struct SsoJitHarness {
         return sink.dispatch("POST", path, body, "application/json",
                              {{"Cookie", "yuzu_session=" + token}});
     }
+
+    // A fresh-MFA admin cookie session, for tests exercising the
+    // admin-gated elevation-eligibility-grant route on THIS harness (which
+    // otherwise only sets up OIDC identities, never a local admin). Mirrors
+    // JitHarness::seed + session_for, collapsed to what the step-up gate
+    // needs: a `users` row to key `mfa_status` on (unenrolled — the gate's
+    // not-enrolled branch passes unconditionally) plus a session-level
+    // fresh MFA proof. Unlike JitHarness (which seeds before
+    // `set_auth_db`), this harness's constructor already wired `auth_db`
+    // into `auth_mgr` — so `upsert_user` alone persists the row; a second
+    // explicit `auth_db.upsert_user` call would double-insert and fail
+    // with `UserAlreadyExists`.
+    std::string admin_session() {
+        REQUIRE(auth_mgr.upsert_user("admin", "adminpassword1", Role::admin));
+        return auth_mgr.create_local_session("admin", Role::admin, /*mfa_verified=*/true);
+    }
 };
 } // namespace
 
@@ -596,4 +612,43 @@ TEST_CASE("AuthDB::invalidate_all_sessions accepts a durable SSO principal", "[s
 
     const std::string principal = "oidc:https://idp.example.com/#sub-revoke2";
     CHECK(db.invalidate_all_sessions(principal).has_value());
+}
+
+// ── review round: elevation-eligibility grant route reachability for SSO ────
+
+TEST_CASE("POST /api/v1/users/elevation-eligibility?username=: the query form reaches "
+          "a durable SSO principal that the path form can never carry",
+          "[sso][routes]") {
+    SsoJitHarness h;
+    // A realistic OIDC principal — contains '/' (in the issuer URL) and '#'
+    // (the iss/sub separator). httplib percent-decodes the path (%2F -> '/',
+    // %23 -> '#') and strips the literal '#' fragment BEFORE route-regex
+    // matching, so a `([^/]+)` PATH SEGMENT can never carry this shape — the
+    // path-only route 404s for every real IdP identity (this is exactly what
+    // this test must observe against the pre-fix route below).
+    const std::string principal = "oidc:https://idp.example.com/#sub-4821";
+    REQUIRE(h.auth_db.upsert_sso_identity(principal, "https://idp.example.com/", "sub-4821",
+                                          "Test SSO", "oidc")
+                .has_value());
+    CHECK(h.auth_db.is_elevation_eligible(principal).value() == false);
+
+    auto admin = h.admin_session();
+    // Query value: '#' percent-encoded (%23) so it survives to the handler
+    // as part of the query string rather than being parsed as a URL
+    // fragment; the '/' in the issuer is passed through literal (query
+    // values don't need '/' escaped).
+    auto res = h.post(
+        "/api/v1/users/elevation-eligibility?username=oidc:https://idp.example.com/%23sub-4821",
+        admin, R"({"eligible":true})");
+
+    // Against the OLD path-only route
+    // (`/api/v1/users/([^/]+)/elevation-eligibility`), this fixed two-segment
+    // path (`/api/v1/users/elevation-eligibility`) never matches the
+    // three-segment pattern — TestRouteSink::dispatch returns nullptr,
+    // mirroring httplib's 404. This REQUIRE is the fail-without/pass-with
+    // pin: it fails on the pre-fix route registration and passes once the
+    // query-form route is registered.
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.auth_db.is_elevation_eligible(principal).value() == true);
 }

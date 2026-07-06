@@ -2479,119 +2479,142 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
     // POST /api/v1/users/<name>/elevation-eligibility — admin grants/revokes who
     // may elevate. Body: {"eligible": <bool>}. Admin + step-up gated.
-    sink.Post(R"(/api/v1/users/([^/]+)/elevation-eligibility)",
-              [this, elevation_step_up, kElevationStepUpWindow](const httplib::Request& req,
-                                                                httplib::Response& res) {
-                  const auto cid = detail::make_correlation_id();
-                  res.set_header("X-Correlation-Id", cid);
-                  // Inline A4 admin gate (#1748 H3): a new REST route must carry the
-                  // A4 envelope on its denial path, not require_admin's legacy
-                  // {"error":{code,message}} body. Replicates require_admin's
-                  // token-type guards + role check, but gates on effective_role
-                  // (so an active elevation passes) and audits `auth.admin_required`.
-                  auto session = resolve_session(req);
-                  if (!session) {
-                      res.status = 401;
-                      res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
-                      return;
-                  }
-                  if (!session->token_scope_service.empty() || !session->mcp_tier.empty()) {
-                      audit_log(req, "auth.admin_required", "denied", "endpoint", req.path,
-                                "non-interactive token blocked from admin route");
-                      res.status = 403;
-                      res.set_content(detail::error_json_a4(403, "non-interactive tokens cannot "
-                                                                 "perform admin operations",
-                                                            cid),
-                                      "application/json");
-                      return;
-                  }
-                  if (auth::effective_role(*session) != auth::Role::admin) {
-                      audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
-                      res.status = 403;
-                      res.set_content(detail::error_json_a4(403, "admin role required", cid,
-                                                            "elevate via POST /api/v1/elevate, or use "
-                                                            "an admin account"),
-                                      "application/json");
-                      return;
-                  }
-                  if (!elevation_step_up(req, res, *session,
-                                         "POST /api/v1/users/{name}/elevation-eligibility",
-                                         kElevationStepUpWindow))
-                      return;
-                  auto* db = auth_mgr_.auth_db_ptr();
-                  if (!db) {
-                      res.status = 503;
-                      res.set_content(detail::error_json_a4(503, "JIT elevation requires the "
-                                                                 "persistent auth store",
-                                                            cid, "start the server with --data-dir"),
-                                      "application/json");
-                      return;
-                  }
-                  const auto target = req.matches[1].str();
-                  // #1852 — `target` may be a durable SSO principal
-                  // (`oidc:<iss>#<sub>`); an admin must be able to grant
-                  // elevation eligibility to an SSO operator, not just a
-                  // local account. `is_valid_principal` is a strict
-                  // superset of `is_valid_username`, so local-target
-                  // behaviour is unchanged.
-                  if (target.empty() || !is_valid_principal(target)) {
-                      res.status = 400;
-                      res.set_content(detail::error_json_a4(400, "invalid username format", cid,
-                                                            "username must match the allowed format"),
-                                      "application/json");
-                      return;
-                  }
-                  // Block self-grant (review UP-6 / security-LOW): an operator —
-                  // including one acting under an active elevation — must not set
-                  // their OWN eligibility, which would let a temporary admin
-                  // window manufacture a durable self-elevation right. Eligibility
-                  // is always granted by another admin.
-                  if (target == session->username) {
-                      audit_log(req, "user.elevation_eligibility.set", "denied", "User", target,
-                                "self_grant_blocked");
-                      res.status = 403;
-                      res.set_content(detail::error_json_a4(403, "cannot change your own elevation "
-                                                                 "eligibility",
-                                                            cid, "another administrator must set it"),
-                                      "application/json");
-                      return;
-                  }
-                  auto body = nlohmann::json::parse(req.body, nullptr, false);
-                  if (!body.is_object() || !body.contains("eligible") ||
-                      !body["eligible"].is_boolean()) {
-                      res.status = 400;
-                      res.set_content(detail::error_json_a4(400, "body must be {\"eligible\": bool}",
-                                                            cid),
-                                      "application/json");
-                      return;
-                  }
-                  const bool eligible = body["eligible"].get<bool>();
-                  if (auto r = db->set_elevation_eligible(target, eligible); !r) {
-                      const auto err = r.error();
-                      const int code = err == AuthDBError::UserNotFound ? 404 : 500;
-                      audit_log(req, "user.elevation_eligibility.set", "error", "User", target,
-                                "store error");
-                      res.status = code;
-                      res.set_content(detail::error_json_a4(code,
-                                                            code == 404 ? "user not found"
-                                                                        : "failed to update",
-                                                            cid),
-                                      "application/json");
-                      return;
-                  }
-                  // Revoking eligibility must terminate any in-flight elevation
-                  // immediately (governance UP-1) — symmetric with the session
-                  // wipe on demote/delete, so an incident-response "revoke now"
-                  // actually drops the operator's admin access rather than
-                  // leaving it standing for up to the window.
-                  int cleared = 0;
-                  if (!eligible)
-                      cleared = auth_mgr_.revoke_user_elevations(target);
-                  audit_log(req, "user.elevation_eligibility.set", "ok", "User", target,
-                            std::string(eligible ? "eligible=true" : "eligible=false") +
-                                (cleared > 0 ? " elevations_cleared=" + std::to_string(cleared) : ""));
-                  res.set_content(R"({"status":"ok"})", "application/json");
-              });
+    //
+    // Registered on TWO route forms (both bound to the same handler below):
+    //   - /api/v1/users/([^/]+)/elevation-eligibility  — path-segment form, for
+    //     local usernames.
+    //   - /api/v1/users/elevation-eligibility?username=<principal> — query form,
+    //     REQUIRED for a durable SSO principal (`oidc:<iss>#<sub>`). httplib
+    //     percent-decodes the path (%2F -> '/', %23 -> '#') and strips the
+    //     literal '#' fragment BEFORE route-regex matching, so a `([^/]+)`
+    //     path segment can never carry the '/' and '#' an SSO principal
+    //     contains — that route 404s for every real IdP identity. The query
+    //     form mirrors the proven `DELETE /api/v1/sessions?username=` pattern.
+    auto set_elevation_eligibility = [this, elevation_step_up, kElevationStepUpWindow](
+                                         const httplib::Request& req, httplib::Response& res) {
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
+        // Inline A4 admin gate (#1748 H3): a new REST route must carry the
+        // A4 envelope on its denial path, not require_admin's legacy
+        // {"error":{code,message}} body. Replicates require_admin's
+        // token-type guards + role check, but gates on effective_role
+        // (so an active elevation passes) and audits `auth.admin_required`.
+        auto session = resolve_session(req);
+        if (!session) {
+            res.status = 401;
+            res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
+            return;
+        }
+        if (!session->token_scope_service.empty() || !session->mcp_tier.empty()) {
+            audit_log(req, "auth.admin_required", "denied", "endpoint", req.path,
+                      "non-interactive token blocked from admin route");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "non-interactive tokens cannot "
+                                                       "perform admin operations",
+                                                  cid),
+                            "application/json");
+            return;
+        }
+        if (auth::effective_role(*session) != auth::Role::admin) {
+            audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "admin role required", cid,
+                                                  "elevate via POST /api/v1/elevate, or use "
+                                                  "an admin account"),
+                            "application/json");
+            return;
+        }
+        if (!elevation_step_up(req, res, *session,
+                               "POST /api/v1/users/{name}/elevation-eligibility",
+                               kElevationStepUpWindow))
+            return;
+        auto* db = auth_mgr_.auth_db_ptr();
+        if (!db) {
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "JIT elevation requires the "
+                                                       "persistent auth store",
+                                                  cid, "start the server with --data-dir"),
+                            "application/json");
+            return;
+        }
+        // Path-segment form (local usernames) OR query form (SSO
+        // principals — see the route-registration comment above for
+        // why a path segment can't carry the '/' and '#' of an
+        // `oidc:<iss>#<sub>` principal).
+        const std::string target = (req.matches.size() > 1 && req.matches[1].matched)
+                                        ? req.matches[1].str()
+                                        : req.get_param_value("username");
+        // #1852 — `target` may be a durable SSO principal
+        // (`oidc:<iss>#<sub>`); an admin must be able to grant
+        // elevation eligibility to an SSO operator, not just a
+        // local account. `is_valid_principal` is a strict
+        // superset of `is_valid_username`, so local-target
+        // behaviour is unchanged.
+        if (target.empty() || !is_valid_principal(target)) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "invalid username format", cid,
+                                                  "username must match the allowed format"),
+                            "application/json");
+            return;
+        }
+        // Block self-grant (review UP-6 / security-LOW): an operator —
+        // including one acting under an active elevation — must not set
+        // their OWN eligibility, which would let a temporary admin
+        // window manufacture a durable self-elevation right. Eligibility
+        // is always granted by another admin.
+        if (target == session->username) {
+            audit_log(req, "user.elevation_eligibility.set", "denied", "User", target,
+                      "self_grant_blocked");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "cannot change your own elevation "
+                                                       "eligibility",
+                                                  cid, "another administrator must set it"),
+                            "application/json");
+            return;
+        }
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (!body.is_object() || !body.contains("eligible") ||
+            !body["eligible"].is_boolean()) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "body must be {\"eligible\": bool}",
+                                                  cid),
+                            "application/json");
+            return;
+        }
+        const bool eligible = body["eligible"].get<bool>();
+        if (auto r = db->set_elevation_eligible(target, eligible); !r) {
+            const auto err = r.error();
+            const int code = err == AuthDBError::UserNotFound ? 404 : 500;
+            audit_log(req, "user.elevation_eligibility.set", "error", "User", target,
+                      "store error");
+            res.status = code;
+            res.set_content(detail::error_json_a4(code,
+                                                  code == 404 ? "user not found"
+                                                              : "failed to update",
+                                                  cid),
+                            "application/json");
+            return;
+        }
+        // Revoking eligibility must terminate any in-flight elevation
+        // immediately (governance UP-1) — symmetric with the session
+        // wipe on demote/delete, so an incident-response "revoke now"
+        // actually drops the operator's admin access rather than
+        // leaving it standing for up to the window.
+        int cleared = 0;
+        if (!eligible)
+            cleared = auth_mgr_.revoke_user_elevations(target);
+        audit_log(req, "user.elevation_eligibility.set", "ok", "User", target,
+                  std::string(eligible ? "eligible=true" : "eligible=false") +
+                      (cleared > 0 ? " elevations_cleared=" + std::to_string(cleared) : ""));
+        res.set_content(R"({"status":"ok"})", "application/json");
+    };
+    // Path form: local usernames.
+    sink.Post(R"(/api/v1/users/([^/]+)/elevation-eligibility)", set_elevation_eligibility);
+    // Query form: required for SSO principals (`?username=oidc:<iss>#<sub>`,
+    // percent-encoded). The two patterns don't collide — this fixed path has
+    // exactly two segments after /api/v1/users, the path-param pattern
+    // requires three.
+    sink.Post(R"(/api/v1/users/elevation-eligibility)", set_elevation_eligibility);
 
     // POST /api/v1/elevate — activate a time-boxed admin elevation on THIS cookie
     // session. Body: {"justification": <str, required>, "duration_secs": <int>}.

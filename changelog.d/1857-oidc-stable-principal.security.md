@@ -30,7 +30,10 @@
   so there is no local record to set the flag on. This is not a regression of a
   previously-supported flow — before #1837, SSO elevation only appeared to work by accident
   (name-collision borrowing a local user's `elevation_eligible` flag with no cryptographic
-  binding). #1852 is the real restoration path; this release does not include it.
+  binding). #1852 is the real restoration path, and this same `[Unreleased]` window DOES
+  include it: durable SSO identity provisioning (`AuthDB::upsert_sso_identity`, PR #1861)
+  gives every OIDC principal a durable `users` row to key `elevation_eligible` on — see
+  `1861-durable-sso-identity-oidc-elevation.security.md`.
   Session revocation by username for SSO operators is **not** structurally blocked:
   `AuthManager::invalidate_user_sessions`'s in-memory sweep carries no `is_valid_username`
   gate and revokes any principal string, `oidc:<iss>#<sub>` included.
