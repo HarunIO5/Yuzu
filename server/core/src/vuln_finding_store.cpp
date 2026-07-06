@@ -13,8 +13,11 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <format>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -34,6 +37,22 @@ constexpr std::chrono::milliseconds kReadTimeout{3000};
 // Hard cap on findings a single query materialises regardless of the caller's
 // limit (a per-agent finding list the page renders).
 constexpr int kFindingRowCap = 5000;
+// Hard cap on the findings vector a single reconcile batch may carry. A batch
+// larger than this holds the per-agent advisory lock + write lease across N
+// per-row round-trips, so an unbounded batch is both a lease-hold hazard and a
+// producer bug (the expected count is tens). Reject outright. (PR-4 FOLLOW-UP:
+// if a genuine batch ever approaches this, switch the upsert loop to a single
+// batched `unnest`-driven multi-row INSERT rather than raising the cap — that is
+// the real fix, deliberately out of scope for this store-hardening pass.)
+constexpr std::size_t kReconcileMaxFindings = 10000;
+
+// Locale-independent double formatting for a float8 text parameter. std::format
+// emits '.' as the decimal separator regardless of the process `LC_NUMERIC`
+// (std::to_string(double) does NOT — a comma-decimal locale emits "7,5" and PG
+// rejects it with 22P02, rolling back the whole reconcile). Mirrors the sibling
+// AppPerfDailyStore::fmt_double. Callers MUST pre-check std::isfinite — a NaN/Inf
+// would stringify to a "nan"/"inf" token PG cannot parse.
+std::string fmt_double(double v) { return std::format("{}", v); }
 
 const std::vector<pg::PgMigration>& migrations_impl() {
     // Unqualified DDL: the runner sets search_path to the store schema for the
@@ -105,20 +124,28 @@ int to_int(const char* s) { return static_cast<int>(to_i64(s)); }
 // set collapses to "unknown" (severity is normalized-not-rejected, unlike status
 // / confidence which are bound as-is and rely on the column CHECK). Mirrors the
 // finding.severity CHECK exactly.
+// Trim leading/trailing ASCII whitespace and lowercase. Shared by severity
+// normalization (write + filter) and the status filter so a mixed-case /
+// whitespace-padded filter matches the canonically-stored value.
+std::string lower_trim(std::string_view s) {
+    auto is_ws = [](unsigned char c) { return std::isspace(c) != 0; };
+    while (!s.empty() && is_ws(static_cast<unsigned char>(s.front())))
+        s.remove_prefix(1);
+    while (!s.empty() && is_ws(static_cast<unsigned char>(s.back())))
+        s.remove_suffix(1);
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s)
+        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    return out;
+}
+
 std::string normalize_severity(std::string_view sev) {
     // Trim leading/trailing ASCII whitespace first so incidental feed whitespace
     // ("high ", " critical") does not collapse a real severity to "unknown". We
     // deliberately trim ONLY whitespace — arbitrary punctuation ("Critical!")
     // still legitimately falls outside the vocab and becomes "unknown".
-    auto is_ws = [](unsigned char c) { return std::isspace(c) != 0; };
-    while (!sev.empty() && is_ws(static_cast<unsigned char>(sev.front())))
-        sev.remove_prefix(1);
-    while (!sev.empty() && is_ws(static_cast<unsigned char>(sev.back())))
-        sev.remove_suffix(1);
-    std::string s;
-    s.reserve(sev.size());
-    for (char c : sev)
-        s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    std::string s = lower_trim(sev);
     static constexpr std::array<std::string_view, 6> kVocab = {
         "critical", "high", "medium", "low", "none", "unknown"};
     for (auto v : kVocab)
@@ -205,6 +232,29 @@ bool VulnFindingStore::reconcile_agent(const AgentReconcile& r) {
         return false;
     const std::string agent_id = r.agent_id;
 
+    // (FIX 5) Bound the batch. An unbounded findings vector holds the per-agent
+    // advisory lock + write lease across findings.size() per-row round-trips; a
+    // batch this large is a PR-4 producer bug, not a legitimate host. Reject it
+    // outright rather than lease-starve the pool.
+    if (r.findings.size() > kReconcileMaxFindings) {
+        spdlog::error("VulnFindingStore::reconcile_agent: batch of {} findings for agent '{}' "
+                      "exceeds cap {} — rejecting (producer bug)",
+                      r.findings.size(), agent_id, kReconcileMaxFindings);
+        return false;
+    }
+
+    // (FIX 4) Reject an embedded NUL in any identity field. exec_params binds
+    // each value as a NUL-terminated C string (no explicit length), so a NUL
+    // silently truncates the value at libpq — which could collide two distinct
+    // identities onto one PK row. The PR-4 producer sanitizes, but the store now
+    // also rejects rather than trusts (defence-in-depth boundary check).
+    auto has_nul = [](std::string_view s) { return s.find('\0') != std::string_view::npos; };
+    if (has_nul(agent_id))
+        return false;
+    for (const auto& f : r.findings)
+        if (has_nul(f.cve_id) || has_nul(f.package_name))
+            return false;
+
     return pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         // (0) Self-protecting per-agent serialization. PR-4 single-flight does
         // not exist yet, so the store protects itself: two overlapping passes for
@@ -238,15 +288,24 @@ bool VulnFindingStore::reconcile_agent(const AgentReconcile& r) {
         // it. This keeps first_seen/last_seen/resolved_at strictly ordered even
         // across a backwards clock step (test S4).
         std::int64_t last_run = 0;
+        // Prior coverage tallies — also drive the UP-2 mass-resolve backstop below.
+        std::int64_t prior_potential = 0;
+        std::int64_t prior_vulnerable = 0;
+        std::int64_t prior_total_packages = 0;
         {
             pg::PgResult lr = pg::exec_params(
                 conn,
-                "SELECT last_run_at_ms FROM vuln_finding_store.agent_coverage WHERE agent_id = $1",
+                "SELECT last_run_at_ms, potential, vulnerable, total_packages "
+                "FROM vuln_finding_store.agent_coverage WHERE agent_id = $1",
                 std::vector<std::string>{agent_id});
             if (lr.status() != PGRES_TUPLES_OK)
                 return false;
-            if (PQntuples(lr.get()) == 1)
+            if (PQntuples(lr.get()) == 1) {
                 last_run = to_i64(PQgetvalue(lr.get(), 0, 0));
+                prior_potential = to_i64(PQgetvalue(lr.get(), 0, 1));
+                prior_vulnerable = to_i64(PQgetvalue(lr.get(), 0, 2));
+                prior_total_packages = to_i64(PQgetvalue(lr.get(), 0, 3));
+            }
         }
         const std::int64_t run_ts = std::max(now_ms(), last_run + 1);
         const std::string run_ts_s = std::to_string(run_ts);
@@ -265,7 +324,13 @@ bool VulnFindingStore::reconcile_agent(const AgentReconcile& r) {
                 f.package_version,
                 f.ecosystem,
                 normalize_severity(f.severity), // severity IS normalized to the vocab
-                f.cvss ? std::optional<std::string>{std::to_string(*f.cvss)} : std::nullopt,
+                // cvss: locale-independent format AND finite-guarded. A
+                // non-finite value (NaN/Inf from a bad PR-4 feed row) binds SQL
+                // NULL rather than a "nan"/"inf" token that would 22P02 and abort
+                // the whole reconcile — cvss is optional, so absence is honest.
+                (f.cvss && std::isfinite(*f.cvss))
+                    ? std::optional<std::string>{fmt_double(*f.cvss)}
+                    : std::nullopt,
                 f.fixed_in, // already optional → SQL NULL when absent
                 f.confidence, // bound as-is → CHECK-enforced
                 std::to_string(f.feed_synced_at_ms),
@@ -289,10 +354,37 @@ bool VulnFindingStore::reconcile_agent(const AgentReconcile& r) {
                 return false;
         }
 
+        // (FIX 3, UP-2 backstop) Defence-in-depth against a mis-set authoritative
+        // flag mass-false-resolving an agent. The TRUE suspect signal is a
+        // ZERO-total_packages coverage (`r.coverage.total_packages == 0`): the
+        // inventory read itself returned nothing, so there is no basis to resolve
+        // anything. When that lands against an agent that PREVIOUSLY had state
+        // (prior open findings OR a non-zero prior package count), it is almost
+        // certainly a "whole inventory vanished" bad read from a PR-4 producer bug.
+        // Treat it like a non-authoritative pass: SKIP the sweep + dispose +
+        // coverage clobber (keep-last-good), still return true.
+        //
+        // CRITICAL — do NOT key this on `findings.empty()`: an authoritative pass
+        // with total_packages > 0 but empty findings is a GENUINELY-PATCHED agent
+        // (inventory still present, all vulns fixed) and MUST sweep-resolve the
+        // now-fixed findings. Suppressing that would leave patched findings open
+        // forever (a false-positive worse than the bug this guards).
+        const bool authoritative_effective =
+            r.authoritative &&
+            !(r.coverage.total_packages == 0 &&
+              (prior_potential + prior_vulnerable > 0 || prior_total_packages > 0));
+        if (r.authoritative && !authoritative_effective) {
+            spdlog::warn("VulnFindingStore::reconcile_agent: authoritative pass for agent '{}' "
+                         "reported zero total_packages while prior state existed (open={}, "
+                         "prior_total_packages={}) — treating as non-authoritative to avoid a "
+                         "mass false-resolve (suspected inventory-read failure / producer bug)",
+                         agent_id, prior_potential + prior_vulnerable, prior_total_packages);
+        }
+
         // Steps (3)–(5) are AUTHORITATIVE-ONLY. A non-authoritative (suspect /
         // partial) pass refreshes observed findings only: NO dispose, NO resolve
         // sweep, NO coverage clobber (keep-last-good — the B1 fix).
-        if (r.authoritative) {
+        if (authoritative_effective) {
             // (3) OVAL-reassessed-clean fold: delete the disposed tuples outright
             // (a definitively-clean reassessment removes the row rather than
             // resolving it). Empty in M1a.
@@ -381,13 +473,17 @@ std::vector<FindingRow> VulnFindingStore::query_findings(std::string_view agent_
     int p = 1;
     if (!q.include_resolved)
         sql += " AND resolved_at_ms IS NULL";
+    // Normalize the filter values to the canonical stored form (lowercased +
+    // trimmed) so a mixed-case filter ("Critical", "HIGH", "Potential") matches —
+    // severity is normalize_severity()d on write, and status is stored lowercase
+    // (CHECK vocab). Without this a "Critical" filter silently returns empty.
     if (q.status && !q.status->empty()) {
         sql += " AND status = $" + std::to_string(++p);
-        params.push_back(*q.status);
+        params.push_back(lower_trim(*q.status));
     }
     if (q.severity && !q.severity->empty()) {
         sql += " AND severity = $" + std::to_string(++p);
-        params.push_back(*q.severity);
+        params.push_back(normalize_severity(*q.severity));
     }
     sql += " ORDER BY " + std::string(kSeverityRankSql) + ", last_seen_ms DESC LIMIT $" +
            std::to_string(++p) + "::bigint";

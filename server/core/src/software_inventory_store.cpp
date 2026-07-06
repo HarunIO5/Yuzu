@@ -191,6 +191,20 @@ const std::vector<pg::PgMigration>& migrations() {
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS signature_status TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS distro_id        TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS distro_version   TEXT NOT NULL DEFAULT '';"},
+        {6,
+         // (source, agent_id) serving index for list_agent_ids' keyset pager:
+         // `WHERE source=$1 AND agent_id>$2 ORDER BY agent_id ASC LIMIT`. The PK is
+         // (agent_id, source) — leading `agent_id` — so it CANNOT serve a `source=`
+         // equality + `agent_id>` range; without this index the planner falls back
+         // to a seq-scan of inventory_state + Filter + Sort on every page. Leading
+         // `source` matches the equality and `agent_id` serves BOTH the `> $2`
+         // keyset seek and the ORDER BY, so the plan becomes an Index-Cond ordered
+         // scan with early LIMIT termination — per-page cost proportional to the
+         // page, not the fleet. The PR-4 backfill loops this pager once per page,
+         // so the difference is fleet-scale. IF NOT EXISTS → idempotent under a
+         // white-box schema_meta rewind, matching migration v4's style.
+         "CREATE INDEX IF NOT EXISTS inventory_state_source_agent_idx "
+         "ON inventory_state (source, agent_id);"},
     };
     return kMigrations;
 }
@@ -941,7 +955,11 @@ std::vector<std::string> SoftwareInventoryStore::list_agent_ids(std::string_view
     // KEYSET page over inventory_state for one source. The (agent_id, source) PK
     // makes agent_id unique per source, so a plain `agent_id > $2 ORDER BY
     // agent_id ASC LIMIT` walks the fleet with no DISTINCT and no unstable OFFSET.
-    // Bounded lease; empty on !open_ / no-lease / query error (degrade).
+    // The (source, agent_id) index (migration v6) is the SERVING index for this
+    // plan: the PK leads with agent_id and so cannot seek on the `source=` equality
+    // — v6 makes `agent_id > $2` an Index Cond seek + ordered scan (verified via
+    // EXPLAIN) rather than a seq-scan + Filter + Sort. Bounded lease; empty on
+    // !open_ / no-lease / query error (degrade).
     std::vector<std::string> out;
     if (!open_ || source.empty())
         return out;

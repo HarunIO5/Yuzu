@@ -40,6 +40,12 @@
 ///   * agent_coverage — PK(agent_id); the per-agent assessment tallies + the last
 ///                      run + feed-sync stamps. KEEP-LAST-GOOD: only an
 ///                      authoritative reconcile pass overwrites it.
+///
+/// DATA CLASSIFICATION: findings + coverage are asset / vulnerability-posture data
+/// (which CVE affects which package on which agent) — NOT PII and NOT a secret, so
+/// there is no behavioural-PII audit tier or SecretCodec envelope on this store.
+/// Per-device retention / right-to-erasure of an agent's findings is the
+/// cross-store agent-removal work tracked in #1666 (see `delete_agent`), deferred.
 
 #include <cstdint>
 #include <optional>
@@ -64,8 +70,9 @@ namespace yuzu::server {
 /// shared by every born-on-PG store, not unique to this one. An embedded NUL is
 /// therefore silently truncated at the first NUL byte, which could collide two
 /// distinct identities onto one PK row. The PR-4 producer sanitizes identity
-/// fields to be NUL-free before calling `reconcile_agent`; this store does not
-/// re-validate.
+/// fields to be NUL-free before calling `reconcile_agent`; the store ALSO rejects
+/// (returns false) any batch whose `agent_id`, `cve_id`, or `package_name`
+/// carries an embedded NUL — defence-in-depth, not a trusted-producer assumption.
 struct FindingUpsert {
     std::string cve_id;
     std::string package_name;
@@ -206,8 +213,23 @@ public:
     /// (always) → IF authoritative: dispose_clean delete, disappear sweep, and
     /// coverage upsert (all gated together on `authoritative`). Any failed row
     /// aborts the whole batch (no partial write). Returns false on any error /
-    /// !is_open / empty agent_id.
-    bool reconcile_agent(const AgentReconcile& r);
+    /// !is_open / empty agent_id / a batch exceeding the internal findings cap /
+    /// an embedded NUL in an identity field.
+    ///
+    /// UP-2 BACKSTOP on `authoritative`: an authoritative pass whose coverage
+    /// reports ZERO `total_packages` against an agent that PREVIOUSLY had state
+    /// (prior open findings potential+vulnerable > 0, OR a prior non-zero
+    /// total_packages) is treated as NON-authoritative — the sweep / dispose /
+    /// coverage-clobber are skipped (keep-last-good), the call still returns true.
+    /// The suspect signal is the EMPTY INVENTORY READ (total_packages == 0), NOT
+    /// empty findings: a pass with total_packages > 0 and empty findings is a
+    /// GENUINELY-PATCHED agent and MUST sweep-resolve its now-fixed findings, so
+    /// keying the backstop on findings.empty() would strand patched findings open
+    /// forever. This defends the fleet against a PR-4 producer / inventory-read bug
+    /// mass-false-resolving every agent on a "whole inventory vanished" read.
+    ///
+    /// [[nodiscard]]: dropping the bool silently loses a whole agent's batch.
+    [[nodiscard]] bool reconcile_agent(const AgentReconcile& r);
 
     /// Findings for one agent, most-severe first then most-recent. Open-only
     /// unless `q.include_resolved`. Hard-capped regardless of `q.limit`. Returns

@@ -119,7 +119,12 @@ TEST_CASE("ADVERSARIAL: non-authoritative with non-empty findings leaves coverag
     CHECK_FALSE(c2->resolved_at_ms.has_value());
 }
 
-TEST_CASE("ADVERSARIAL: authoritative with EMPTY findings resolves all AND zeroes coverage",
+// FIX 3 (UP-2 backstop) — SUSPECT READ guarded. The trigger is a ZERO
+// total_packages coverage (the inventory read returned nothing), NOT empty
+// findings. Against an agent whose PRIOR coverage had state (open findings and/or
+// a non-zero package count), such a pass is a "whole inventory vanished" bad read:
+// treated as NON-authoritative — NO sweep, NO coverage clobber. Returns true.
+TEST_CASE("ADVERSARIAL: authoritative ZERO-total_packages pass over a prior-state agent is backstopped",
           "[pg][vuln][adversarial]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -129,28 +134,95 @@ TEST_CASE("ADVERSARIAL: authoritative with EMPTY findings resolves all AND zeroe
 
     AgentCoverageCounts cov;
     cov.total_packages = 50;
-    cov.vulnerable = 3;
+    cov.vulnerable = 3; // prior state: total_packages=50, open=3 → backstop arms on a zero-pkg pass
     REQUIRE(store.reconcile_agent(mk_reconcile(
         "a1", {mk_finding("CVE-1", "p1"), mk_finding("CVE-2", "p2")}, true, cov)));
 
-    // A genuine "agent has zero vulnerabilities now" authoritative pass: empty
-    // findings AND zeroed coverage. Both the sweep and the coverage overwrite are
-    // gated on the SAME `authoritative` flag, so they must move together.
-    AgentCoverageCounts zero{};
+    // A bare empty authoritative pass with a ZEROED coverage payload
+    // (total_packages == 0 — the shape a failed "whole inventory" read emits). The
+    // backstop treats it as suspect: NO sweep, NO coverage clobber. Returns true.
+    AgentCoverageCounts zero{}; // total_packages == 0 → the suspect signal
     REQUIRE(store.reconcile_agent(mk_reconcile("a1", {}, /*authoritative=*/true, zero)));
 
-    CHECK(store.query_findings("a1").empty()); // both resolved
+    // Findings preserved (NOT resolved) — the fleet is not mass-false-resolved.
+    CHECK(store.query_findings("a1").size() == 2);
     auto c1 = find_row(store, "a1", "CVE-1", "p1");
     auto c2 = find_row(store, "a1", "CVE-2", "p2");
     REQUIRE(c1);
     REQUIRE(c2);
-    CHECK(c1->resolved_at_ms.has_value());
-    CHECK(c2->resolved_at_ms.has_value());
+    CHECK_FALSE(c1->resolved_at_ms.has_value());
+    CHECK_FALSE(c2->resolved_at_ms.has_value());
 
+    // Coverage kept-last-good (NOT clobbered to zero by the suspect payload).
     auto cr = store.get_agent_coverage("a1");
     REQUIRE(cr.status == CoverageRead::Status::Ok);
-    CHECK(cr.row.total_packages == 0);
+    CHECK(cr.row.total_packages == 50);
+    CHECK(cr.row.vulnerable == 3);
+}
+
+// FIX 3 REGRESSION GUARD — a GENUINELY-PATCHED agent MUST resolve. Inventory is
+// still present (total_packages > 0) but every vuln is now fixed → findings
+// legitimately empty. The backstop must NOT fire (it keys on total_packages == 0,
+// not findings.empty()), so the now-fixed findings ARE swept-resolved. Keying on
+// empty findings would strand these open forever = a false-positive.
+TEST_CASE("ADVERSARIAL: genuinely-patched agent (empty findings, total_packages>0) IS resolved",
+          "[pg][vuln][adversarial]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    VulnFindingStore store{pool};
+    REQUIRE(store.is_open());
+
+    AgentCoverageCounts before;
+    before.total_packages = 50;
+    before.vulnerable = 3;
+    REQUIRE(store.reconcile_agent(mk_reconcile(
+        "a1", {mk_finding("CVE-1", "p1"), mk_finding("CVE-2", "p2"), mk_finding("CVE-3", "p3")}, true,
+        before)));
+    CHECK(store.query_findings("a1").size() == 3);
+
+    // Patched: inventory STILL present (50 packages) but zero vulns now.
+    AgentCoverageCounts after;
+    after.total_packages = 50; // > 0 → NOT the suspect signal
+    after.potential = 0;
+    after.vulnerable = 0;
+    REQUIRE(store.reconcile_agent(mk_reconcile("a1", {}, /*authoritative=*/true, after)));
+
+    // All three findings resolved (backstop did NOT fire) — the fix landed.
+    CHECK(store.query_findings("a1").empty());
+    for (const auto* cve : {"CVE-1", "CVE-2", "CVE-3"}) {
+        auto row = find_row(store, "a1", cve, cve[4] == '1' ? "p1" : (cve[4] == '2' ? "p2" : "p3"));
+        REQUIRE(row);
+        CHECK(row->resolved_at_ms.has_value());
+    }
+    // Coverage updated to the patched tallies (total 50, zero vulns).
+    auto cr = store.get_agent_coverage("a1");
+    REQUIRE(cr.status == CoverageRead::Status::Ok);
+    CHECK(cr.row.total_packages == 50);
     CHECK(cr.row.vulnerable == 0);
+    CHECK(cr.row.potential == 0);
+}
+
+// FIX 3 boundary: the backstop is NARROW — an agent with NO prior state (fresh
+// coverage all-zero) is legitimately swept by an empty authoritative pass even
+// with total_packages == 0, because there is nothing prior to protect (the guard
+// requires prior open findings OR a prior non-zero package count).
+TEST_CASE("ADVERSARIAL: authoritative EMPTY pass over a prior-CLEAN agent still sweeps (backstop is narrow)",
+          "[pg][vuln][adversarial]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    VulnFindingStore store{pool};
+    REQUIRE(store.is_open());
+
+    // First pass carries DEFAULT (all-zero) coverage → no prior state to protect.
+    REQUIRE(store.reconcile_agent(mk_reconcile("a1", {mk_finding("CVE-1", "p1")}, true)));
+    // Empty authoritative pass: prior state is all-zero → backstop does NOT arm → sweep fires.
+    REQUIRE(store.reconcile_agent(mk_reconcile("a1", {}, /*authoritative=*/true)));
+    CHECK(store.query_findings("a1").empty()); // swept
+    auto row = find_row(store, "a1", "CVE-1", "p1");
+    REQUIRE(row);
+    CHECK(row->resolved_at_ms.has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -459,11 +531,15 @@ TEST_CASE("ADVERSARIAL: get_agent_coverage returns Degraded (not NotFound) when 
     REQUIRE(store.reconcile_agent(mk_reconcile("known", {mk_finding("CVE-1", "p1")}, true)));
 
     // Hold the pool's only connection for longer than kReadTimeout (3s) on another
-    // thread so the coverage read's try_acquire_for starves.
+    // thread so the coverage read's try_acquire_for starves. Catch2 macros are NOT
+    // thread-safe (a failing REQUIRE throws out of the thread → std::terminate), so
+    // the holder captures its result in an atomic and the assertion runs on the
+    // main thread after join().
     std::atomic<bool> release_now{false};
+    std::atomic<bool> holder_got_lease{false};
     std::thread holder([&] {
         auto lease = pool.acquire();
-        REQUIRE(lease);
+        holder_got_lease.store(static_cast<bool>(lease), std::memory_order_relaxed);
         while (!release_now.load())
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
     });
@@ -474,6 +550,7 @@ TEST_CASE("ADVERSARIAL: get_agent_coverage returns Degraded (not NotFound) when 
     release_now = true;
     holder.join();
 
+    CHECK(holder_got_lease.load()); // the holder really did take the only connection
     CHECK(cr.status == CoverageRead::Status::Degraded); // NOT NotFound — the agent DOES exist
 }
 
@@ -514,7 +591,11 @@ TEST_CASE("ADVERSARIAL: SQL metacharacters in agent_id/cve_id/package_name are s
     CHECK(cr.row.total_packages == 5);
 }
 
-TEST_CASE("ADVERSARIAL: a NUL byte embedded in cve_id does not corrupt other rows or crash",
+// FIX 4: an embedded NUL in an identity field is REJECTED (reconcile returns
+// false, nothing persisted) — not silently truncated onto a colliding PK. A NUL
+// truncates at libpq's c_str() bind, which could fold two distinct identities
+// onto one row; the store now boundary-checks and refuses.
+TEST_CASE("ADVERSARIAL: a NUL byte embedded in cve_id is rejected, not silently truncated",
           "[pg][vuln][adversarial]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -523,31 +604,28 @@ TEST_CASE("ADVERSARIAL: a NUL byte embedded in cve_id does not corrupt other row
     REQUIRE(store.is_open());
 
     using namespace std::string_literals;
-    // cve_id with an embedded NUL. `exec_params` binds via `c_str()` (a
-    // null-terminated C string with no explicit length), so libpq will only see
-    // the bytes up to the first NUL — this documents whatever actually happens
-    // (truncation vs error vs full value) rather than assuming either.
     const std::string evil_cve = "CVE-1\0-TAIL"s;
     REQUIRE(evil_cve.size() == 11); // the std::string itself DOES hold all 11 bytes
 
-    auto f = mk_finding(evil_cve, "pkg-nul");
-    bool ok = store.reconcile_agent(mk_reconcile("a1", {f}, true));
-    INFO("reconcile_agent with NUL-embedded cve_id returned: " << ok);
-
-    if (ok) {
-        auto rows = store.query_findings("a1");
-        REQUIRE(rows.size() == 1);
-        INFO("stored cve_id length: " << rows[0].cve_id.size() << " value: [" << rows[0].cve_id
-                                       << "]");
-        // Whatever it stored, it must be a PREFIX of the original up to the NUL
-        // (silent truncation), never garbage/other bytes appended, and it must
-        // not equal the full 11-byte original (that would require the NUL to
-        // have survived libpq's text-format transport, which it cannot).
-        CHECK(rows[0].cve_id != evil_cve);
+    SECTION("NUL in cve_id → reject, no row persisted") {
+        auto f = mk_finding(evil_cve, "pkg-nul");
+        CHECK_FALSE(store.reconcile_agent(mk_reconcile("a1", {f}, true)));
+        CHECK(store.query_findings("a1").empty());
     }
-    // Above all: this must not crash the process. Reaching this line is itself
-    // part of the assertion.
-    SUCCEED("did not crash on embedded NUL");
+    SECTION("NUL in package_name → reject") {
+        auto f = mk_finding("CVE-CLEAN", "pkg\0evil"s);
+        CHECK_FALSE(store.reconcile_agent(mk_reconcile("a1", {f}, true)));
+        CHECK(store.query_findings("a1").empty());
+    }
+    SECTION("NUL in agent_id → reject") {
+        auto f = mk_finding("CVE-CLEAN", "pkg-ok");
+        CHECK_FALSE(store.reconcile_agent(mk_reconcile("agent\0x"s, {f}, true)));
+    }
+    SECTION("a clean sibling batch (no NUL) still succeeds — the reject is scoped") {
+        auto f = mk_finding("CVE-OK", "pkg-ok");
+        CHECK(store.reconcile_agent(mk_reconcile("a2", {f}, true)));
+        CHECK(store.query_findings("a2").size() == 1);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -595,6 +673,20 @@ TEST_CASE("ADVERSARIAL: disposed_clean overlapping the sweep set — DELETE wins
 //    software_inventory-style lock must NOT block the vuln reconcile.
 // ---------------------------------------------------------------------------
 
+// Return the boolean result of a single `SELECT pg_try_advisory_xact_lock(...)`
+// executed on `lease` (already inside a BEGIN). try-lock is NON-blocking and
+// per-session, so its result is a DETERMINISTIC witness of whether the key is
+// already held by another session — no wall-clock threshold required.
+namespace {
+bool try_xact_lock(PGconn* conn, const std::string& lock_sql, const std::string& agent) {
+    auto r = yuzu::server::pg::exec_params(conn, lock_sql.c_str(), std::vector<std::string>{agent});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) >= 1);
+    const char* v = PQgetvalue(r.get(), 0, 0);
+    return v != nullptr && (v[0] == 't' || v[0] == 'T');
+}
+} // namespace
+
 TEST_CASE("ADVERSARIAL: VulnFindingStore's advisory lock key is namespaced away from "
           "SoftwareInventoryStore's for the same agent_id",
           "[pg][vuln][adversarial]") {
@@ -605,50 +697,40 @@ TEST_CASE("ADVERSARIAL: VulnFindingStore's advisory lock key is namespaced away 
     REQUIRE(store.is_open());
 
     const std::string agent = "collide-agent";
-    constexpr auto kHold = std::chrono::milliseconds(1500);
 
-    // Hold the EXACT lock SoftwareInventoryStore's full-replace path takes
-    // (identical SQL: hashtextextended(agent_id, 0), same salt) on a raw
-    // transaction, without going through SoftwareInventoryStore at all — this
-    // isolates the claim to "does the vuln reconcile's lock KEY collide with the
-    // software-inventory key", independent of any other behavioral difference.
-    std::atomic<bool> lock_acquired{false};
-    std::thread holder([&] {
-        auto lease = pool.acquire();
-        REQUIRE(lease);
-        auto begin = yuzu::server::pg::exec_params(lease.get(), "BEGIN", std::vector<std::string>{});
-        REQUIRE(begin.status() == PGRES_COMMAND_OK);
-        auto lk = yuzu::server::pg::exec_params(
-            lease.get(), "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-            std::vector<std::string>{agent});
-        REQUIRE(lk.status() == PGRES_TUPLES_OK);
-        lock_acquired = true;
-        std::this_thread::sleep_for(kHold);
-        auto commit =
-            yuzu::server::pg::exec_params(lease.get(), "COMMIT", std::vector<std::string>{});
-        REQUIRE(commit.status() == PGRES_COMMAND_OK);
-    });
-    while (!lock_acquired.load())
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    // Small buffer to be sure the holder's transaction is fully inside the lock
-    // before we race the reconcile against it.
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // DETERMINISTIC key-disjointness proof — no threads, no wall-clock. On lease A
+    // hold the EXACT SoftwareInventoryStore full-replace key
+    // (hashtextextended(agent, 0)) inside a transaction; on lease B a NON-BLOCKING
+    // try-lock of the VULN store's namespaced key
+    // (hashtextextended('vuln_finding_store:'||agent, 0)) must SUCCEED (return
+    // TRUE) because the two keys are disjoint. Before the namespacing fix the keys
+    // were identical and the try-lock would have returned FALSE.
+    auto leaseA = pool.acquire();
+    REQUIRE(leaseA);
+    auto leaseB = pool.acquire();
+    REQUIRE(leaseB);
 
-    auto t0 = std::chrono::steady_clock::now();
-    bool ok = store.reconcile_agent(mk_reconcile(agent, {mk_finding("CVE-1", "p1")}, true));
-    auto elapsed = std::chrono::steady_clock::now() - t0;
-    holder.join();
+    REQUIRE(yuzu::server::pg::exec_params(leaseA.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(leaseB.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
 
-    CHECK(ok); // succeeds regardless
-    // Post-fix: the vuln store's key is hashtextextended('vuln_finding_store:' ||
-    // agent, 0), disjoint from software_inventory's hashtextextended(agent, 0), so
-    // the reconcile must NOT wait on the unrelated hold — it should complete well
-    // under the hold duration. (Before the fix this blocked for ~kHold.)
-    INFO("reconcile_agent elapsed while an external hashtextextended(agent,0) "
-         "lock was held: "
-         << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() << "ms "
-         << "(hold was " << kHold.count() << "ms)");
-    CHECK(elapsed < kHold / 2); // NOT blocked — namespaced key does not collide
+    // A holds the software-inventory-style key (blocking lock; unheld → returns at
+    // once). pg_advisory_xact_lock returns void, so we don't route it through the
+    // try-lock witness helper.
+    REQUIRE(yuzu::server::pg::exec_params(
+                leaseA.get(), "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                std::vector<std::string>{agent})
+                .status() == PGRES_TUPLES_OK);
+    // B try-locks the namespaced vuln key — disjoint → TRUE.
+    CHECK(try_xact_lock(
+        leaseB.get(),
+        "SELECT pg_try_advisory_xact_lock(hashtextextended('vuln_finding_store:' || $1, 0))", agent));
+
+    REQUIRE(yuzu::server::pg::exec_params(leaseA.get(), "COMMIT", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(leaseB.get(), "COMMIT", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
 }
 
 TEST_CASE("ADVERSARIAL: two vuln reconciles for the SAME agent still serialize "
@@ -661,41 +743,33 @@ TEST_CASE("ADVERSARIAL: two vuln reconciles for the SAME agent still serialize "
     REQUIRE(store.is_open());
 
     const std::string agent = "same-agent-serialize";
-    constexpr auto kHold = std::chrono::milliseconds(1500);
 
-    // Hold the VULN store's own namespaced key (the exact formula reconcile_agent
-    // now uses) for the same agent. A concurrent reconcile of that agent MUST
-    // block on it — the fix must not have weakened same-agent serialization.
-    std::atomic<bool> lock_acquired{false};
-    std::thread holder([&] {
-        auto lease = pool.acquire();
-        REQUIRE(lease);
-        auto begin = yuzu::server::pg::exec_params(lease.get(), "BEGIN", std::vector<std::string>{});
-        REQUIRE(begin.status() == PGRES_COMMAND_OK);
-        auto lk = yuzu::server::pg::exec_params(
-            lease.get(),
-            "SELECT pg_advisory_xact_lock(hashtextextended('vuln_finding_store:' || $1, 0))",
-            std::vector<std::string>{agent});
-        REQUIRE(lk.status() == PGRES_TUPLES_OK);
-        lock_acquired = true;
-        std::this_thread::sleep_for(kHold);
-        auto commit =
-            yuzu::server::pg::exec_params(lease.get(), "COMMIT", std::vector<std::string>{});
-        REQUIRE(commit.status() == PGRES_COMMAND_OK);
-    });
-    while (!lock_acquired.load())
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // DETERMINISTIC same-key serialization proof. On lease A hold the VULN store's
+    // OWN namespaced key inside a transaction; on lease B a non-blocking try-lock
+    // of the SAME namespaced key must FAIL (return FALSE) — a second session
+    // cannot take a key another session already holds. This proves the fix did not
+    // weaken same-agent serialization, with no wall-clock threshold.
+    auto leaseA = pool.acquire();
+    REQUIRE(leaseA);
+    auto leaseB = pool.acquire();
+    REQUIRE(leaseB);
 
-    auto t0 = std::chrono::steady_clock::now();
-    bool ok = store.reconcile_agent(mk_reconcile(agent, {mk_finding("CVE-1", "p1")}, true));
-    auto elapsed = std::chrono::steady_clock::now() - t0;
-    holder.join();
+    REQUIRE(yuzu::server::pg::exec_params(leaseA.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(leaseB.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
 
-    CHECK(ok); // eventually succeeds once the hold releases
-    INFO("reconcile_agent elapsed while its OWN namespaced key was held: "
-         << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() << "ms");
-    CHECK(elapsed >= kHold / 2); // blocked — same-agent serialization intact
+    const std::string vuln_key_sql =
+        "SELECT pg_try_advisory_xact_lock(hashtextextended('vuln_finding_store:' || $1, 0))";
+    // A takes the key (try-lock → TRUE the first time).
+    CHECK(try_xact_lock(leaseA.get(), vuln_key_sql, agent));
+    // B try-locks the SAME key held by A → FALSE.
+    CHECK_FALSE(try_xact_lock(leaseB.get(), vuln_key_sql, agent));
+
+    REQUIRE(yuzu::server::pg::exec_params(leaseA.get(), "COMMIT", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(leaseB.get(), "COMMIT", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
 }
 
 TEST_CASE("ADVERSARIAL: disposed_clean naming a tuple that was never observed is a harmless no-op",
@@ -713,4 +787,44 @@ TEST_CASE("ADVERSARIAL: disposed_clean naming a tuple that was never observed is
     auto rows = store.query_findings("a1");
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].cve_id == "CVE-1");
+}
+
+// FIX 11: fleet_summary is AUTHORITATIVE — a store/pool degrade returns nullopt,
+// NEVER a silent all-zero summary (which would read as "the whole fleet is
+// clean"). Prove it under a REAL pool-exhaustion degrade, mirroring the
+// get_agent_coverage Degraded probe above.
+TEST_CASE("ADVERSARIAL: fleet_summary returns nullopt (not a zero summary) on an exhausted pool",
+          "[pg][vuln][adversarial]") {
+    YUZU_REQUIRE_PG_DB(db);
+    // Pool of size 1 so a single held lease starves fleet_summary's acquire.
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    VulnFindingStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Seed data so a FREE pool would return a populated (non-null) summary.
+    AgentCoverageCounts cov;
+    cov.total_packages = 20;
+    cov.vulnerable = 2;
+    REQUIRE(store.reconcile_agent(mk_reconcile("known", {mk_finding("CVE-1", "p1", "critical")}, true, cov)));
+
+    // Hold the pool's only connection past kReadTimeout on another thread. Catch2
+    // macros are not thread-safe, so the holder captures its result in an atomic
+    // and the assertion runs on the main thread after join().
+    std::atomic<bool> release_now{false};
+    std::atomic<bool> holder_got_lease{false};
+    std::thread holder([&] {
+        auto lease = pool.acquire();
+        holder_got_lease.store(static_cast<bool>(lease), std::memory_order_relaxed);
+        while (!release_now.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    auto sum = store.fleet_summary();
+    release_now = true;
+    holder.join();
+
+    CHECK(holder_got_lease.load());
+    CHECK_FALSE(sum.has_value()); // degrade → nullopt, NOT a zeroed FleetVulnSummary
 }

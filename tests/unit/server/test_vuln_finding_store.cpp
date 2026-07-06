@@ -22,6 +22,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <string>
 #include <thread>
@@ -537,6 +538,79 @@ TEST_CASE("SoftwareInventoryStore list_agent_ids keyset pages the fleet", "[pg][
     // Ascending + unique (no dupes across page boundaries).
     for (std::size_t i = 1; i < all.size(); ++i)
         CHECK(all[i - 1] < all[i]);
+}
+
+// (19) FIX 2: a non-finite cvss (NaN / +Inf) persists as SQL NULL, NOT a batch
+// abort. std::to_string(NaN) would emit "nan" → PG 22P02 → the whole reconcile
+// rolls back every pass; the finite-guard binds NULL instead (cvss is optional).
+TEST_CASE("VulnFindingStore non-finite cvss persists as NULL, not a batch abort", "[pg][vuln][store]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    VulnFindingStore store{pool};
+    REQUIRE(store.is_open());
+
+    SECTION("NaN cvss → NULL, sibling finite value survives") {
+        FindingUpsert nan_f = mk_finding("CVE-NAN", "p1");
+        nan_f.cvss = std::numeric_limits<double>::quiet_NaN();
+        FindingUpsert good = mk_finding("CVE-OK", "p2");
+        good.cvss = 6.4;
+        // The whole batch must COMMIT (no 22P02 abort) with the NaN row's cvss NULL.
+        REQUIRE(store.reconcile_agent(mk_reconcile("a1", {nan_f, good}, true)));
+        auto rn = find_row(store, "a1", "CVE-NAN", "p1");
+        REQUIRE(rn);
+        CHECK_FALSE(rn->cvss.has_value()); // NaN → SQL NULL
+        auto rg = find_row(store, "a1", "CVE-OK", "p2");
+        REQUIRE(rg);
+        REQUIRE(rg->cvss.has_value());
+        CHECK(rg->cvss.value() == 6.4);
+    }
+    SECTION("+Inf cvss → NULL") {
+        FindingUpsert inf_f = mk_finding("CVE-INF", "p3");
+        inf_f.cvss = std::numeric_limits<double>::infinity();
+        REQUIRE(store.reconcile_agent(mk_reconcile("a2", {inf_f}, true)));
+        auto ri = find_row(store, "a2", "CVE-INF", "p3");
+        REQUIRE(ri);
+        CHECK_FALSE(ri->cvss.has_value());
+    }
+}
+
+// (20) FIX 6: a mixed-case severity/status filter matches the canonically-stored
+// (normalized) value — "HIGH" must return the 'high' rows, not empty.
+TEST_CASE("VulnFindingStore query filter normalizes severity/status case", "[pg][vuln][store]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    VulnFindingStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.reconcile_agent(mk_reconcile(
+        "a1",
+        {mk_finding("CVE-1", "p1", "high", "vulnerable"), mk_finding("CVE-2", "p2", "critical", "potential")},
+        true)));
+
+    SECTION("mixed-case severity 'HIGH' matches the stored 'high' row") {
+        FindingQuery q;
+        q.severity = std::string{"HIGH"};
+        auto rows = store.query_findings("a1", q);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].cve_id == "CVE-1");
+        CHECK(rows[0].severity == "high");
+    }
+    SECTION("padded + mixed-case severity ' Critical ' matches 'critical'") {
+        FindingQuery q;
+        q.severity = std::string{" Critical "};
+        auto rows = store.query_findings("a1", q);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].cve_id == "CVE-2");
+    }
+    SECTION("mixed-case status 'Vulnerable' matches the stored 'vulnerable' row") {
+        FindingQuery q;
+        q.status = std::string{"Vulnerable"};
+        auto rows = store.query_findings("a1", q);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].cve_id == "CVE-1");
+    }
 }
 
 // (18) delete_agent removes both tables.
