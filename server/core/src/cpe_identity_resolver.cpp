@@ -10,9 +10,9 @@
 
 #include <spdlog/spdlog.h>
 
-#include <initializer_list>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -55,8 +55,9 @@ ResolvedIdentity CpeIdentityResolver::resolve(const SoftwareEntry& e) const {
         return r;
     }
 
-    // 2. Empty name -> no derivable identity.
-    if (cpe_trim(e.name).empty()) {
+    // 2. Empty name -> no derivable identity. cpe_trim_view avoids allocating a
+    //    string just to test emptiness on this per-installed-software hot path.
+    if (cpe_trim_view(e.name).empty()) {
         r.outcome = IdentityOutcome::NoIdentity;
         r.not_assessed_reason = std::string(kReasonNoIdentity);
         return r;
@@ -66,27 +67,32 @@ ResolvedIdentity CpeIdentityResolver::resolve(const SoftwareEntry& e) const {
     //    impossible without a version, mirroring match_inventory skipping
     //    empty-version rows. A curated `openssl` with no version is NoVersion,
     //    never a High hit.
-    if (cpe_trim(e.version).empty()) {
+    if (cpe_trim_view(e.version).empty()) {
         r.outcome = IdentityOutcome::NoVersion;
         r.not_assessed_reason = std::string(kReasonNoVersion);
         return r;
     }
 
     // 4. Curated lookup, most-specific precedence:
-    //    (eco, distro_id, name) -> (eco, "", name) -> ("", "", name).
-    for (const std::string& key : {curated_key(e.ecosystem, e.distro_id, e.name),
-                                   curated_key(e.ecosystem, "", e.name),
-                                   curated_key("", "", e.name)}) {
+    //    (eco, distro_id, name) -> (eco, "", name) -> ("", "", name). Three
+    //    sequential early-return finds — NOT an initializer_list of the three
+    //    keys, which would heap-allocate all three std::string keys on every
+    //    call even when the most-specific key hits first.
+    auto try_curated = [&](const std::string& key) -> bool {
         auto it = map_.find(key);
-        if (it != map_.end()) {
-            r.outcome = IdentityOutcome::Resolved;
-            r.cpe_product = it->second.product;
-            r.cpe_vendor = it->second.vendor; // display/provenance ONLY (see header)
-            r.exact_product = true;
-            r.confidence = Confidence::High;
-            return r;
-        }
-    }
+        if (it == map_.end())
+            return false;
+        r.outcome = IdentityOutcome::Resolved;
+        r.cpe_product = it->second.product;
+        r.cpe_vendor = it->second.vendor; // display/provenance ONLY (see header)
+        r.exact_product = true;
+        r.confidence = Confidence::High;
+        return true;
+    };
+    if (try_curated(curated_key(e.ecosystem, e.distro_id, e.name)) ||
+        try_curated(curated_key(e.ecosystem, "", e.name)) ||
+        try_curated(curated_key("", "", e.name)))
+        return r;
 
     // 5. Low-confidence normalized fallback.
     std::string n = normalize_product(e.name);

@@ -9,8 +9,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 using namespace yuzu::server;
 
@@ -174,6 +176,22 @@ TEST_CASE("uncurated name resolves low-confidence via normalization", "[cpe]") {
     REQUIRE(id.cpe_vendor.empty());
 }
 
+TEST_CASE("uncurated dotted-lib name dot-strips through the full resolve() path",
+          "[cpe]") {
+    // The libssl-dot fix (cpe_normalize.hpp step 4, lib-branch consuming a
+    // trailing `[0-9.]` run) is otherwise only exercised via normalize_product()
+    // directly, or via the curated `libssl1.1`/`libssl3` rows — which short-
+    // circuit at the curated lookup BEFORE normalize runs. This drives an
+    // UNCURATED dotted-lib name (`libssl9.9`, not in the seed) through the real
+    // low-confidence decision path, proving the dot-strip runs there.
+    CpeIdentityResolver r{kSeed};
+    auto id = r.resolve(pkg("libssl9.9", "1.0", "deb"));
+    REQUIRE(id.outcome == IdentityOutcome::Resolved);
+    CHECK(id.confidence == Confidence::Low);
+    CHECK_FALSE(id.exact_product);
+    CHECK(id.cpe_product == "libssl"); // dotted soname tail stripped, no dead dot
+}
+
 TEST_CASE("normalize_product low-confidence table", "[cpe]") {
     CHECK(normalize_product("openssl-dev") == "openssl");
     CHECK(normalize_product("python3-requests") == "requests");
@@ -185,6 +203,10 @@ TEST_CASE("normalize_product low-confidence table", "[cpe]") {
     CHECK(normalize_product("  openssl  ") == "openssl");
     CHECK(normalize_product("-dev") == "");
     CHECK(normalize_product("sqlite3") == "sqlite3"); // no bare-digit strip
+    // Prefix strips first (`python3-`), then no SAFE suffix remains on the bare
+    // `dev` token, so it is NOT re-examined as a `-dev` suffix — surprising but
+    // correct under the single-pass fixed order.
+    CHECK(normalize_product("python3-dev") == "dev");
 }
 
 TEST_CASE("normalize_product order-dependence is single-pass (S3)", "[cpe]") {
@@ -222,13 +244,13 @@ TEST_CASE("dangerous suffixes are not stripped (real stems)", "[cpe]") {
 
 TEST_CASE("empty or short curated map fails closed", "[cpe]") {
     // 0 rows.
-    REQUIRE_THROWS([] { CpeIdentityResolver r{std::string_view{""}}; }());
+    REQUIRE_THROWS_AS(CpeIdentityResolver{std::string_view{""}}, std::runtime_error);
     // all-comment CSV -> 0 data rows.
-    REQUIRE_THROWS([] {
-        CpeIdentityResolver r{std::string_view{"# just a comment\n# another\n"}};
-    }());
+    REQUIRE_THROWS_AS(CpeIdentityResolver{std::string_view{"# just a comment\n# another\n"}},
+                      std::runtime_error);
     // below-floor (fewer than 13 valid rows).
-    REQUIRE_THROWS([] { CpeIdentityResolver r{std::string_view{",,openssl,openssl,openssl\n"}}; }());
+    REQUIRE_THROWS_AS(CpeIdentityResolver{std::string_view{",,openssl,openssl,openssl\n"}},
+                      std::runtime_error);
 }
 
 TEST_CASE("csv parse skips comments and blanks", "[cpe]") {
@@ -412,8 +434,8 @@ TEST_CASE("REGRESSION GUARD: a curated row with an empty product (or name) field
 
 TEST_CASE("ADVERSARIAL: fail-closed floor is an exact boundary at kMinCuratedRows",
           "[cpe]") {
-    REQUIRE_THROWS(CpeIdentityResolver(kTwelveRows)); // 12 < 13
-    REQUIRE_NOTHROW(CpeIdentityResolver(kSeed));       // 13 == 13, ok
+    REQUIRE_THROWS_AS(CpeIdentityResolver(kTwelveRows), std::runtime_error); // 12 < 13
+    REQUIRE_NOTHROW(CpeIdentityResolver(kSeed));                             // 13 == 13, ok
 }
 
 TEST_CASE("ADVERSARIAL: 13 raw non-comment lines that parse to ZERO valid rows "
@@ -432,7 +454,8 @@ TEST_CASE("ADVERSARIAL: 13 raw non-comment lines that parse to ZERO valid rows "
         thirteen_malformed += "a,b,c\n"; // 3 fields, not 5 — dropped by the parser
     auto parsed = parse_curated_csv(thirteen_malformed);
     CHECK(parsed.empty());
-    REQUIRE_THROWS(CpeIdentityResolver(std::string_view{thirteen_malformed}));
+    REQUIRE_THROWS_AS(CpeIdentityResolver(std::string_view{thirteen_malformed}),
+                      std::runtime_error);
 }
 
 // ===========================================================================

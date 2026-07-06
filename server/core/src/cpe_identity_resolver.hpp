@@ -42,8 +42,12 @@ struct SoftwareEntry; // software_inventory_store.hpp (only referenced by ref)
 /// Fail-closed floor: the production constructor refuses to build a resolver
 /// whose curated map holds fewer than this many entries (a corrupt/empty embed
 /// must not ship a resolver that high-confidence-matches almost nothing). Kept
-/// equal to the shipped seed row count; the build-time meson probe enforces the
-/// same floor on the CSV so the failure surfaces at configure time too.
+/// equal to the shipped seed row count. The runtime ctor is the AUTHORITATIVE
+/// floor — it counts successfully-parsed, deduplicated keys. The build-time
+/// meson probe is a weaker build-time LOWER-BOUND guard: it counts well-formed
+/// rows (non-blank / non-`#` / exactly 5 fields / non-empty name+product) but
+/// does NOT replicate the key-dedup, so it catches the gross malformed-embed
+/// class at configure time without claiming byte-for-byte parity.
 inline constexpr std::size_t kMinCuratedRows = 13;
 
 enum class IdentityOutcome { Resolved, NoIdentity, NoVersion, NotAssessed };

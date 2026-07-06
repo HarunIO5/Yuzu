@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -61,6 +62,11 @@ inline std::string cpe_trim(std::string_view s) { return std::string(cpe_trim_vi
 inline bool is_lane1(std::string_view eco) {
     // Lowercase before comparing — curated_key()/normalize also lowercase, and a
     // producer that emits "RPM" must not fall through to unsupported-ecosystem.
+    //
+    // pacman is INCLUDED here as NVD-assessable at M1a (NVD version-range matching
+    // needs no distro OVAL stream). ADR-0018's Lane-1 enumeration currently lists
+    // only deb/rpm/apk (Arch has no OVAL stream) — that list should be amended to
+    // sanction pacman as an OVAL-less Lane-1 member; OVAL only matters at M1b.
     const std::string e = yuzu::server::detail::to_lower_ascii(cpe_trim_view(eco));
     return e == "rpm" || e == "deb" || e == "apk" || e == "pacman";
 }

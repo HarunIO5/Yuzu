@@ -258,25 +258,39 @@ content_embed = custom_target(
 # Instruction-Engine bundle; it is embedded on its own as a std::string_view
 # (kCuratedCpeMap) that CpeIdentityResolver parses at construction.
 #
-# Fail-closed at CONFIGURE time (mirrors the PyYAML probe above): a curated map
-# with fewer than kMinCuratedRows (13) data rows would ship a resolver that
-# high-confidence-matches almost nothing, so refuse to build. The runtime ctor
-# enforces the same floor as defence-in-depth.
+# Build-time LOWER-BOUND guard on WELL-FORMED rows (NOT the authoritative
+# floor). This probe counts only lines that share the shape the runtime parser
+# accepts — non-blank, non-`#`, split on `,` into EXACTLY 5 fields with a
+# non-empty name (field[2]) AND non-empty cpe_product (field[4]) — so 13
+# malformed / empty-product lines can no longer pass configure and then crash
+# the server at boot. It deliberately does NOT replicate the runtime's `\x1f`
+# key-dedup (impractical in a one-liner), so it is an over-count relative to
+# distinct keys: the runtime ctor (map_.size() < kMinCuratedRows in
+# cpe_identity_resolver.cpp) remains the AUTHORITATIVE floor. See ADR-0018.
 cpe_map_csv = files('../../content/cpe-map/curated-cpe-map.csv')
 _cpe_probe = run_command(
   embed_python, '-c',
   '''import sys
 lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
-print(sum(1 for l in lines if l.strip() and not l.strip().startswith("#")))''',
+n = 0
+for l in lines:
+    s = l.strip()
+    if not s or s.startswith("#"):
+        continue
+    parts = l.split(",")
+    if len(parts) == 5 and parts[2].strip() and parts[4].strip():
+        n += 1
+print(n)''',
   cpe_map_csv,
   check: true,
 )
 _cpe_rows = _cpe_probe.stdout().strip().to_int()
 if _cpe_rows < 13
   error(
-    'Curated CPE map has ' + _cpe_rows.to_string() + ' data rows but kMinCuratedRows '
-    + 'is 13 (server/core/src/cpe_identity_resolver.hpp). Fail-closed: a thin map '
-    + 'ships a resolver that high-confidence-matches almost nothing. See ADR-0018.'
+    'Curated CPE map has ' + _cpe_rows.to_string() + ' well-formed data rows but '
+    + 'kMinCuratedRows is 13 (server/core/src/cpe_identity_resolver.hpp). Build-time '
+    + 'lower-bound guard: a thin map ships a resolver that high-confidence-matches '
+    + 'almost nothing. The runtime ctor is the authoritative floor. See ADR-0018.'
   )
 endif
 
