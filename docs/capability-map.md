@@ -431,9 +431,16 @@ Not implemented. Event emission for SIEM/compliance integration.
 
 > **Gap:** No macOS FileVault or Linux LUKS coverage.
 
-### 9.4 Vulnerability Scanning :white_check_mark: `T1`
+### 9.4 Vulnerability Scanning :large_orange_diamond: `T1`
 
-`vuln_scan` plugin + NVD database sync on server.
+`vuln_scan` plugin + NVD database sync on server. Server-side matching now uses
+real CPE version ranges (`cve`+`cve_match` schema), but **coverage is still
+partial**: the NVD sync now backfills the full CVE catalog newest-first
+(configurable window via `--nvd-backfill-years`, default 8y, resumable across
+restarts, then periodic freshness re-checks), yet match identity is still
+product-name based, not vendor/CPE-precise (false positives from name
+collisions possible; vendor precision pending ADR-0018). See
+`docs/vuln-scan-roadmap.md`.
 
 ### 9.5 Event Log Collection :white_check_mark: `T1`
 
@@ -1201,7 +1208,7 @@ Server store shipped (PR 1 — `server/core/src/guaranteed_state_store.{hpp,cpp}
 
 ### 31.8 Pre-Login Activation and Offline Capability :white_check_mark: `T2`
 
-Pre-login activation works by construction today: the agent runs as a Windows service with `SERVICE_AUTO_START` + `FailureActions` configured at install time (`agents/core/src/main.cpp:136-200`); systemd unit on Linux with `Type=notify` + `Restart=always`; launchd `KeepAlive=true` + `RunAtLoad=true` on macOS. `GuardianEngine::start_local()` runs before the Register RPC, so once guard implementations land in PR 3+, enforcement begins as soon as the service starts — before any user can log in. Offline capability comes from caching policy in `kv_store.db` under `__guardian__` namespace; enforcement continues with last-known-good rules when the server is unreachable, and queued events flush when the server returns. Marked `:white_check_mark:` because the service-install side is operational; the *enforcement* half is gated on PR 3+ landing real guards.
+Pre-login activation works by construction today: the agent runs as a Windows service with `SERVICE_AUTO_START` + `FailureActions` configured at install time (`agents/core/src/main.cpp:234-338`, and `agents/core/src/service_win.{hpp,cpp}` for the SCM `ServiceMain`/control-handler dispatcher that actually makes `sc start` succeed — #1822); systemd unit on Linux with `Type=notify` + `Restart=always`; launchd `KeepAlive=true` + `RunAtLoad=true` on macOS. `GuardianEngine::start_local()` runs before the Register RPC, so once guard implementations land in PR 3+, enforcement begins as soon as the service starts — before any user can log in. Offline capability comes from caching policy in `kv_store.db` under `__guardian__` namespace; enforcement continues with last-known-good rules when the server is unreachable, and queued events flush when the server returns. Marked `:white_check_mark:` because the service-install side is operational (genuinely so as of #1822 — before it, `sc start YuzuAgent` failed with error 1053 on every real Windows install, so this claim was aspirational, not true, until this fix landed); the *enforcement* half is gated on PR 3+ landing real guards.
 
 ### 31.9 Dashboard and Approval Workflow :x: `T2`
 
