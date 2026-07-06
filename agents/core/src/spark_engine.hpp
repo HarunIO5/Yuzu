@@ -38,7 +38,8 @@
 #include <yuzu/plugin.h> // YUZU_EXPORT
 #include <yuzu/agent/spark.hpp>
 
-#include "spark_types.hpp" // DiskReaderFn, SparkFireDecision
+#include "spark_mechanism.hpp" // ISparkMechanism, register_mechanism
+#include "spark_types.hpp"     // DiskReaderFn, SparkFireDecision
 
 #include <atomic>
 #include <condition_variable>
@@ -96,6 +97,17 @@ public:
     ~SparkEngine();
     SparkEngine(const SparkEngine&) = delete;
     SparkEngine& operator=(const SparkEngine&) = delete;
+
+    /// Register the watch mechanism for an event-driven spark type (File /
+    /// Registry / Service). MUST be called before start(). Production wires the
+    /// platform factories (make_file_mechanism / make_registry_mechanism);
+    /// tests wire a fake. With NO mechanism registered for a type, arm() of
+    /// that type is rejected — preserving the spark.hpp invariant "Armed means
+    /// a watcher is running". Rejects a null mechanism, a timer-driven type
+    /// (interval/startup/disk are the wheel's), a duplicate registration, and
+    /// any call after start().
+    std::expected<void, std::string>
+    register_mechanism(SparkType type, std::unique_ptr<ISparkMechanism> mechanism);
 
     /// Register a queued consumer. Its dispatch thread starts immediately;
     /// events flow once the engine starts and the consumer arms sparks.
@@ -175,11 +187,21 @@ private:
     };
 
     std::expected<SubscriptionId, std::string> arm_impl(SparkSpec spec, Subscriber sub);
-    /// Validate + normalise (cadence flooring). Returns the effective cadence.
+    /// Validate + normalise (cadence flooring). Returns the effective cadence
+    /// (0 for the event-driven and startup types, which have no wheel cadence).
     std::expected<std::uint64_t, std::string> validate_and_floor(const SparkSpec& spec) const;
     [[nodiscard]] std::chrono::steady_clock::time_point
     initial_due(const SparkSpec& spec, std::uint64_t cadence_ms,
                 std::chrono::steady_clock::time_point now) const;
+    /// File / Registry / Service: serviced by a mechanism, never the wheel.
+    [[nodiscard]] static bool is_event_driven(SparkType type) noexcept;
+    /// The mechanism fire entry point: fan one event-driven fire out to every
+    /// subscriber of `key`. Looks the key up + snapshots subs under mu_, then
+    /// releases mu_ before delivering (an inline consumer that re-arms takes
+    /// mu_ — delivering under it would deadlock). A key disarmed mid-flight is
+    /// simply skipped. Distinct from the wheel's commit path, which also owns
+    /// reschedule + per-subscriber startup semantics.
+    void emit_event(const std::string& key, SparkData data);
     void wheel_loop();
     void deliver(const SparkEvent& ev, const std::vector<Subscriber>& subs);
     void consumer_loop(const std::shared_ptr<Consumer>& consumer);
@@ -193,6 +215,13 @@ private:
     bool stopped_{false};
     std::thread wheel_thread_;
     std::uint64_t next_id_{1}; ///< shared consumer/subscription id counter
+
+    /// Event-driven watch mechanisms by type. Registered before start(),
+    /// structurally stable thereafter (entries never added/removed until
+    /// destruction), so a raw pointer captured under mu_ stays valid for any
+    /// operation. Mechanism methods (start/watch/unwatch/stop) are ALWAYS
+    /// invoked with mu_ released — they may block on OS handle setup.
+    std::map<SparkType, std::unique_ptr<ISparkMechanism>> mechanisms_;
 
     mutable std::mutex consumers_mu_;
     std::map<ConsumerId, std::shared_ptr<Consumer>> consumers_;

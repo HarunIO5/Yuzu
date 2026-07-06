@@ -40,10 +40,34 @@ bool params_match_type(const SparkSpec& spec) {
 
 } // namespace
 
+bool SparkEngine::is_event_driven(SparkType type) noexcept {
+    return type == SparkType::File || type == SparkType::Service ||
+           type == SparkType::Registry;
+}
+
 SparkEngine::SparkEngine() = default;
 
 SparkEngine::~SparkEngine() {
     stop();
+}
+
+// ── Mechanisms ────────────────────────────────────────────────────────────────
+
+std::expected<void, std::string>
+SparkEngine::register_mechanism(SparkType type, std::unique_ptr<ISparkMechanism> mechanism) {
+    if (!mechanism)
+        return std::unexpected("mechanism must not be null");
+    if (!is_event_driven(type))
+        return std::unexpected(std::string("spark type '") + spark_type_token(type) +
+                               "' is timer-driven — the wheel services it, it has no mechanism");
+    std::lock_guard lk(mu_);
+    if (running_ || stopped_)
+        return std::unexpected("mechanisms must be registered before start()");
+    auto [it, inserted] = mechanisms_.try_emplace(type, std::move(mechanism));
+    if (!inserted)
+        return std::unexpected(std::string("a mechanism is already registered for spark type '") +
+                               spark_type_token(type) + "'");
+    return {};
 }
 
 // ── Consumers ─────────────────────────────────────────────────────────────────
@@ -174,11 +198,22 @@ SparkEngine::validate_and_floor(const SparkSpec& spec) const {
                          floor);
         return eff;
     }
-    case SparkType::File:
+    case SparkType::File: {
+        const auto& p = std::get<FileSparkParams>(spec.params);
+        if (p.path.empty())
+            return std::unexpected("file spark: path must not be empty");
+        return 0; // event-driven: no wheel cadence
+    }
+    case SparkType::Registry: {
+        const auto& p = std::get<RegistrySparkParams>(spec.params);
+        if (p.hive != "HKLM" && p.hive != "HKCU" && p.hive != "HKCR" && p.hive != "HKU")
+            return std::unexpected("registry spark: hive must be one of HKLM/HKCU/HKCR/HKU");
+        if (p.key.empty())
+            return std::unexpected("registry spark: key must not be empty");
+        return 0; // event-driven: no wheel cadence
+    }
     case SparkType::Service:
-    case SparkType::Registry:
-        return std::unexpected(std::string("spark type '") + spark_type_token(spec.type) +
-                               "' mechanism not built yet (Stage-1 PR 1b/1c)");
+        return std::unexpected("spark type 'service' mechanism not built yet (Stage-1 PR 1c)");
     }
     return std::unexpected("unknown spark type");
 }
@@ -225,55 +260,124 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     const auto cadence = validate_and_floor(spec);
     if (!cadence)
         return std::unexpected(cadence.error());
-    std::string key = spark_key(spec);
+    const std::string key = spark_key(spec);
+    const bool event_driven = is_event_driven(spec.type);
 
-    std::lock_guard lk(mu_);
-    if (stopped_)
-        return std::unexpected("engine is stopped");
-    sub.id = next_id_++;
-    auto [it, inserted] = armed_.try_emplace(key);
-    Armed& armed = it->second;
-    if (inserted) {
-        armed.spec = std::move(spec);
-        armed.cadence_ms = *cadence;
-        armed.scheduled = true;
-        armed.next_due = initial_due(armed.spec, armed.cadence_ms, std::chrono::steady_clock::now());
-        spdlog::info("SparkEngine: armed '{}'", key);
-    } else if (armed.spec.type == SparkType::Startup && !armed.scheduled && running_) {
-        // A late subscriber to an already-fired startup spark still gets its
-        // one-shot: re-schedule so the arm itself is the observable "startup".
-        armed.scheduled = true;
-        armed.next_due = std::chrono::steady_clock::now();
+    // Set to the mechanism + params only when a NEW event-driven watch must be
+    // armed live (a fresh key on a running engine). Deferred/deduped arms and
+    // all timer-driven arms leave it null.
+    ISparkMechanism* mech = nullptr;
+    SparkParams watch_params;
+    SubscriptionId id = 0;
+    {
+        std::lock_guard lk(mu_);
+        if (stopped_)
+            return std::unexpected("engine is stopped");
+        if (event_driven && !mechanisms_.contains(spec.type))
+            // No watcher for this type on this platform → reject, rather than
+            // arm without a watcher (spark.hpp: armed == a watcher is running).
+            return std::unexpected(std::string("no watch mechanism for spark type '") +
+                                   spark_type_token(spec.type) + "' — unsupported on this platform");
+        sub.id = next_id_++;
+        id = sub.id;
+        auto [it, inserted] = armed_.try_emplace(key);
+        Armed& armed = it->second;
+        if (inserted) {
+            armed.spec = spec;
+            armed.cadence_ms = *cadence;
+            if (event_driven) {
+                // TRAP 1: event-driven sparks NEVER sit on the wheel — the wheel
+                // scan + `default: continue` assume it. A live engine arms the
+                // watch now (below, mu_ released); a pre-start arm is armed by
+                // start()'s replay.
+                armed.scheduled = false;
+                if (running_) {
+                    mech = mechanisms_.at(spec.type).get();
+                    watch_params = spec.params;
+                }
+            } else {
+                armed.scheduled = true;
+                armed.next_due =
+                    initial_due(armed.spec, armed.cadence_ms, std::chrono::steady_clock::now());
+            }
+            spdlog::info("SparkEngine: armed '{}'", key);
+        } else if (armed.spec.type == SparkType::Startup && !armed.scheduled && running_) {
+            // A late subscriber to an already-fired startup spark still gets its
+            // one-shot: re-schedule so the arm itself is the observable "startup".
+            armed.scheduled = true;
+            armed.next_due = std::chrono::steady_clock::now();
+        }
+        // Dedup: a second arm of an equal event-driven spec falls through here
+        // (inserted == false) and shares the existing watcher — mech stays null,
+        // no second watch() (N subscriptions, 1 watcher).
+        sub_keys_.emplace(id, key);
+        armed.subs.push_back(std::move(sub));
+        if (!event_driven)
+            wheel_cv_.notify_all();
     }
-    const SubscriptionId id = sub.id;
-    sub_keys_.emplace(id, key);
-    armed.subs.push_back(std::move(sub));
-    wheel_cv_.notify_all();
+
+    // Arm the OS watch with mu_ RELEASED — watch() may block on handle setup,
+    // and an inline emit from the mechanism re-enters under mu_. On failure roll
+    // the subscription back so we never leave a spark armed without a watcher.
+    if (mech) {
+        auto w = mech->watch(key, watch_params);
+        if (!w) {
+            disarm(id);
+            return std::unexpected(std::string("watch mechanism failed to arm '") + key +
+                                   "': " + w.error());
+        }
+    }
     return id;
 }
 
 void SparkEngine::disarm(SubscriptionId id) {
-    std::lock_guard lk(mu_);
-    auto ki = sub_keys_.find(id);
-    if (ki == sub_keys_.end())
-        return;
-    auto ai = armed_.find(ki->second);
-    if (ai != armed_.end()) {
-        auto& subs = ai->second.subs;
-        std::erase_if(subs, [&](const Subscriber& s) { return s.id == id; });
-        if (subs.empty()) {
-            spdlog::info("SparkEngine: disarmed '{}' (last subscription gone)", ki->second);
-            armed_.erase(ai);
+    ISparkMechanism* mech = nullptr;
+    std::string unwatch_key;
+    {
+        std::lock_guard lk(mu_);
+        auto ki = sub_keys_.find(id);
+        if (ki == sub_keys_.end())
+            return;
+        const std::string key = ki->second;
+        auto ai = armed_.find(key);
+        if (ai != armed_.end()) {
+            auto& subs = ai->second.subs;
+            std::erase_if(subs, [&](const Subscriber& s) { return s.id == id; });
+            if (subs.empty()) {
+                spdlog::info("SparkEngine: disarmed '{}' (last subscription gone)", key);
+                // Only tear the OS watch down when the engine is live: the watch
+                // was armed only while running_, and stop() already unwinds every
+                // mechanism. A pre-start or post-stop disarm has no watch to drop.
+                if (running_ && is_event_driven(ai->second.spec.type)) {
+                    auto mit = mechanisms_.find(ai->second.spec.type);
+                    if (mit != mechanisms_.end()) {
+                        mech = mit->second.get();
+                        unwatch_key = key;
+                    }
+                }
+                armed_.erase(ai);
+            }
         }
+        sub_keys_.erase(ki);
+        wheel_cv_.notify_all();
     }
-    sub_keys_.erase(ki);
-    wheel_cv_.notify_all();
+    // Stop watching with mu_ RELEASED (unwatch may block; a racing inline emit
+    // takes mu_).
+    if (mech)
+        mech->unwatch(unwatch_key);
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 void SparkEngine::start() {
     std::size_t armed_count = 0;
+    std::vector<ISparkMechanism*> mechs;
+    struct Replay {
+        ISparkMechanism* mech;
+        std::string key;
+        SparkParams params;
+    };
+    std::vector<Replay> replays;
     {
         std::lock_guard lk(mu_);
         if (running_ || stopped_) {
@@ -283,14 +387,38 @@ void SparkEngine::start() {
         }
         running_ = true;
         // Re-base deadlines on the start instant: an interval armed long before
-        // start must not fire immediately; a startup spark fires now.
+        // start must not fire immediately; a startup spark fires now. Event-driven
+        // sparks armed before start are collected for a watch() replay below.
         const auto now = std::chrono::steady_clock::now();
         for (auto& [key, armed] : armed_) {
-            if (armed.scheduled)
+            if (armed.scheduled) {
                 armed.next_due = initial_due(armed.spec, armed.cadence_ms, now);
+            } else if (is_event_driven(armed.spec.type)) {
+                auto mit = mechanisms_.find(armed.spec.type);
+                if (mit != mechanisms_.end())
+                    replays.push_back({mit->second.get(), key, armed.spec.params});
+            }
         }
+        for (auto& [type, m] : mechanisms_)
+            mechs.push_back(m.get());
         armed_count = armed_.size();
         wheel_thread_ = std::thread([this] { wheel_loop(); });
+    }
+    // Start mechanisms (wire the emit callback), THEN replay pre-start watches —
+    // both with mu_ released (handle setup blocks). Mechanisms are started
+    // before any watch() reaches them.
+    for (auto* m : mechs)
+        m->start([this](const std::string& key, SparkData data) {
+            emit_event(key, std::move(data));
+        });
+    for (auto& r : replays) {
+        auto w = r.mech->watch(r.key, r.params);
+        if (!w)
+            // Pre-start replay failure leaves the spark armed-without-watcher
+            // (logged, unlike the post-start arm which rolls back) — a valid
+            // path/key rarely fails here; surfaced for the resource gate.
+            spdlog::error("SparkEngine: mechanism failed to arm pre-start watch '{}': {}", r.key,
+                          w.error());
     }
     spdlog::info("SparkEngine started ({} spark(s) armed)", armed_count);
 }
@@ -308,7 +436,15 @@ void SparkEngine::stop() {
     if (wheel_thread_.joinable())
         wheel_thread_.join();
 
-    // 2) Stop consumer dispatch threads (prompt; leftovers dropped + counted).
+    // 2) Stop event-driven mechanisms (producers, like the wheel) BEFORE the
+    // consumer threads they feed — a mechanism must quiesce before its
+    // downstream consumers. mechanisms_ is structurally stable post-start (no
+    // concurrent registration), so iterating without mu_ is safe; stop() is
+    // idempotent and a no-op if start() never ran.
+    for (auto& [type, m] : mechanisms_)
+        m->stop();
+
+    // 3) Stop consumer dispatch threads (prompt; leftovers dropped + counted).
     std::map<ConsumerId, std::shared_ptr<Consumer>> consumers;
     {
         std::lock_guard lk(consumers_mu_);
@@ -432,6 +568,27 @@ void SparkEngine::wheel_loop() {
 
 // ── Delivery ──────────────────────────────────────────────────────────────────
 
+void SparkEngine::emit_event(const std::string& key, SparkData data) {
+    SparkEvent event;
+    std::vector<Subscriber> subs;
+    {
+        std::lock_guard lk(mu_);
+        auto it = armed_.find(key);
+        if (it == armed_.end())
+            return; // disarmed between the mechanism's fire and here — TRAP 2 safe
+        Armed& armed = it->second;
+        event.key = key;
+        event.type = armed.spec.type;
+        event.seq = ++armed.seq;
+        event.at = std::chrono::system_clock::now();
+        event.data = std::move(data);
+        subs = armed.subs; // fan-out snapshot (event-driven: all subs, no startup logic)
+    }
+    // mu_ released before delivery — an inline consumer that re-arms takes mu_.
+    events_total_.fetch_add(1, std::memory_order_relaxed);
+    deliver(event, subs);
+}
+
 void SparkEngine::deliver(const SparkEvent& ev, const std::vector<Subscriber>& subs) {
     for (const auto& sub : subs) {
         if (sub.tier == SparkTier::Inline) {
@@ -501,7 +658,10 @@ SparkEngineStats SparkEngine::stats() const {
         std::lock_guard lk(mu_);
         s.armed_sparks = armed_.size();
         s.subscriptions = sub_keys_.size();
-        s.watcher_threads = running_ ? 1 : 0; // the wheel; mechanisms add theirs in PR 1b/1c
+        // Watcher units while running: the wheel + one per registered event-driven
+        // mechanism (a mechanism may itself run a small pool — this is a unit
+        // count, not an OS-thread count).
+        s.watcher_threads = running_ ? (1 + mechanisms_.size()) : 0;
     }
     {
         std::lock_guard lk(consumers_mu_);

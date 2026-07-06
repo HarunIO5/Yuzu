@@ -140,6 +140,7 @@ agent_test_exe = executable(
     'unit/test_resilience_strategy.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
+    'unit/test_spark_mechanism.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
     'unit/test_agent_csr.cpp',

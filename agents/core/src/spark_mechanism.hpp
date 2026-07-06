@@ -1,0 +1,97 @@
+#pragma once
+
+/**
+ * spark_mechanism.hpp — the injectable watch-mechanism seam for event-driven
+ * spark types (ADR-0021 Stage 1 PR 1b).
+ *
+ * Interval / Startup / Disk are timer-driven and serviced by the SparkEngine's
+ * wheel (spark_engine.cpp). File / Registry / Service are EVENT-driven: they do
+ * not sit on the wheel — a kernel notification, not a deadline, is the trigger.
+ * Each such type is serviced by one `ISparkMechanism` that multiplexes EVERY
+ * armed spark of its type onto O(mechanism) OS resources — one IOCP + thread
+ * for file changes, one TP_WAIT pool for registry changes — never O(rules).
+ *
+ * The seam is what keeps this PR testable off Windows: the real IOCP / TP_WAIT
+ * impls are Windows-only (spark_file.cpp / spark_registry.cpp), but a test
+ * fake wired via SparkEngine::register_mechanism() exercises the whole
+ * arm / dedup / fan-out / disarm-teardown path on any platform (the
+ * DiskReaderFn seam precedent, generalised to a stateful, thread-owning
+ * mechanism — the tar ProcStreamCollector shape).
+ *
+ * Platform contract (why arm() rejects rather than succeeds-inert off Windows):
+ * `make_file_mechanism()` / `make_registry_mechanism()` return a real
+ * mechanism on Windows and `nullptr` elsewhere. A SparkEngine with no
+ * mechanism for a type REJECTS arm() of that type — preserving the spark.hpp
+ * invariant "Armed means the engine is running a watcher for the spec" (a
+ * succeed-but-inert arm would be armed with no watcher). This mirrors the
+ * guard_file / guard_registry precedent (no-op off-Windows → never reads as
+ * armed). The "Linux agent receives a cross-platform Baseline containing a file
+ * guard" UX is Guardian's concern (Stage 2), not the detection primitive's.
+ */
+
+#include <yuzu/agent/spark.hpp>
+
+#include <expected>
+#include <functional>
+#include <memory>
+#include <string>
+
+namespace yuzu::agent {
+
+/// The engine's fire callback, handed to a mechanism at start(). The mechanism
+/// calls it — from its OWN thread — when the watched condition for `key` fires.
+/// `data` is std::monostate for file/registry (the event itself is the fact;
+/// the consumer re-reads whatever state it asserts over). The engine's
+/// implementation (SparkEngine::emit_event) looks the key up under its lock,
+/// snapshots subscribers, releases the lock, then delivers — so a mechanism may
+/// call emit() freely without risking the engine's lock (an inline consumer
+/// that re-arms takes that lock).
+using SparkEmitFn = std::function<void(const std::string& key, SparkData data)>;
+
+/// One watch mechanism for one event-driven SparkType. Lifecycle mirrors the
+/// engine: register (pre-start) → start(emit) → watch/unwatch as sparks
+/// arm/disarm while running → stop(). The engine calls start / watch / unwatch
+/// / stop with NO engine lock held — a mechanism method may block on OS handle
+/// setup without stalling every other arm/disarm/emit.
+class ISparkMechanism {
+public:
+    virtual ~ISparkMechanism() = default;
+
+    ISparkMechanism() = default;
+    ISparkMechanism(const ISparkMechanism&) = delete;
+    ISparkMechanism& operator=(const ISparkMechanism&) = delete;
+
+    /// Begin the mechanism thread(s). `emit` is retained for the mechanism's
+    /// lifetime. Called exactly once by SparkEngine::start(), BEFORE the engine
+    /// replays any watch() for a spark armed before start.
+    virtual void start(SparkEmitFn emit) = 0;
+
+    /// Begin watching one armed spark. `params` is the variant alternative
+    /// matching this mechanism's type (the engine guarantees the match).
+    /// Called only while the mechanism is started. Distinct armed specs carry
+    /// distinct keys; a mechanism MAY coalesce them onto shared OS resources
+    /// (e.g. one ReadDirectoryChangesW per parent directory) and route a raw
+    /// notification back to the matching key(s). Returns an error string on
+    /// unrecoverable setup failure (the engine rolls the arm back).
+    [[nodiscard]] virtual std::expected<void, std::string>
+    watch(const std::string& key, const SparkParams& params) = 0;
+
+    /// Stop watching one spark (its last subscription went). Idempotent; an
+    /// unknown key is ignored.
+    virtual void unwatch(const std::string& key) = 0;
+
+    /// Join the mechanism thread(s). Idempotent. Called by SparkEngine::stop()
+    /// BEFORE consumer dispatch threads — a mechanism is a producer, like the
+    /// wheel, so it must quiesce before its downstream consumers.
+    virtual void stop() = 0;
+};
+
+/// Platform factory: a real IOCP + ReadDirectoryChangesW file-change mechanism
+/// on Windows, `nullptr` on every other platform.
+[[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism> make_file_mechanism();
+
+/// Platform factory: a real TP_WAIT + RegNotifyChangeKeyValue registry-change
+/// mechanism on Windows, `nullptr` on every other platform.
+[[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism> make_registry_mechanism();
+
+} // namespace yuzu::agent
