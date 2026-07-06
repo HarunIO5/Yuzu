@@ -1693,6 +1693,12 @@ TEST_CASE("assess/match query plans seek on the right index (two-index schema)",
         INFO("plan (b): " << p);
         REQUIRE(p.find("idx_cve_match_vendor_product") != std::string::npos);
         REQUIRE(p.find("SCAN") == std::string::npos);
+        // Assert the PRODUCT column is used as a range bound, not just the vendor
+        // equality: dropping COLLATE NOCASE from the composite's product column
+        // degrades the plan to `(cpe_vendor=?)` only — which STILL names the index and
+        // has no SCAN, so the two checks above pass on that regression. `cpe_product>`
+        // is present only when the LIKE-prefix range seek actually engages (FIX 4).
+        REQUIRE(p.find("cpe_product>") != std::string::npos);
     }
     // (c) vendor-less prefix → the single-column index (no regression from v4).
     {
@@ -1701,6 +1707,9 @@ TEST_CASE("assess/match query plans seek on the right index (two-index schema)",
         INFO("plan (c): " << p);
         REQUIRE(p.find("idx_cve_match_product") != std::string::npos);
         REQUIRE(p.find("SCAN") == std::string::npos);
+        // Same collation-regression guard as (b): the product range bound must engage,
+        // not a bare index name with no seek (FIX 4).
+        REQUIRE(p.find("cpe_product>") != std::string::npos);
     }
     // (d) match_inventory's exact query shape still seeks.
     {
@@ -1792,6 +1801,12 @@ TEST_CASE("assess(adversarial): cpe_vendor stored non-lowercase is invisible to 
 
     // The caller queries with a normal lowercase vendor, exactly as every real
     // caller (server-side CPE-identity resolution) would.
+    //
+    // REGRESSION GUARD for an ACCEPTED limitation, not a bug to 'fix' by editing this
+    // test: cpe_vendor is BINARY-collated (the composite index seek depends on it);
+    // producers MUST lowercase vendor at ingest (nvd_client.cpp does). If a future
+    // producer regresses, fix it at ingest, NOT by relaxing this assertion. See
+    // ADR-0023 / the assess() vendor-filter comment.
     auto r = db.assess({"acme", "widget", "1.0", true});
     // FINDING: this currently comes back product_known=false — a false "unknown"
     // verdict — because `m.cpe_vendor = ?` has no COLLATE NOCASE (unlike
@@ -1941,6 +1956,15 @@ TEST_CASE("upsert_cves(adversarial): changed_ids excludes a per-CVE savepoint ro
     std::vector<std::string> changed;
     const bool ok = db.upsert_cves(batch, &changed);
 
+    // FIX 3, RETAINED side: a per-CVE SAVEPOINT rollback fails one record while the
+    // surrounding batch STILL commits the rest — so bool is false yet changed_ids is
+    // non-empty with the ids that genuinely committed (CVE-GOOD). This is the ONLY
+    // non-empty-on-false case FIX 3 leaves standing. The complementary CLEARED side
+    // (an outer COMMIT failure wipes changed_ids, since nothing committed) is covered
+    // by inspection: it is the `if (changed_ids) changed_ids->clear();` guard on the
+    // txn.commit()!=SQLITE_OK branch in upsert_cves_impl. Forcing a WAL COMMIT to fail
+    // deterministically needs an I/O-fault VFS shim (a COMMIT can't fail from external
+    // contention in WAL), so it is not exercised at runtime here.
     REQUIRE_FALSE(ok); // the batch was NOT fully persisted
     REQUIRE(changed.size() == 1);
     REQUIRE(changed[0] == "CVE-GOOD"); // the rolled-back CVE must never appear here
@@ -1951,4 +1975,35 @@ TEST_CASE("upsert_cves(adversarial): changed_ids excludes a per-CVE savepoint ro
     // CVE-POISON's header+matches must have rolled back together (UP-1 atomicity) —
     // it must not appear as a known identity at all.
     REQUIRE_FALSE(db.assess({"acme", "poison", "1.0", true}).product_known);
+}
+
+TEST_CASE("assess/products_for_cves: a DB fault THROWS, never a false absent/empty verdict "
+          "(FIX 1)",
+          "[nvd][adversarial]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"nvd-fault-throw-"}};
+    const std::string path = tmp.path.string();
+
+    NvdDatabase db(path);
+    db.upsert_cve(make_cve_v("CVE-REAL", "acme", "widget", "9.9", true));
+    REQUIRE(db.assess({"acme", "widget", "1.0", true}).product_known);   // healthy first
+    REQUIRE(db.products_for_cves({"CVE-REAL"}).size() == 1);
+
+    // Drop cve_match out from under the store via a second connection so the next
+    // prepare fails with "no such table: cve_match" (same technique the atomic-rollback
+    // test uses). Before FIX 1 both functions swallowed the prepare error and returned
+    // an empty result — indistinguishable from a genuine no-rows/absent identity, i.e. a
+    // fabricated product_known=false / an empty CVE→product inversion. FIX 1 makes them
+    // THROW so the caller can distinguish a DB fault and abort, never record clean.
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(path.c_str(), &raw) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(raw, "DROP TABLE cve_match;", nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    // Prepare-failure throw path (forced deterministically above). The step-error path
+    // (a mid-scan SQLITE_BUSY/IOERR/CORRUPT → rc != SQLITE_DONE → throw) shares the same
+    // throw site and is covered by inspection — it cannot be forced without a VFS shim.
+    REQUIRE_THROWS_AS(db.assess({"acme", "widget", "1.0", true}), std::runtime_error);
+    REQUIRE_THROWS_AS(db.products_for_cves({"CVE-REAL"}), std::runtime_error);
 }

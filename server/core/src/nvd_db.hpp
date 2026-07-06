@@ -101,13 +101,15 @@ public:
     // NOT drive the feed trigger (it has its own trigger, ADR-0023 Decision 6d). When
     // non-null it is filled with the deduped set of cve_ids successfully persisted this
     // batch (in-loop from the per-CVE success bool — never sqlite3_changes(), #1033).
-    // CAUTION for a future feed-trigger consumer (ADR-0023 Decision 6d): changed_ids
-    // may be NON-EMPTY even when this returns false. A per-CVE SAVEPOINT rollback fails
-    // one record while the surrounding batch still commits the rest — the ids already in
-    // changed_ids DID commit. So a consumer must decide its own policy for the false
-    // case (e.g. still emit the committed delta, or discard and re-derive next pass);
-    // it must NOT assume false ⇒ changed_ids is meaningless. do_freshness discards on
-    // false today, so this is latent, not a live bug.
+    // CAUTION for a future feed-trigger consumer (ADR-0023 Decision 6d): changed_ids is
+    // cleared on an outer-commit failure; it may still be non-empty when the bool is
+    // false ONLY in the per-record SAVEPOINT-rollback-within-a-committed-batch case
+    // (those ids DID commit). A per-CVE SAVEPOINT rollback fails one record while the
+    // surrounding batch still commits the rest — the ids already in changed_ids DID
+    // commit. So a consumer must decide its own policy for that false case (e.g. still
+    // emit the committed delta, or discard and re-derive next pass); it must NOT assume
+    // false ⇒ changed_ids is meaningless. do_freshness discards on false today, so this
+    // is latent, not a live bug.
     [[nodiscard]] bool upsert_cves(const std::vector<CveRecord>& records,
                                    std::vector<std::string>* changed_ids = nullptr);
     std::vector<CveMatch> match_inventory(const std::vector<SoftwareItem>& inventory) const;
@@ -116,6 +118,12 @@ public:
     // See CpeQuery/AssessResult. The is_vulnerable=1 filter is load-bearing: a plain
     // "any row" would count is_vulnerable=0 platform operands and fabricate an
     // assessed-clean verdict for a product that is only ever a running-on node.
+    //
+    // Throws std::runtime_error on a SQLite prepare/step error so the caller can
+    // distinguish a DB fault from a genuine no-rows/absent result — a caller MUST NOT
+    // treat a DB fault as assessed-clean/not-assessed. (The future PR-4 correlation
+    // engine wraps each agent's assess() calls in try/catch and ABORTS that agent on a
+    // throw, never recording a clean verdict for a DB fault.)
     AssessResult assess(const CpeQuery& q) const;
 
     // The DISTINCT (vendor, product) identities carried by is_vulnerable=1 match rows

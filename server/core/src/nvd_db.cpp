@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cstddef>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -601,6 +602,13 @@ bool NvdDatabase::upsert_cves_impl(const std::vector<CveRecord>& records,
 
     if (txn.commit() != SQLITE_OK) {
         spdlog::error("NvdDatabase: COMMIT failed");
+        // The whole batch rolled back — none of the per-record successes actually
+        // committed, so changed_ids (populated in the loop above) would otherwise be
+        // returned non-empty with ids that did NOT commit. Clear it so the only
+        // non-empty-on-false case left is the genuine per-SAVEPOINT partial-rollback
+        // one, whose ids DID commit (FIX 3).
+        if (changed_ids)
+            changed_ids->clear();
         return false; // commit failed → txn stays armed, its dtor rolls back
     }
     // Return false if the batch was not FULLY persisted — BEGIN/COMMIT failed (handled
@@ -766,17 +774,24 @@ AssessResult NvdDatabase::assess(const CpeQuery& q) const {
     if (!vend.empty())
         sql += " AND m.cpe_vendor = ?";
 
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("NvdDatabase: assess prepare failed: {}", sqlite3_errmsg(db_));
-        return out;
+    // RAII-owned statement: a throw below (FIX 1) or a bad_alloc between prepare and the
+    // step loop must finalize it on unwind, never leak it (FIX 2, sqlite_raii.hpp).
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, stmt.addr(), nullptr) != SQLITE_OK) {
+        // THROW, never return {} on a DB fault: an empty AssessResult is
+        // indistinguishable from a genuine no-rows/absent identity, so a swallowed
+        // prepare error would fabricate a false product_known=false (the exact
+        // ADR-0019 lie the is_vulnerable=1 filter guards). The caller distinguishes a
+        // DB fault from assessed-clean by catching this.
+        throw std::runtime_error(std::string("NvdDatabase: assess prepare failed: ") +
+                                 sqlite3_errmsg(db_));
     }
 
     const std::string product_bind = q.exact_product ? prod : (like_escape(prod) + "%");
     int bind_idx = 1;
-    sqlite3_bind_text(stmt, bind_idx++, product_bind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), bind_idx++, product_bind.c_str(), -1, SQLITE_TRANSIENT);
     if (!vend.empty())
-        sqlite3_bind_text(stmt, bind_idx++, vend.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), bind_idx++, vend.c_str(), -1, SQLITE_TRANSIENT);
 
     auto col = [](sqlite3_stmt* s, int i) -> std::string {
         const char* t = reinterpret_cast<const char*>(sqlite3_column_text(s, i));
@@ -785,7 +800,8 @@ AssessResult NvdDatabase::assess(const CpeQuery& q) const {
 
     std::unordered_map<std::string, std::size_t> idx; // cve_id -> position in out.hits
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int rc;
+    while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
         // Every stepped row is is_vulnerable=1 for this identity → the product is known.
         out.product_known = true;
 
@@ -794,12 +810,12 @@ AssessResult NvdDatabase::assess(const CpeQuery& q) const {
         if (q.version.empty())
             continue;
 
-        const std::string cve_id = col(stmt, 0);
-        const std::string cpe_version = col(stmt, 1);
-        const std::string vsi = col(stmt, 2);
-        const std::string vse = col(stmt, 3);
-        const std::string vei = col(stmt, 4);
-        const std::string vee = col(stmt, 5);
+        const std::string cve_id = col(stmt.get(), 0);
+        const std::string cpe_version = col(stmt.get(), 1);
+        const std::string vsi = col(stmt.get(), 2);
+        const std::string vse = col(stmt.get(), 3);
+        const std::string vei = col(stmt.get(), 4);
+        const std::string vee = col(stmt.get(), 5);
 
         VersionRange range{cpe_version, vsi, vse, vei, vee};
         if (!nvd_version_in_range(q.version, range))
@@ -808,7 +824,8 @@ AssessResult NvdDatabase::assess(const CpeQuery& q) const {
         auto it = idx.find(cve_id);
         if (it == idx.end()) {
             idx.emplace(cve_id, out.hits.size());
-            out.hits.push_back(CveHit{cve_id, col(stmt, 6), col(stmt, 7), col(stmt, 8),
+            out.hits.push_back(CveHit{cve_id, col(stmt.get(), 6), col(stmt.get(), 7),
+                                      col(stmt.get(), 8),
                                       /*fixed_in=*/vee});
         } else if (!vee.empty()) {
             // Reconcile fixed_in across multiple in-range vulnerable rows for the same
@@ -824,8 +841,14 @@ AssessResult NvdDatabase::assess(const CpeQuery& q) const {
                 cur = vee;
         }
     }
+    // A loop exit on anything but SQLITE_DONE (SQLITE_BUSY/LOCKED/IOERR/CORRUPT) means the
+    // scan aborted mid-flight: `out` is a partial/empty result that MUST NOT be read as
+    // assessed-clean/not-assessed. Throw so the caller aborts this identity (FIX 1).
+    if (rc != SQLITE_DONE) {
+        throw std::runtime_error(std::string("NvdDatabase: assess step failed: ") +
+                                 sqlite3_errmsg(db_));
+    }
 
-    sqlite3_finalize(stmt);
     return out;
 }
 
@@ -855,25 +878,34 @@ NvdDatabase::products_for_cves(const std::vector<std::string>& cve_ids) const {
             sql += (i == 0) ? "?" : ",?";
         sql += ")";
 
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-            spdlog::error("NvdDatabase: products_for_cves prepare failed: {}", sqlite3_errmsg(db_));
-            return result;
+        // RAII per-chunk statement, finalized before the next chunk's SqliteStmt (FIX 2).
+        SqliteStmt stmt;
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, stmt.addr(), nullptr) != SQLITE_OK) {
+            // THROW on ANY chunk's prepare failure — never a silent partial list. An empty
+            // or truncated result would be read as "these CVEs affect no products", a false
+            // inversion the caller cannot distinguish from a DB fault (FIX 1).
+            throw std::runtime_error(std::string("NvdDatabase: products_for_cves prepare failed: ") +
+                                     sqlite3_errmsg(db_));
         }
         for (std::size_t i = 0; i < n; ++i)
-            sqlite3_bind_text(stmt, static_cast<int>(i + 1), cve_ids[base + i].c_str(), -1,
+            sqlite3_bind_text(stmt.get(), static_cast<int>(i + 1), cve_ids[base + i].c_str(), -1,
                               SQLITE_TRANSIENT);
 
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            std::string vendor = col(stmt, 0);
-            std::string product = col(stmt, 1);
+        int rc;
+        while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
+            std::string vendor = col(stmt.get(), 0);
+            std::string product = col(stmt.get(), 1);
             std::string key = vendor;
             key.push_back('\x1f');
             key += product;
             if (seen.insert(std::move(key)).second)
                 result.emplace_back(std::move(vendor), std::move(product));
         }
-        sqlite3_finalize(stmt);
+        // A mid-chunk abort (not SQLITE_DONE) would truncate the inversion silently (FIX 1).
+        if (rc != SQLITE_DONE) {
+            throw std::runtime_error(std::string("NvdDatabase: products_for_cves step failed: ") +
+                                     sqlite3_errmsg(db_));
+        }
     }
     return result;
 }
