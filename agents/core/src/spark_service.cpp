@@ -794,6 +794,16 @@ struct PendingFault {
 /// `pContext` points back at this struct so the APC callback can identify
 /// which service fired among N multiplexed on the one thread.
 struct SvcWatch {
+    // RAII for pszServiceNames: teardown_watch()/the reap loop free it on
+    // their own paths, but WAIT_FAILED and the run()-exit catch blocks tear
+    // svcs_/retiring_ down without ever reaping a still-fired entry first —
+    // this destructor makes every teardown path safe uniformly, rather than
+    // relying on the reap loop alone (governance re-review LOW finding).
+    ~SvcWatch() {
+        if (notify.pszServiceNames)
+            LocalFree(notify.pszServiceNames);
+    }
+
     std::wstring name; ///< folded (case-insensitive); map key in svcs_
     std::set<std::string> keys;
     yuzu::win::ScHandle svc; ///< SERVICE_QUERY_STATUS
