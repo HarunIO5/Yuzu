@@ -727,6 +727,14 @@ public:
         // "Sign out everywhere" which also revokes API tokens).
         metrics_.describe("yuzu_auth_sessions_revoked_total",
                           "Total session revocations, by caller, result, and scope", "counter");
+        // Durable SSO identity provisioning observability (#1852 governance
+        // round, sec-LOW/UP-5). Incremented on every successful
+        // upsert_sso_identity call (first-provision AND re-login refresh),
+        // labelled by source so an IdP-side provisioning flood is visible
+        // independently of ordinary login volume.
+        metrics_.describe("yuzu_auth_sso_provision_total",
+                          "Total durable SSO identity provision/refresh upserts, by source",
+                          "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -5603,8 +5611,17 @@ private:
             auto session = require_auth(req, res);
             if (!session)
                 return;
+            // #1837: `username` is the STABLE authorization principal (an
+            // opaque `oidc:<iss>#<sub>` id for SSO sessions) — never render
+            // it alone as the nav-bar identity. `display_name` is the
+            // human-readable label consumed by every page's nav/context
+            // bar JS below; falls back to `username` for a legacy session
+            // created before this field existed.
             auto j = nlohmann::json(
-                {{"username", session->username}, {"role", auth::role_to_string(session->role)}});
+                {{"username", session->username},
+                {"display_name",
+                 session->display_name.empty() ? session->username : session->display_name},
+                {"role", auth::role_to_string(session->role)}});
             // Add RBAC role if enabled
             if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
                 j["rbac_enabled"] = true;
