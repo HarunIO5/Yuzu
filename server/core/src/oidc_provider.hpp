@@ -8,9 +8,18 @@
 #include <unordered_map>
 #include <vector>
 
-#ifndef _WIN32
+// OpenSSL is an unconditional server dependency on every platform (vcpkg.json;
+// server/core/meson.build hard-errors without it). JWT/JWKS RSA verification
+// therefore uses the same OpenSSL EVP path everywhere — see verify_jwt_signature
+// (#1856/#1782: the old Windows build stubbed verification out and returned
+// success without checking the signature, accepting forged tokens).
+//
+// <openssl/evp.h> alone is safe to expose from this header: it declares none of
+// the wincrypt.h-shadowed symbols (X509_NAME, OCSP_*, PKCS7_*), so a Windows
+// consumer that includes <windows.h> before this header does not hit the macro
+// clash. If a future edit adds <openssl/x509.h> (etc.) here, that guarantee
+// breaks — such includers would then need OpenSSL-before-windows.h ordering.
 #include <openssl/evp.h>
-#endif
 
 namespace yuzu::server::oidc {
 
@@ -88,9 +97,7 @@ struct IdTokenClaims {
 struct CachedJwk {
     std::string kid;
     std::string alg;
-#ifndef _WIN32
     std::shared_ptr<EVP_PKEY> pkey; // shared_ptr with custom deleter for RAII
-#endif
 };
 
 class OidcProvider {
@@ -117,6 +124,15 @@ public:
     static std::string generate_code_verifier();
     static std::string compute_code_challenge(const std::string& verifier);
     static std::expected<IdTokenClaims, std::string> parse_id_token(const std::string& jwt);
+
+    /// Test-only seam (#1856): inject an RSA verifying key into the JWKS cache
+    /// directly, bypassing the network fetch, so verify_jwt_signature can be
+    /// exercised end-to-end (jwk_to_pkey + EVP_DigestVerify) without a live IdP.
+    /// `n_b64url`/`e_b64url` are the base64url RSA modulus/exponent (JWK form).
+    /// Returns false if the key material does not parse. NOT for production use —
+    /// this mutates the trusted signing-key cache and has no production callers.
+    bool add_test_jwks_key(const std::string& kid, const std::string& n_b64url,
+                           const std::string& e_b64url);
 
     std::expected<void, std::string> validate_claims(const IdTokenClaims& claims,
                                                      const std::string& expected_nonce) const;
