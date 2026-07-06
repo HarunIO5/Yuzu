@@ -91,14 +91,14 @@ public:
     }
 
     // ── test drivers ──
-    void fire(const std::string& key) {
+    void fire(const std::string& key, SparkData data = SparkData{std::monostate{}}) {
         SparkEmitFn e;
         {
             std::lock_guard lk(mu_);
             e = emit_;
         }
         if (e)
-            e(key, SparkData{std::monostate{}});
+            e(key, std::move(data));
     }
     // Drive the fault/health channel as a real mechanism would (lock released).
     void fire_fault(const std::string& key, bool faulted, std::string_view reason) {
@@ -154,6 +154,9 @@ SparkSpec file_spec(const std::string& path) {
 SparkSpec registry_spec(const std::string& hive, const std::string& key) {
     return SparkSpec{SparkType::Registry, RegistrySparkParams{hive, key}};
 }
+SparkSpec service_spec(const std::string& name) {
+    return SparkSpec{SparkType::Service, ServiceSparkParams{name}};
+}
 
 /// Register a fake for `type` and return the borrowed pointer (engine owns it).
 FakeMechanism* wire_fake(SparkEngine& engine, SparkType type) {
@@ -195,6 +198,16 @@ TEST_CASE("arm(File) with no mechanism is rejected (armed == a watcher runs)", "
     CHECK(engine.stats().armed_sparks == 0);
 }
 
+TEST_CASE("arm(Service) with no mechanism is rejected (armed == a watcher runs)",
+          "[spark][mechanism]") {
+    SparkEngine engine;
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    auto sub = engine.arm(*c, service_spec("sshd"));
+    CHECK_FALSE(sub.has_value()); // no Service mechanism registered → reject, never inert-arm
+    CHECK(engine.stats().armed_sparks == 0);
+}
+
 TEST_CASE("arm(File) validation: empty path rejected", "[spark][mechanism]") {
     SparkEngine engine;
     wire_fake(engine, SparkType::File);
@@ -211,6 +224,20 @@ TEST_CASE("arm(Registry) validation: hive must be HKLM/HKCU/HKCR/HKU", "[spark][
     CHECK_FALSE(engine.arm(*c, registry_spec("BOGUS", "Software\\Yuzu")).has_value());
     CHECK_FALSE(engine.arm(*c, registry_spec("HKLM", "")).has_value());
     CHECK(engine.arm(*c, registry_spec("HKLM", "Software\\Yuzu")).has_value());
+}
+
+TEST_CASE("arm(Service) validation: name charset and length", "[spark][mechanism]") {
+    SparkEngine engine;
+    wire_fake(engine, SparkType::Service);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    CHECK_FALSE(engine.arm(*c, service_spec("")).has_value());
+    CHECK_FALSE(engine.arm(*c, service_spec(std::string(257, 'a'))).has_value());
+    CHECK_FALSE(engine.arm(*c, service_spec("foo bar")).has_value());  // space not allowed
+    CHECK_FALSE(engine.arm(*c, service_spec("foo;x")).has_value());    // shell metachar not allowed
+    CHECK(engine.arm(*c, service_spec("sshd")).has_value());
+    CHECK(engine.arm(*c, service_spec("ssh.service")).has_value());
+    CHECK(engine.arm(*c, service_spec("getty@tty1.service")).has_value());
 }
 
 TEST_CASE("File spark: arm-after-start watches, fire delivers to the consumer",
@@ -382,6 +409,37 @@ TEST_CASE("Mechanism fault channel: fault flags health on the transition, recove
     engine.stop();
 }
 
+TEST_CASE("Service spark: fire carries ServiceSparkData through the queued tier",
+          "[spark][mechanism]") {
+    // Unlike File/Registry (monostate — consumer re-reads), Service carries the
+    // resolved terminal state. Prove it survives the engine's snapshot/fan-out
+    // copy (emit_event copies SparkData by value into each subscriber's queue).
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = service_spec("sshd");
+    const std::string key = spark_key(spec);
+    REQUIRE(engine.arm(*c, spec).has_value());
+
+    fake->fire(key, SparkData{ServiceSparkData{ServiceRunState::Running}});
+    REQUIRE(eventually([&] { return got.count() >= 1; }));
+    const SparkEvent ev = got.at(0);
+    CHECK(ev.key == key);
+    CHECK(ev.type == SparkType::Service);
+    REQUIRE(std::holds_alternative<ServiceSparkData>(ev.data));
+    CHECK(std::get<ServiceSparkData>(ev.data).state == ServiceRunState::Running);
+
+    fake->fire(key, SparkData{ServiceSparkData{ServiceRunState::Paused}});
+    REQUIRE(eventually([&] { return got.count() >= 2; }));
+    REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(1).data));
+    CHECK(std::get<ServiceSparkData>(got.at(1).data).state == ServiceRunState::Paused);
+    engine.stop();
+}
+
 TEST_CASE("Mechanism emit path does not deadlock an inline re-arm (TRAP 2)", "[spark][mechanism]") {
     // An inline consumer that re-arms from inside its handler must not deadlock:
     // emit_event snapshots + releases mu_ before delivering, and arm takes mu_.
@@ -407,15 +465,227 @@ TEST_CASE("Mechanism emit path does not deadlock an inline re-arm (TRAP 2)", "[s
     engine.stop();
 }
 
+TEST_CASE("Service spark emit path does not deadlock an inline re-arm (TRAP 2 twin)",
+          "[spark][mechanism]") {
+    SparkEngine engine;
+    engine.set_cadence_floor_for_test(10);
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    std::atomic<bool> rearmed{false};
+    const auto spec = service_spec("sshd");
+    const std::string key = spark_key(spec);
+
+    auto inline_sub = engine.arm_inline(spec, [&](const SparkEvent&) {
+        auto c = engine.register_consumer("late-svc", [](const SparkEvent&) {});
+        if (c)
+            rearmed.store(engine.arm(*c, SparkSpec{SparkType::Interval, IntervalSparkParams{50}})
+                              .has_value());
+    });
+    REQUIRE(inline_sub.has_value());
+    engine.start();
+
+    fake->fire(key, SparkData{ServiceSparkData{ServiceRunState::Stopped}});
+    CHECK(eventually([&] { return rearmed.load(); }));
+    engine.stop();
+}
+
 TEST_CASE("platform factories honor the mechanism-or-null contract", "[spark][mechanism]") {
 #ifdef _WIN32
     CHECK(make_file_mechanism() != nullptr);
     CHECK(make_registry_mechanism() != nullptr);
+    CHECK(make_service_mechanism() != nullptr);
 #else
     CHECK(make_file_mechanism() == nullptr);     // off Windows → no mechanism → arm() rejects
     CHECK(make_registry_mechanism() == nullptr);
+#if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)
+    CHECK(make_service_mechanism() != nullptr);  // Linux + libsystemd → real sd-bus mechanism
+#else
+    CHECK(make_service_mechanism() == nullptr);  // macOS, or Linux built without libsystemd
+#endif
 #endif
 }
+
+// ── Linux-only smoke: drive the REAL sd-bus mechanism against absent units and
+//    (env-gated) a live unit transition. The cross-platform cases above prove
+//    the engine plumbing via the fake; these prove the actual Linux body fires
+//    and that its resource contract (1 bus connection + 1 eventfd + 1 thread,
+//    for any N) actually holds — thread count alone would hide a per-unit-
+//    connection regression (stage0-resource-baseline.md).
+//
+//    NOTE on bus-collapse/reconnect: killing the system bus in a test would
+//    kill the host session, so there is deliberately no live test for that
+//    path here. The fault-channel plumbing itself is proven by the
+//    cross-platform FakeMechanism-driven cases above (B1); the reopen logic is
+//    a line-level port of guard_systemd.cpp's soak-tested reconnect, and the
+//    churn case below (arm N, disarm all) proves no fd/slot leak across
+//    repeated arm/disarm, which is the only property a unit test here can
+//    directly observe.
+#if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)
+
+#include <unistd.h> // getpid
+
+#include <cstdlib>     // getenv
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+namespace {
+std::size_t linux_fd_count() {
+    std::error_code ec;
+    std::size_t n = 0;
+    for (const auto& e : std::filesystem::directory_iterator("/proc/self/fd", ec))
+        (void)e, ++n;
+    return n;
+}
+std::size_t linux_thread_count() {
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("Threads:", 0) == 0) {
+            std::istringstream iss(line.substr(8));
+            std::size_t n = 0;
+            iss >> n;
+            return n;
+        }
+    }
+    return 0;
+}
+} // namespace
+
+TEST_CASE("Service spark (real mechanism): an absent unit gets an initial Stopped emit",
+          "[spark][mechanism][linux]") {
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const std::string name = "yuzu-nosuch-" + std::to_string(::getpid()) + ".service";
+    auto sub = engine.arm(*c, service_spec(name));
+    if (!sub.has_value()) {
+        engine.stop();
+        SUCCEED("service mechanism reports inert (no system bus on this host) — skipping");
+        return;
+    }
+    REQUIRE(eventually([&] { return got.count() >= 1; }));
+    REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(0).data));
+    CHECK(std::get<ServiceSparkData>(got.at(0).data).state == ServiceRunState::Stopped);
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Service spark (real mechanism): a real active unit resolves to Running",
+          "[spark][mechanism][linux]") {
+    // systemd-journald.service is present and active on virtually any systemd
+    // host, needs no privilege to READ (only start/stop needs polkit auth), so
+    // this exercises the Resolved+Active real-bus path without any live-env
+    // gate — the twin of the Windows "Winmgmt" always-running smoke case.
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto sub = engine.arm(*c, service_spec("systemd-journald.service"));
+    if (!sub.has_value()) {
+        engine.stop();
+        SUCCEED("service mechanism reports inert (no system bus on this host) — skipping");
+        return;
+    }
+    REQUIRE(eventually([&] { return got.count() >= 1; }));
+    REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(0).data));
+    CHECK(std::get<ServiceSparkData>(got.at(0).data).state == ServiceRunState::Running);
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Service spark (real mechanism): fd/thread collapse holds across N absent watches",
+          "[spark][mechanism][linux][resource]") {
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const std::string pid = std::to_string(::getpid());
+    auto first = engine.arm(*c, service_spec("yuzu-fdproof-0-" + pid + ".service"));
+    if (!first.has_value()) {
+        engine.stop();
+        SUCCEED("service mechanism reports inert (no system bus on this host) — skipping");
+        return;
+    }
+    REQUIRE(eventually([&] { return got.count() >= 1; }));
+    const auto fd_base = linux_fd_count();
+    const auto thread_base = linux_thread_count();
+
+    std::vector<SparkEngine::SubscriptionId> subs;
+    for (int i = 1; i < 20; ++i) {
+        auto s = engine.arm(*c, service_spec("yuzu-fdproof-" + std::to_string(i) + "-" + pid +
+                                             ".service"));
+        REQUIRE(s.has_value());
+        subs.push_back(*s);
+    }
+    REQUIRE(eventually([&] { return got.count() >= 20; }));
+
+    // 19 MORE units armed onto the SAME bus connection: the bus fd + eventfd
+    // are already open, so this should add ~0 fds. A regression to a
+    // per-unit bus connection (today's guard model) would add ~2 fds/unit —
+    // this assertion fails hard, immediately, on that regression.
+    CHECK(linux_fd_count() <= fd_base + 2);
+    // Thread count is FIXED at 1 mechanism thread regardless of watch count —
+    // the wheel + this mechanism + the consumer dispatch thread are already
+    // running at fd_base's sample, so arming 19 more units must add zero.
+    CHECK(linux_thread_count() == thread_base);
+
+    for (auto& s : subs)
+        engine.disarm(s);
+    engine.disarm(*first);
+    CHECK(eventually([&] { return linux_fd_count() <= fd_base; })); // no slot/fd leak on churn
+    engine.stop();
+}
+
+// Live transition — env-gated so normal CI (incl. bus-less containers) skips it;
+// runs on a real systemd box. Recipe:
+//   sudo systemd-run --unit=yuzu-spark-probe.service /usr/bin/sleep 3600
+//   ( sleep 4; sudo systemctl stop yuzu-spark-probe.service ) &
+//   YUZU_SPARK_LIVE_UNIT=yuzu-spark-probe.service ./yuzu_agent_tests "[spark][linux][live]"
+TEST_CASE("Service spark (real mechanism): live unit transition fires Running then Stopped",
+          "[spark][mechanism][linux][live]") {
+    const char* unit = std::getenv("YUZU_SPARK_LIVE_UNIT");
+    if (!unit || !*unit) {
+        SUCCEED("YUZU_SPARK_LIVE_UNIT unset — skipping live systemd integration test");
+        return;
+    }
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto sub = engine.arm(*c, service_spec(unit));
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] { return got.count() >= 1; }, 10000ms));
+    REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(0).data));
+    CHECK(std::get<ServiceSparkData>(got.at(0).data).state == ServiceRunState::Running);
+
+    CHECK(eventually(
+        [&] {
+            for (std::size_t i = 0; i < got.count(); ++i) {
+                const auto& ev = got.at(i);
+                if (std::holds_alternative<ServiceSparkData>(ev.data) &&
+                    std::get<ServiceSparkData>(ev.data).state == ServiceRunState::Stopped)
+                    return true;
+            }
+            return false;
+        },
+        30000ms));
+    engine.stop();
+}
+
+#endif // __linux__ && YUZU_HAVE_LIBSYSTEMD
 
 // ── Windows-only smoke: drive the REAL IOCP / TP_WAIT mechanisms against a live
 //    file write / registry write. The cross-platform cases above prove the
@@ -728,6 +998,197 @@ TEST_CASE("File spark (real mechanism): inline dispatch is microsecond-scale",
          << " over_10ms=" << st.inline_over_10ms_total
          << "  (OS-notify latency NOT included — that is ms-scale, separate)");
     CHECK(s.median_us < 10000);
+}
+
+// ── Windows Service spark: real SCM mechanism. Winmgmt (WMI) is READ-ONLY in
+//    every case below (SERVICE_QUERY_STATUS only) — never stopped/started —
+//    it is universally present and safe to watch on any Windows host. A live
+//    STATE TRANSITION needs a service this box can safely toggle, which
+//    varies by host, so that one case is env-gated (YUZU_SPARK_LIVE_SERVICE).
+
+#include <tlhelp32.h>
+
+#include <cstdlib> // getenv
+
+namespace {
+DWORD windows_thread_count() {
+    HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return 0;
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+    DWORD n = 0;
+    const DWORD pid = ::GetCurrentProcessId();
+    if (::Thread32First(snap, &te)) {
+        do {
+            if (te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof(DWORD) &&
+                te.th32OwnerProcessID == pid)
+                ++n;
+            te.dwSize = sizeof(te);
+        } while (::Thread32Next(snap, &te));
+    }
+    ::CloseHandle(snap);
+    return n;
+}
+} // namespace
+
+TEST_CASE("Service spark (real mechanism): initial state resolves for a real and an absent service",
+          "[spark][mechanism][windows]") {
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto real = engine.arm(*c, service_spec("Winmgmt"));
+    REQUIRE(real.has_value());
+    REQUIRE(eventually([&] { return got.count() >= 1; }));
+    REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(0).data));
+    CHECK(std::get<ServiceSparkData>(got.at(0).data).state == ServiceRunState::Running);
+
+    const std::string absent_name = "YuzuNoSuchSvc_" + std::to_string(::GetCurrentProcessId());
+    auto absent = engine.arm(*c, service_spec(absent_name));
+    REQUIRE(absent.has_value());
+    REQUIRE(eventually([&] { return got.count() >= 2; }));
+    REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(1).data));
+    CHECK(std::get<ServiceSparkData>(got.at(1).data).state == ServiceRunState::Stopped);
+
+    engine.disarm(*real);
+    engine.disarm(*absent);
+    engine.stop();
+}
+
+TEST_CASE("Service spark (real mechanism): thread count is fixed at 1 regardless of watch count",
+          "[spark][mechanism][windows][resource]") {
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto first = engine.arm(*c, service_spec("Winmgmt"));
+    REQUIRE(first.has_value());
+    REQUIRE(eventually([&] { return got.count() >= 1; }));
+    const DWORD threads_base = windows_thread_count();
+
+    // A handful of always-present real services (read-only) + absent ones —
+    // handle count grows (one SC_HANDLE per service is unavoidable), thread
+    // count must NOT. Arm one at a time (waiting for each initial emit before
+    // the next arm) rather than in a burst — avoids a race where the thread
+    // count is sampled before every registration has settled.
+    const char* more[] = {"EventLog", "Schedule", "LanmanWorkstation", "Dnscache"};
+    std::vector<SparkEngine::SubscriptionId> subs;
+    std::size_t expect = 1;
+    for (const char* name : more) {
+        auto s = engine.arm(*c, service_spec(name));
+        REQUIRE(s.has_value());
+        subs.push_back(*s);
+        ++expect;
+        REQUIRE(eventually([&] { return got.count() >= expect; }));
+    }
+    for (int i = 0; i < 15; ++i) {
+        const std::string name =
+            "YuzuFdProof_" + std::to_string(i) + "_" + std::to_string(::GetCurrentProcessId());
+        auto s = engine.arm(*c, service_spec(name));
+        REQUIRE(s.has_value());
+        subs.push_back(*s);
+        ++expect;
+        REQUIRE(eventually([&] { return got.count() >= expect; }));
+    }
+    CHECK(windows_thread_count() == threads_base); // +19 more watches, 0 more threads
+
+    for (auto& s : subs)
+        engine.disarm(s);
+    engine.disarm(*first);
+    engine.stop();
+}
+
+TEST_CASE("Service spark (real mechanism): rapid arm/unwatch churn does not UAF (R2)",
+          "[spark][mechanism][windows][resilience]") {
+    // Winmgmt is READ-ONLY here too — never stopped/started, only watched.
+    // NotifyServiceStatusChangeW's immediate on-registration callback fires
+    // moments after arming, so a tight arm-then-immediately-unwatch loop races
+    // that delivery against teardown_watch's SleepEx(0,TRUE) drain — exactly
+    // the R2 hazard (a queued APC running after its SvcWatch is freed) that a
+    // static create/delete-without-ever-toggling case would never exercise.
+    // If teardown_watch's drain were wrong this would UAF/crash under ASan
+    // (or corrupt heap state observably) well before kChurn iterations.
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    constexpr int kChurn = 200;
+    for (int i = 0; i < kChurn; ++i) {
+        auto sub = engine.arm(*c, service_spec("Winmgmt"));
+        REQUIRE(sub.has_value());
+        engine.disarm(*sub);
+    }
+    engine.stop();
+    SUCCEED("completed " << kChurn << " rapid arm/unwatch cycles without a crash");
+}
+
+// Live transition + latency — env-gated: a real service transition needs a
+// service THIS host can safely stop/start, which varies by box (unlike the
+// Linux systemd-run recipe, Windows has no equivalent "just create a throwaway
+// unit" primitive that starts into a real RUNNING state without a genuine
+// service binary). Recipe: pick an already-installed, safe-to-toggle service
+// (e.g. "Spooler" on a box that doesn't care about print spooling) and run:
+//   net stop Spooler   REM ensure a known starting state
+//   yuzu_agent_tests.exe "[spark][windows][live]" with YUZU_SPARK_LIVE_SERVICE=Spooler set,
+//   and toggle it externally (net start / net stop Spooler) while the test waits.
+TEST_CASE("Service spark (real mechanism): live service transition + inline dispatch latency",
+          "[spark][mechanism][windows][live][latency]") {
+    const char* env = std::getenv("YUZU_SPARK_LIVE_SERVICE");
+    if (!env || !*env) {
+        SUCCEED("YUZU_SPARK_LIVE_SERVICE unset — skipping live service integration test");
+        return;
+    }
+    const std::string name(env);
+
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+
+    std::mutex lat_mu;
+    std::vector<std::int64_t> dispatch_us;
+    std::vector<ServiceRunState> states;
+    auto inline_sub = engine.arm_inline(service_spec(name), [&](const SparkEvent& ev) {
+        const auto now = std::chrono::system_clock::now();
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - ev.at).count();
+        std::lock_guard lk(lat_mu);
+        dispatch_us.push_back(us);
+        if (std::holds_alternative<ServiceSparkData>(ev.data))
+            states.push_back(std::get<ServiceSparkData>(ev.data).state);
+    });
+    REQUIRE(inline_sub.has_value());
+    engine.start();
+
+    // Toggle externally (operator/script) while this waits for at least the
+    // initial resolve + a handful of transitions.
+    CHECK(eventually(
+        [&] {
+            std::lock_guard lk(lat_mu);
+            return states.size() >= 3;
+        },
+        60000ms));
+    engine.stop();
+
+    std::vector<std::int64_t> samples;
+    {
+        std::lock_guard lk(lat_mu);
+        samples = dispatch_us;
+    }
+    if (samples.size() >= 2) {
+        const LatencyStats s = summarize_us(samples);
+        WARN("[service SCM] inline DISPATCH us over " << s.n << " fires: min=" << s.min_us
+             << " median=" << s.median_us << " p90=" << s.p90_us << " max=" << s.max_us
+             << "  (OS-notify latency NOT included — that is APC-delivery-scale, separate)");
+        CHECK(s.median_us < 10000);
+    }
 }
 
 #endif // _WIN32

@@ -9,24 +9,32 @@
  * not sit on the wheel — a kernel notification, not a deadline, is the trigger.
  * Each such type is serviced by one `ISparkMechanism` that multiplexes EVERY
  * armed spark of its type onto O(mechanism) OS resources — one IOCP + thread
- * for file changes, one TP_WAIT pool for registry changes — never O(rules).
+ * for file changes, one TP_WAIT pool for registry changes, one sd-bus
+ * connection + thread (Linux) or one alertable-wait thread + one SCM
+ * connection (Windows) for service changes — never O(rules).
  *
  * The seam is what keeps this PR testable off Windows: the real IOCP / TP_WAIT
  * impls are Windows-only (spark_file.cpp / spark_registry.cpp), but a test
  * fake wired via SparkEngine::register_mechanism() exercises the whole
  * arm / dedup / fan-out / disarm-teardown path on any platform (the
  * DiskReaderFn seam precedent, generalised to a stateful, thread-owning
- * mechanism — the tar ProcStreamCollector shape).
+ * mechanism — the tar ProcStreamCollector shape). Service (spark_service.cpp,
+ * Stage-1 PR 1c) is the first mechanism real on TWO platforms at once (Linux
+ * sd-bus + Windows SCM) rather than Windows-only.
  *
  * Platform contract (why arm() rejects rather than succeeds-inert off Windows):
  * `make_file_mechanism()` / `make_registry_mechanism()` return a real
- * mechanism on Windows and `nullptr` elsewhere. A SparkEngine with no
- * mechanism for a type REJECTS arm() of that type — preserving the spark.hpp
- * invariant "Armed means the engine is running a watcher for the spec" (a
- * succeed-but-inert arm would be armed with no watcher). This mirrors the
- * guard_file / guard_registry precedent (no-op off-Windows → never reads as
- * armed). The "Linux agent receives a cross-platform Baseline containing a file
- * guard" UX is Guardian's concern (Stage 2), not the detection primitive's.
+ * mechanism on Windows and `nullptr` elsewhere; `make_service_mechanism()`
+ * returns a real mechanism on Windows AND on Linux built with libsystemd
+ * (`-DYUZU_HAVE_LIBSYSTEMD`, gated by the `systemd_guard` meson feature option
+ * — the same option that gates guard_systemd.cpp), `nullptr` on macOS or a
+ * Linux build without libsystemd. A SparkEngine with no mechanism for a type
+ * REJECTS arm() of that type — preserving the spark.hpp invariant "Armed means
+ * the engine is running a watcher for the spec" (a succeed-but-inert arm would
+ * be armed with no watcher). This mirrors the guard_file / guard_registry /
+ * guard_systemd precedent (no-op off-platform → never reads as armed). The
+ * "Linux agent receives a cross-platform Baseline containing a file guard" UX
+ * is Guardian's concern (Stage 2), not the detection primitive's.
  */
 
 #include <yuzu/agent/spark.hpp>
@@ -107,5 +115,13 @@ public:
 /// Platform factory: a real TP_WAIT + RegNotifyChangeKeyValue registry-change
 /// mechanism on Windows, `nullptr` on every other platform.
 [[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism> make_registry_mechanism();
+
+/// Platform factory: a real multiplexed service/unit run-state mechanism — one
+/// sd-bus connection servicing N `PropertiesChanged` matches on Linux built
+/// with libsystemd, one alertable-wait thread + one SCM connection servicing N
+/// `NotifyServiceStatusChangeW` registrations on Windows — and `nullptr` on
+/// macOS or a Linux build without libsystemd (`systemd_guard` meson option),
+/// where arm(Service) is then rejected per the platform contract above.
+[[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism> make_service_mechanism();
 
 } // namespace yuzu::agent

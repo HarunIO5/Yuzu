@@ -16,6 +16,8 @@
 
 #include "spark_engine.hpp"
 
+#include <yuzu/agent/guard_systemd.hpp> // valid_unit_name — pure, all-platform, shared with the guard
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -259,8 +261,13 @@ SparkEngine::validate_and_floor(const SparkSpec& spec) const {
             return std::unexpected("registry spark: key must not be empty");
         return 0; // event-driven: no wheel cadence
     }
-    case SparkType::Service:
-        return std::unexpected("spark type 'service' mechanism not built yet (Stage-1 PR 1c)");
+    case SparkType::Service: {
+        const auto& p = std::get<ServiceSparkParams>(spec.params);
+        if (!valid_unit_name(p.service_name))
+            return std::unexpected("service spark: name must be non-empty, <=256 chars, "
+                                   "alphanumeric plus . _ - @");
+        return 0; // event-driven: no wheel cadence
+    }
     }
     return std::unexpected("unknown spark type");
 }

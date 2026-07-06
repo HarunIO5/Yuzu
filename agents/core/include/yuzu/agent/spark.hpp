@@ -147,10 +147,56 @@ struct DiskSparkData {
     bool operator==(const DiskSparkData&) const = default;
 };
 
-/// Type-specific event facts. Interval/Startup (and the change-signal types
-/// until their mechanisms land) carry no payload — the event itself is the
-/// fact; consumers re-read whatever state they assert over.
-using SparkData = std::variant<std::monostate, DiskSparkData>;
+/// Resolved run state of a watched service/unit — the TERMINAL vocabulary only.
+/// Mapping (mirrors guard_systemd / guard_service, the governed precedents):
+///   Linux  : active → Running; inactive / failed / absent(not-loaded) → Stopped;
+///            activating / deactivating / reloading / maintenance / unknown →
+///            TRANSITIONAL — HELD, never emitted (see rationale below).
+///   Windows: SERVICE_RUNNING → Running; SERVICE_STOPPED / absent / deleted →
+///            Stopped; SERVICE_PAUSED → Paused (a TERMINAL SCM state — the guard
+///            compares and remediates on it, so the raw primitive must surface it
+///            or a consumer goes blind to paused drift); *_PENDING →
+///            TRANSITIONAL — HELD.
+/// Transitional states are held, not emitted: a consumer can neither assert over
+/// nor enforce against a mid-transition state (the guards hold on exactly these),
+/// and emitting them would make every stop/start a multi-event flap each consumer
+/// must re-filter. The enum is deliberately open — a Transitional member can be
+/// added later without breaking the wire tokens below.
+enum class ServiceRunState : std::uint8_t {
+    Running,
+    Stopped, ///< includes failed (Linux) and absent/deleted (both platforms)
+    Paused,  ///< Windows-only terminal state; never produced on Linux
+};
+
+/// Stable token for logs and (later) the content plane.
+[[nodiscard]] constexpr const char* service_run_state_token(ServiceRunState s) noexcept {
+    switch (s) {
+    case ServiceRunState::Running: return "running";
+    case ServiceRunState::Stopped: return "stopped";
+    case ServiceRunState::Paused:  return "paused";
+    }
+    return "unknown";
+}
+
+/// Event payload for a Service spark: the resolved terminal state AFTER the
+/// change. Unlike File/Registry (monostate — consumer re-reads), the service
+/// spark carries state because a consumer has no independent read primitive
+/// that doesn't duplicate the mechanism's own sd-bus/SCM connection — the exact
+/// resource duplication this mechanism exists to remove. Emitted once on
+/// successful watch-arm (the initial resolved state) and thereafter only on
+/// terminal-state edges; transitional states never emit and never move the
+/// edge-dedup baseline.
+struct ServiceSparkData {
+    ServiceRunState state{ServiceRunState::Stopped};
+    bool operator==(const ServiceSparkData&) const = default;
+};
+
+/// Type-specific event facts. Interval/Startup (and the File/Registry
+/// change-signal types) carry no payload — the event itself is the fact;
+/// consumers re-read whatever state they assert over. Service is the one
+/// event-driven type that DOES carry a payload (ServiceSparkData) — see its
+/// doc comment for why.
+using SparkData = std::variant<std::monostate, DiskSparkData, ServiceSparkData>;
 
 /// What a consumer receives when an armed spark fires.
 struct SparkEvent {
