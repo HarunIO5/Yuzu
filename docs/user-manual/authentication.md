@@ -624,12 +624,10 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 Eligibility is the per-user `users.elevation_eligible` flag — distinct from holding standing admin, and enumerable for access reviews. An admin **cannot** grant their own eligibility (another admin must). Revoking it (`{"eligible":false}`) immediately ends any elevation the user currently holds.
 
-**Prerequisite for a federated (OIDC/SSO) operator:** eligibility is keyed on a Yuzu `users` table row, and signing in via OIDC does **not** create one. A federated-only identity must already have a `users` row — provision it first (e.g. `POST /api/v1/users`) — or the eligibility call above 404s. This is a known limitation; auto-provisioning eligibility by OIDC identity is tracked as a follow-up, not yet implemented.
+**2. The eligible operator elevates** when they need admin. A second factor is **mandatory** to elevate, regardless of `--mfa-enforcement` — but which second factor depends on how the operator signed in:
 
-**2. The eligible operator elevates** when they need admin. A second factor is mandatory to elevate, regardless of `--mfa-enforcement`, and satisfied one of two ways depending on how the operator is currently authenticated (their identity SOURCE, not their username — an OIDC session never consults a local namesake account's TOTP enrollment):
-
-- **Local account:** the operator must have **MFA enrolled** and will be challenged for a fresh TOTP code.
-- **OIDC/SSO account:** if the operator's *current* SSO login was authenticated with IdP MFA (asserted via the OIDC `amr` claim), that assertion satisfies the second-factor requirement — **no local TOTP enrollment needed**. A single-factor SSO login (no IdP MFA) is still denied. This is controlled by `--jit-oidc-amr-elevation` (default enabled). Disabling it (`--no-jit-oidc-amr-elevation`) means **OIDC sessions cannot use JIT elevation at all** — an OIDC session cannot present a local TOTP step-up (its step-up challenge is re-authenticating via SSO, not a TOTP code), so the operator must elevate from a local-authenticated session with local TOTP instead.
+- **Local (password) sessions** must have **MFA enrolled** and are challenged for a fresh **TOTP code** via the shared step-up gate.
+- **OIDC/SSO sessions** are NOT challenged for a TOTP code (a durable SSO identity has no local TOTP secret to check against — see "SSO operators" below) — the second factor is the **IdP-attested `amr` claim** captured at login.
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
@@ -640,6 +638,26 @@ curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
 ```
 
 `expires_in` is the TRUE remaining seconds computed after the grant (always `<=` the requested `duration_secs` — it is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute lifetime, so it is never an exact echo of the request), and `expires_at` is the same window as a wall-clock RFC3339 UTC timestamp. The session is now admin for the window (capped by `--jit-max-elevation-secs`, default 1h). It **auto-reverts** when the window lapses, on logout, or on a server restart — the elevation is never persisted. Step down early with `POST /api/v1/elevate/revoke`. Every step (`role.elevation.granted`/`denied`/`revoked`/`expired`, `user.elevation_eligibility.set`) is audited — the `granted` row's detail records which factor was used (`mfa=local_totp` or `mfa=oidc_amr`). Technical invariants: `docs/auth-architecture.md` "JIT admin elevation".
+
+### SSO operators
+
+An OIDC/SSO operator elevates through the same two steps above, with the following differences:
+
+- **Eligibility is granted on the durable, stable principal** — `oidc:<iss>#<sub>` (the IdP-issuer-scoped subject claim, never the display name) — via the **query form** of the eligibility endpoint, `POST /api/v1/users/elevation-eligibility?username=<principal>`, e.g.:
+
+  ```bash
+  curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+    -H "Content-Type: application/json" -d '{"eligible":true}' \
+    'https://yuzu.example.com/api/v1/users/elevation-eligibility?username=oidc:https://idp.example.com/%23sub-4821'
+  ```
+
+  The path form (`POST /api/v1/users/{username}/elevation-eligibility`) remains for local usernames only — an SSO principal contains `/` and `#`, which a path segment cannot carry (the server percent-decodes and strips the URL fragment before route matching), so it must use the query form instead.
+
+  The operator must have **logged in at least once** before an admin can grant eligibility — first login auto-provisions a durable row for the principal (`AuthDB::upsert_sso_identity`); granting eligibility against a principal with no row yet **404s** ("user not found"), since the grant is an `UPDATE` against an existing row, not an `INSERT`.
+- **The second factor is the IdP-attested `amr` claim**, captured on the OIDC session at login — never a local TOTP challenge. A session created from a login where the IdP did not assert `amr` is denied elevation unconditionally (`403`, "elevation requires an IdP-attested MFA proof"), independent of the `--mfa-enforcement` setting. Disabling `--jit-oidc-amr-elevation` (default enabled) turns OIDC JIT elevation off entirely — an OIDC session cannot fall back to a local TOTP step-up (its step-up challenge is re-authenticating via SSO), so operators must elevate from a local-authenticated session with local TOTP instead.
+- **Finding the principal string**: Settings → Users lists every durable SSO identity with an **SSO** badge next to its row; the row's displayed name IS the `oidc:<iss>#<sub>` principal to use in the eligibility-grant URL above.
+- **SAML operators cannot elevate today** — SAML carries no `amr`-equivalent claim, so a SAML session fails closed at the same MFA gate a non-MFA'd OIDC session would hit. SAML JIT elevation is a deferred workstream (see `docs/auth-architecture.md` "JIT admin elevation").
+- **Cross-protocol identity-source scoping**: an elevation grant is scoped to the identity *source* that earned it, not just the principal string — the check is a **direct equality** between the session's own `auth_source` and the eligible row's `identity_source` (`local`↔`local`, `oidc`↔`oidc`, `saml`↔`saml`), not an "oidc-or-else-local" fallback. A local session can only spend a grant recorded against an `identity_source='local'` row; a SAML session (SAML JIT elevation is not yet provisioned — see below) would need an `identity_source='saml'` row, which no row carries today, so SAML fails closed at this gate too. This closes a theoretical collision where a crafted SAML NameID (or a legacy local row) shares a principal string with a real OIDC identity.
 
 ## MCP Tokens
 
