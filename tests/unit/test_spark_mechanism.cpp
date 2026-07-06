@@ -440,6 +440,54 @@ TEST_CASE("Service spark: fire carries ServiceSparkData through the queued tier"
     engine.stop();
 }
 
+TEST_CASE("Service spark: arm-before-start is replayed to the mechanism at start()",
+          "[spark][mechanism]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+
+    const auto spec = service_spec("sshd");
+    const std::string key = spark_key(spec);
+    REQUIRE(engine.arm(*c, spec).has_value());
+    CHECK_FALSE(fake->is_watching(key)); // not watched until the engine starts
+    CHECK(fake->watch_calls() == 0);
+
+    engine.start();
+    CHECK(eventually([&] { return fake->is_watching(key); })); // start() replays the watch
+    CHECK(fake->watch_calls() == 1);
+
+    fake->fire(key, SparkData{ServiceSparkData{ServiceRunState::Running}});
+    CHECK(eventually([&] { return got.count() >= 1; }));
+    engine.stop();
+}
+
+TEST_CASE("Service spark: equal specs dedup to one watch, fan out to all subscribers",
+          "[spark][mechanism]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    Collector a, b;
+    auto ca = engine.register_consumer("a", a.handler());
+    auto cb = engine.register_consumer("b", b.handler());
+    REQUIRE(ca.has_value());
+    REQUIRE(cb.has_value());
+    engine.start();
+
+    const auto spec = service_spec("sshd");
+    const std::string key = spark_key(spec);
+    REQUIRE(engine.arm(*ca, spec).has_value());
+    REQUIRE(engine.arm(*cb, spec).has_value());
+    CHECK(fake->watch_calls() == 1); // dedup: N subscriptions, 1 watcher
+    CHECK(engine.stats().armed_sparks == 1);
+    CHECK(engine.stats().subscriptions == 2);
+
+    fake->fire(key, SparkData{ServiceSparkData{ServiceRunState::Stopped}});
+    REQUIRE(eventually([&] { return a.count() >= 1 && b.count() >= 1; }));
+    CHECK(a.at(0).seq == b.at(0).seq); // one fire, one seq, both observe it
+    engine.stop();
+}
+
 TEST_CASE("Mechanism emit path does not deadlock an inline re-arm (TRAP 2)", "[spark][mechanism]") {
     // An inline consumer that re-arms from inside its handler must not deadlock:
     // emit_event snapshots + releases mu_ before delivering, and arm takes mu_.
@@ -576,6 +624,48 @@ TEST_CASE("Service spark (real mechanism): an absent unit gets an initial Stoppe
     REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(0).data));
     CHECK(std::get<ServiceSparkData>(got.at(0).data).state == ServiceRunState::Stopped);
     engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Service spark (real mechanism): two spark keys coalescing onto one unit each "
+          "get their own emit",
+          "[spark][mechanism][linux]") {
+    // "yuzu-coalesce-<pid>" and "yuzu-coalesce-<pid>.service" are DISTINCT
+    // engine-level spark keys (different ServiceSparkParams::service_name,
+    // no engine-level dedup) but normalize_unit_name folds them onto the
+    // SAME underlying UnitWatch inside the mechanism. Governance flagged
+    // this exact scenario (a second key arming onto an already-known unit)
+    // as untested by every N-watch resource test, since those all use N
+    // DISTINCT unit names.
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const std::string base = "yuzu-coalesce-" + std::to_string(::getpid());
+    auto first = engine.arm(*c, service_spec(base));
+    if (!first.has_value()) {
+        engine.stop();
+        SUCCEED("service mechanism reports inert (no system bus on this host) — skipping");
+        return;
+    }
+    REQUIRE(eventually([&] { return got.count() >= 1; }));
+
+    // Second key normalizes to the identical unit name ("base" has no '.'
+    // so normalize_unit_name appends ".service" — matching this literal).
+    auto second = engine.arm(*c, service_spec(base + ".service"));
+    REQUIRE(second.has_value());
+    REQUIRE(eventually([&] { return got.count() >= 2; })); // the coalescing key gets its OWN emit
+
+    CHECK(got.at(0).key != got.at(1).key); // distinct engine keys...
+    REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(1).data));
+    CHECK(std::get<ServiceSparkData>(got.at(1).data).state ==
+          ServiceRunState::Stopped); // ...same (absent) unit, same resolved state
+
+    engine.disarm(*first);
+    engine.disarm(*second);
     engine.stop();
 }
 
@@ -1064,6 +1154,41 @@ TEST_CASE("Service spark (real mechanism): initial state resolves for a real and
 
     engine.disarm(*real);
     engine.disarm(*absent);
+    engine.stop();
+}
+
+TEST_CASE("Service spark (real mechanism): two spark keys folding onto one service each "
+          "get their own emit",
+          "[spark][mechanism][windows]") {
+    // "Winmgmt" and "WINMGMT" are DISTINCT engine-level spark keys (no
+    // engine-level dedup — different ServiceSparkParams::service_name
+    // strings) but fold_ci coalesces them onto the SAME underlying SvcWatch
+    // (SCM service names are case-insensitive). Winmgmt is read-only here,
+    // never stopped/started. Governance flagged this exact scenario as
+    // untested by every N-watch resource test, since those all use N
+    // distinct names.
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto first = engine.arm(*c, service_spec("Winmgmt"));
+    REQUIRE(first.has_value());
+    REQUIRE(eventually([&] { return got.count() >= 1; }));
+
+    auto second = engine.arm(*c, service_spec("WINMGMT"));
+    REQUIRE(second.has_value());
+    REQUIRE(eventually([&] { return got.count() >= 2; })); // the coalescing key gets its OWN emit
+
+    CHECK(got.at(0).key != got.at(1).key); // distinct engine keys...
+    REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(1).data));
+    CHECK(std::get<ServiceSparkData>(got.at(1).data).state ==
+          ServiceRunState::Running); // ...same service, same resolved state
+
+    engine.disarm(*first);
+    engine.disarm(*second);
     engine.stop();
 }
 
