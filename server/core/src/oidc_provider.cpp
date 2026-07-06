@@ -567,6 +567,7 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     auto client = std::make_unique<httplib::Client>(scheme + host);
     client->set_connection_timeout(10);
     client->set_read_timeout(15);
+    client->set_write_timeout(15);
     client->enable_server_certificate_verification(!config_.skip_tls_verify);
     httplib::Headers headers;
     if (!auth_header.empty())
@@ -705,6 +706,7 @@ void OidcProvider::fetch_jwks() {
         auto client = std::make_unique<httplib::Client>(scheme + host);
         client->set_connection_timeout(5);
         client->set_read_timeout(5);
+        client->set_write_timeout(5);
         client->enable_server_certificate_verification(!config_.skip_tls_verify);
 
         auto result = client->Get(path);
@@ -925,6 +927,7 @@ OidcProvider::OidcProvider(OidcConfig config)
         auto client = std::make_unique<httplib::Client>(scheme + host);
         client->set_connection_timeout(5);
         client->set_read_timeout(5);
+        client->set_write_timeout(5);
         client->enable_server_certificate_verification(!config_.skip_tls_verify);
 
         auto result = client->Get(path);
