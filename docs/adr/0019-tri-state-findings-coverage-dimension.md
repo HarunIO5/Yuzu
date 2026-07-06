@@ -107,15 +107,37 @@ carrying the feed-version timestamp and computing coverage counters at correlati
   OVAL for this package yet). Surfaced as *"unconfirmed — pending OVAL backport check, as of feed-sync T"*,
   and **counted separately from Vulnerable** (never folded into the vulnerable headline). When OVAL lands
   (M1b) each `potential` resolves deterministically → **Vulnerable** (OVAL: not-backported) or →
-  **Assessed–clean** (OVAL: backport-fixed).
-- **Assessed–clean** — within a covering feed's scope, no match. (Unchanged.)
-- **Not-assessed** — no feed covers the package; identified but never evaluated. (Unchanged.)
+  **Assessed–clean** (OVAL: backport-fixed) **only if the finding's identity confidence is `high`**; a
+  `low`-confidence `potential` that OVAL marks backport-fixed resolves to **Not-assessed** instead — the
+  confidence gate applies at every point a finding could become `assessed-clean`, not just at initial
+  correlation. **This is not a final verdict**: like any other record, it is re-assessed on the next
+  qualifying trigger (ingest content-change or a new-CVE feed delta) — a persistent NVD range match keeps
+  resurfacing as `potential (low)` each cycle rather than being silently dropped.
+- **Assessed–clean** — within a covering feed's scope, no match, **and the package identity was resolved
+  at high confidence**. A low-confidence identity match that looks clean is never assessed-clean — see
+  the confidence rule below.
+- **Not-assessed** — no feed covers the package, or the package's identity could only be resolved at low
+  confidence **and no advisory matched** (a low-confidence match against an in-range advisory is still
+  `potential`, carrying `confidence: low` — see below; this carve-out only ever removes a clean verdict,
+  never a positive one); identified but never evaluated.
 
 **A second, orthogonal dimension: `confidence`.** Independent of status, each `potential`/Vulnerable
 finding carries `confidence ∈ {high, low}` reflecting the **identity-mapping** certainty — `high` = a
 curated or exact CPE identity; `low` = a best-effort normalized-name match. Confidence answers "did we map
 this package to the right CPE product," which is orthogonal to status's "what did the feed say." (This is
 the same separation-of-dimensions principle as coverage vs vulnerability, applied to identity.)
+
+**Low-confidence identity can never produce a clean verdict.** Without this rule, a wrong best-effort
+name-prefix match that happens to land on a safe NVD product would become a counted, timestamped
+`assessed-clean` finding with no confidence field attached to ever flag it — reintroducing, in the
+false-**negative** direction, exactly the false-assurance failure this ADR exists to prevent. So a
+`low`-confidence match **that would otherwise read clean** (no advisory in range) is routed to
+`not-assessed` (reason `identity-low-confidence`) instead; only a `high`-confidence identity can produce
+`assessed-clean`. **This rule never demotes a positive match** — a low-confidence identity that DOES land
+an in-range advisory still surfaces as `potential (confidence: low)`, per the confidence axis above; the
+carve-out only ever removes a clean verdict. **Coverage consequence:** a low-confidence-identity record
+that would have been clean now counts toward coverage as `not-assessed` — the coverage number may read
+lower than a naive identity-match rate would suggest. That is deliberate honesty, not a regression.
 
 **Feed-freshness threading (realises cost #3 above).** Every `potential` and Assessed–clean verdict is
 stamped with the NVD catalog feed-sync timestamp, so a stale mirror yields a *stale* signal, not a
