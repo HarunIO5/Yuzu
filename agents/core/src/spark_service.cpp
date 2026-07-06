@@ -621,6 +621,20 @@ private:
                              "every armed key is now silently dead",
                              err_str(errno));
                 fault_all(true, "mechanism thread terminating", faults);
+                // fault_all only covers already-armed units — a watch() that
+                // landed in pending_ this same tick was never armed at all,
+                // so it has no units_ entry for fault_all to find. Without
+                // this, a consumer whose arm() call raced the mechanism's
+                // death would get no signal whatsoever (governance Gate-4
+                // unhappy-path finding UP-8). Cmd::Remove entries need no
+                // signal — nothing was ever told they existed.
+                {
+                    std::lock_guard lk(mu_);
+                    for (auto& cmd : pending_)
+                        if (cmd.op == Cmd::Add)
+                            faults.push_back({cmd.key, true, "mechanism thread terminating"});
+                    pending_.clear();
+                }
                 dispatch(emits, faults);
                 break;
             }
@@ -652,9 +666,26 @@ private:
                     bus_ = nb;
                     subscribe();
                     bus_ok_ = true;
-                    fault_all(false, "recovered", faults);
-                    for (auto& [name, uwp] : units_)
+                    // Don't declare "recovered" until the re-arm pass below
+                    // actually confirms the connection is still usable — a
+                    // bus that reopens but is dead-on-first-use would
+                    // otherwise flap recovered→faulted within the same
+                    // dispatch batch (governance Gate-6 sre finding).
+                    for (auto& [name, uwp] : units_) {
                         arm_unit(bus, *uwp, emits, faults);
+                        if (!bus_ok_)
+                            break; // the connection died again mid-pass — fault_all(true)
+                                   // inside arm_unit already covers every unit including
+                                   // the ones not yet reached; re-trying them against the
+                                   // same known-broken connection would be redundant and,
+                                   // if one happened to transiently succeed, would leave it
+                                   // stuck reporting faulted=true (set for ALL units by that
+                                   // fault_all call) despite emitting healthy data — no
+                                   // per-unit success clears a fault, only the NEXT reopen's
+                                   // recovered edge does (governance Gate-3 cpp-expert finding)
+                    }
+                    if (bus_ok_)
+                        fault_all(false, "recovered", faults); // only now confirmed still up
                     dispatch(emits, faults);
                     spdlog::info("spark_service: system bus reconnected");
                 } else {
@@ -668,6 +699,8 @@ private:
                     if (uwp->next_backstop > now2)
                         continue;
                     arm_unit(bus, *uwp, emits, faults);
+                    if (!bus_ok_)
+                        break; // same reasoning as the reopen-rearm-all loop above
                 }
                 dispatch(emits, faults);
             }
@@ -1102,6 +1135,19 @@ private:
                     wp->faulted = true;
                     for (const auto& k : wp->keys)
                         faults.push_back({k, true, "mechanism thread terminating"});
+                }
+                // Same reasoning as the Linux mechanism: a watch() that
+                // landed in pending_ this same tick was never armed at all,
+                // so the loop above (which only walks svcs_) can't find it —
+                // without this, a consumer whose arm() call raced the
+                // mechanism's death would get no signal whatsoever
+                // (governance Gate-4 unhappy-path finding UP-8).
+                {
+                    std::lock_guard lk(mu_);
+                    for (auto& cmd : pending_)
+                        if (cmd.op == Cmd::Add)
+                            faults.push_back({cmd.key, true, "mechanism thread terminating"});
+                    pending_.clear();
                 }
                 dispatch(emits, faults);
                 break;
