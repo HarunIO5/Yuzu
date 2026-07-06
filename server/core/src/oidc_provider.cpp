@@ -331,6 +331,27 @@ bool groups_claim_reconcilable(const IdTokenClaims& claims) {
 std::expected<void, std::string>
 OidcProvider::validate_claims(const IdTokenClaims& claims,
                               const std::string& expected_nonce) const {
+    // Defensive: `iss` is compared against the configured issuer just below,
+    // so an empty `iss` is already rejected UNLESS the operator somehow
+    // configured an empty issuer — guard it explicitly rather than rely on
+    // that coincidence.
+    if (claims.iss.empty())
+        return std::unexpected("missing iss claim");
+
+    // `iss` is the other half of the stable principal `oidc:<iss>#<sub>` and,
+    // like `sub` below, lands in the audit `principal` column. It is pinned to
+    // the operator-configured issuer by the equality check just below (so it is
+    // not attacker-controllable), but validate its length/bytes anyway as
+    // defense-in-depth against a misconfigured issuer string and to keep the
+    // principal well-formed. (Mirrors the `sub` validation.)
+    constexpr std::size_t kMaxIssLength = 255;
+    if (claims.iss.size() > kMaxIssLength)
+        return std::unexpected("iss claim exceeds maximum length");
+    for (unsigned char c : claims.iss) {
+        if (c < 0x20 || c == 0x7F)
+            return std::unexpected("iss claim contains control characters");
+    }
+
     if (claims.iss != config_.issuer)
         return std::unexpected("iss mismatch: got '" + claims.iss + "', expected '" +
                                config_.issuer + "'");
@@ -338,6 +359,30 @@ OidcProvider::validate_claims(const IdTokenClaims& claims,
     if (claims.aud != config_.client_id)
         return std::unexpected("aud mismatch: got '" + claims.aud + "', expected '" +
                                config_.client_id + "'");
+
+    // #1837 governance follow-up — `sub` is now the authorization-load-
+    // bearing half of the stable RBAC principal `oidc:<iss>#<sub>`
+    // (auth_routes.cpp /auth/callback, AuthManager::create_oidc_session). An
+    // IdP token that omits `sub` (or sends it empty/non-string —
+    // parse_id_token leaves it as the default-constructed empty string in
+    // that case) would collapse EVERY such login onto the single principal
+    // `oidc:<iss>#`, and #1832's group-membership reconcile makes that
+    // collision actively destructive (one user's login can deprovision
+    // another's roles). `sub` also flows unsanitized into the audit
+    // `principal` column (never through sanitize_detail_value, which is
+    // reserved for `detail` fields) — a control/newline byte there is an
+    // audit-log injection/readability hazard. Reject the token outright
+    // (fail-closed: no session minted) rather than sanitizing-and-continuing,
+    // since a legitimate IdP never sends a malformed `sub`.
+    if (claims.sub.empty())
+        return std::unexpected("missing sub claim");
+    constexpr std::size_t kMaxSubLength = 255;
+    if (claims.sub.size() > kMaxSubLength)
+        return std::unexpected("sub claim exceeds maximum length");
+    for (unsigned char c : claims.sub) {
+        if (c < 0x20 || c == 0x7F)
+            return std::unexpected("sub claim contains control characters");
+    }
 
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch())
