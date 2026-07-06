@@ -610,7 +610,18 @@ private:
             if (pr < 0) {
                 if (errno == EINTR)
                     continue;
-                spdlog::warn("spark_service: poll: {}", err_str(errno));
+                // Unrecoverable — the mechanism thread is about to exit and
+                // every currently-armed key will silently stop updating
+                // forever. Report it: without this, mechanism death is
+                // indistinguishable from "healthy and quiet" in the engine's
+                // stats (governance Gate-6 sre finding — a more severe
+                // version of the re-arm fault-swallowing bug fixed earlier
+                // this round).
+                spdlog::error("spark_service: poll failed ({}) — mechanism thread exiting, "
+                             "every armed key is now silently dead",
+                             err_str(errno));
+                fault_all(true, "mechanism thread terminating", faults);
+                dispatch(emits, faults);
                 break;
             }
             if (fds[wake_idx].revents & POLLIN)
@@ -1077,8 +1088,24 @@ private:
             if (stop_.load(std::memory_order_acquire))
                 break;
 
-            if (r != WAIT_OBJECT_0 && r != WAIT_TIMEOUT && r != WAIT_IO_COMPLETION)
-                break; // WAIT_FAILED — unrecoverable
+            if (r != WAIT_OBJECT_0 && r != WAIT_TIMEOUT && r != WAIT_IO_COMPLETION) {
+                // WAIT_FAILED — unrecoverable. The mechanism thread is about
+                // to exit and every currently-armed key will silently stop
+                // updating forever; report it (governance Gate-6 sre
+                // finding — this path previously had no log line at all).
+                spdlog::error("spark_service: WaitForSingleObjectEx failed (err={}) — mechanism "
+                             "thread exiting, every armed key is now silently dead",
+                             GetLastError());
+                for (auto& [name, wp] : svcs_) {
+                    if (wp->faulted)
+                        continue;
+                    wp->faulted = true;
+                    for (const auto& k : wp->keys)
+                        faults.push_back({k, true, "mechanism thread terminating"});
+                }
+                dispatch(emits, faults);
+                break;
+            }
 
             if (r == WAIT_TIMEOUT) {
                 const auto now2 = std::chrono::steady_clock::now();
