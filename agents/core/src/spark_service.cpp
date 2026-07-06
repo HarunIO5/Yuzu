@@ -206,6 +206,13 @@ public:
         const auto* sp = std::get_if<ServiceSparkParams>(&params);
         if (!sp)
             return std::unexpected("service mechanism: params are not ServiceSparkParams");
+        // Defence-in-depth parity with the Windows mechanism's valid_service_name
+        // check (governance Gate-2 finding): production arms are already gated
+        // by the engine's valid_unit_name call in validate_and_floor, but this
+        // watch() is directly callable in tests, bypassing the engine.
+        if (!valid_unit_name(sp->service_name))
+            return std::unexpected("service mechanism: invalid unit name '" + sp->service_name +
+                                   "'");
         std::lock_guard lk(mu_);
         if (!started_)
             return std::unexpected("service mechanism not started");
@@ -502,7 +509,15 @@ private:
                         } else {
                             // Bus is down: this key is faulted from the moment
                             // it arms; reopen's re-arm-all pass will resolve it.
+                            // MUST set next_backstop — a fresh UnitWatch's
+                            // default-constructed time_point{} sentinel sorts
+                            // before `now` in the poll-timeout computation
+                            // below, collapsing it to 0 and busy-looping
+                            // sd_bus_open_system every iteration until the bus
+                            // recovers (governance Gate-3 cpp-expert finding).
                             uw->faulted = true;
+                            uw->next_backstop = std::chrono::steady_clock::now() +
+                                                std::chrono::milliseconds(kAbsentRetryMs);
                             faults.push_back({cmd.key, true, "system bus lost"});
                         }
                     } else if (uw->last) {
@@ -586,6 +601,22 @@ private:
             if (!bus_ok_) {
                 sd_bus* nb = nullptr;
                 if (sd_bus_open_system(&nb) >= 0 && nb) {
+                    // Slot-before-bus: drop every unit's match (each holds a
+                    // ref on the OLD connection) before releasing our own
+                    // reference to it — mirrors guard_systemd.cpp's
+                    // reopen_bus ordering. Without this, `bus = nb` below
+                    // loses the only pointer that could ever unref the old
+                    // connection, permanently leaking it + its fd on every
+                    // reconnect (governance Gate-2 security-guardian finding)
+                    // — arm_unit()'s own slot.reset() runs against the NEW
+                    // bus pointer by the time it executes below, too late to
+                    // release the old one.
+                    for (auto& [name, uwp] : units_)
+                        uwp->slot.reset();
+                    if (bus) {
+                        sd_bus_flush(bus);
+                        sd_bus_unref(bus);
+                    }
                     bus = nb;
                     bus_ = nb;
                     subscribe();
@@ -724,6 +755,17 @@ static_assert((kNotifyMask & (SERVICE_NOTIFY_CREATED | SERVICE_NOTIFY_DELETED |
 
 constexpr std::uint64_t kAbsentRetryMs = 30000;
 
+/// How many main-loop passes a retired SvcWatch survives in `retiring_`
+/// before being freed for real, once it stops observing any further APC
+/// delivery. Reset back to this value any time a stale APC DOES land during
+/// retirement, so a watch that keeps firing (an SCM that queued several
+/// notifications before the close landed) never gets freed mid-delivery.
+constexpr int kRetireGracePasses = 3;
+
+/// Bounds the fired-flag fixed-point scan (see its call site in run()) so a
+/// pathologically flapping service can't monopolize the mechanism thread.
+constexpr int kMaxFiredScanPasses = 16;
+
 bool is_pending(DWORD s) {
     return s == SERVICE_START_PENDING || s == SERVICE_STOP_PENDING ||
            s == SERVICE_CONTINUE_PENDING || s == SERVICE_PAUSE_PENDING;
@@ -766,6 +808,9 @@ struct SvcWatch {
     std::optional<ServiceRunState> last;
     bool faulted{false};
     std::chrono::steady_clock::time_point next_retry{};
+    /// >0 while parked in `retiring_` awaiting quiescence before real free;
+    /// 0 for a live (non-retiring) watch. See `retiring_`'s doc comment.
+    int retire_grace{0};
 };
 
 void CALLBACK notify_cb(PVOID param) {
@@ -852,9 +897,11 @@ public:
             thread_.join();
         }
         // The mechanism thread has joined — every SvcWatch's registration was
-        // already torn down by the thread's own exit path (see run()); svcs_
-        // is now safe to touch without a lock.
+        // already torn down by the thread's own exit path (see run(), and its
+        // duplication into both catch blocks); svcs_/retiring_ are now safe
+        // to touch without a lock.
         svcs_.clear();
+        retiring_.clear();
         key_svc_.clear();
         scm_.reset();
         wake_.reset();
@@ -1055,7 +1102,18 @@ private:
                         continue;
                     sit->second->keys.erase(cmd.key);
                     if (sit->second->keys.empty()) {
+                        // Don't free the SvcWatch synchronously: CloseServiceHandle
+                        // cancelling a pending NotifyServiceStatusChangeW
+                        // registration is not documented as a synchronous
+                        // barrier against an already-in-flight APC (governance
+                        // Gate-2 security-guardian finding) — a queued
+                        // notification could still land microseconds after
+                        // teardown_watch's drain. Relocate to retiring_ (kept
+                        // alive, never re-armed, no keys so nothing to notify)
+                        // and free only once quiescent for a few loop passes.
                         teardown_watch(*sit->second);
+                        sit->second->retire_grace = kRetireGracePasses;
+                        retiring_.push_back(std::move(sit->second));
                         svcs_.erase(sit);
                     }
                 }
@@ -1075,8 +1133,14 @@ private:
             // full pass finds nothing new: this scan's OWN arm_watch calls
             // (the MARKED_FOR_DELETE / re-arm-failed branches) can themselves
             // deliver another watch's queued APC via the same SleepEx path.
-            for (bool any = true; any;) {
-                any = false;
+            // Bounded to kMaxFiredScanPasses (governance Gate-3 cpp-expert
+            // finding): a service flapping externally faster than this thread
+            // can re-arm+drain could otherwise re-seed `fired` every pass
+            // indefinitely, monopolizing the mechanism thread. A self-wake on
+            // hitting the cap defers any straggler to the next outer-loop
+            // iteration rather than looping unbounded here.
+            for (int pass = 0; pass < kMaxFiredScanPasses; ++pass) {
+                bool any = false;
                 for (auto& [name, wp] : svcs_) {
                     if (!wp->fired)
                         continue;
@@ -1110,20 +1174,62 @@ private:
                     if (!rearmed)
                         arm_watch(*wp, emits, faults);
                 }
+                if (!any) {
+                    break; // converged — nothing fired this pass
+                }
+                if (pass == kMaxFiredScanPasses - 1) {
+                    // Hit the cap with more still pending — self-wake so any
+                    // straggler is picked up on the next outer-loop iteration
+                    // instead of looping unbounded on this thread.
+                    wake_signal();
+                }
             }
+
+            // Reap retiring watches: absorb any stale APC silently (no keys
+            // left, so no consumer to notify — just clear the flag and free
+            // the name buffer) and free the SvcWatch for real once quiescent
+            // for kRetireGracePasses consecutive passes. This is what makes
+            // the "don't free synchronously on removal" fix above safe
+            // regardless of exactly when CloseServiceHandle's cancellation
+            // takes effect — the object stays alive (just never re-armed)
+            // until nothing has touched it for a few loop iterations.
+            for (auto& rw : retiring_) {
+                if (rw->fired) {
+                    rw->fired = false;
+                    if (rw->notify.pszServiceNames) {
+                        LocalFree(rw->notify.pszServiceNames);
+                        rw->notify.pszServiceNames = nullptr;
+                    }
+                    rw->retire_grace = kRetireGracePasses; // still live — reset the countdown
+                } else if (rw->retire_grace > 0) {
+                    --rw->retire_grace;
+                }
+            }
+            retiring_.erase(std::remove_if(retiring_.begin(), retiring_.end(),
+                                           [](const std::unique_ptr<SvcWatch>& rw) {
+                                               return rw->retire_grace == 0 && !rw->fired;
+                                           }),
+                            retiring_.end());
 
             dispatch(emits, faults);
         }
 
         // Thread exit path: tear down every outstanding registration on THIS
         // thread (the registering thread — SERVICE_NOTIFYW/APC ownership).
+        // Duplicated into both catch blocks below (not just here) so an
+        // exception mid-loop can't skip it and leave stop()'s "already torn
+        // down" assumption false (governance Gate-3 cpp-safety finding).
         for (auto& [name, wp] : svcs_)
             teardown_watch(*wp);
     } catch (const std::exception& e) {
         spdlog::error("spark_service: mechanism thread exception: {} — mechanism stopping",
                       e.what());
+        for (auto& [name, wp] : svcs_)
+            teardown_watch(*wp);
     } catch (...) {
         spdlog::error("spark_service: mechanism thread unknown exception — mechanism stopping");
+        for (auto& [name, wp] : svcs_)
+            teardown_watch(*wp);
     }
 
     std::mutex mu_; ///< guards ONLY pending_ + the start/stop/scm_ok_ flags
@@ -1141,6 +1247,10 @@ private:
     // stop() after the thread has joined.
     std::unordered_map<std::wstring, std::unique_ptr<SvcWatch>> svcs_; ///< keyed by folded name
     std::unordered_map<std::string, std::wstring> key_svc_;           ///< spark key -> folded name
+    /// Removed watches awaiting quiescence before real free — see the
+    /// Cmd::Remove handling and the reap loop in run() for why a watch isn't
+    /// freed synchronously on removal.
+    std::vector<std::unique_ptr<SvcWatch>> retiring_;
 };
 
 } // namespace
