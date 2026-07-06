@@ -358,11 +358,21 @@ private:
     // drops any prior slot first. Collects an initial/re-resolved emit for
     // every current key on `uw`. Sets bus_ok_=false on a transport failure
     // (caller reopens); never fabricates a false Stopped on that path.
-    void arm_unit(sd_bus* bus, UnitWatch& uw, std::vector<PendingEmit>& emits) {
+    // `faults` lets arm_unit report a bus failure it discovers itself
+    // (governance Gate-4 unhappy-path finding, UP-1): the three call sites
+    // below previously only fed a fresh BusError into `bus_ok_`, relying on
+    // the main loop's OWN process/read failure sites to call fault_all — but
+    // a re-arm invoked from Cmd::Add, the healthy-reconcile backstop loop, or
+    // the reopen-success re-arm-all pass could discover the SAME class of
+    // failure without ever routing through those two call sites, silently
+    // swallowing the fault signal for every unit on the connection.
+    void arm_unit(sd_bus* bus, UnitWatch& uw, std::vector<PendingEmit>& emits,
+                  std::vector<PendingFault>& faults) {
         uw.slot.reset(); // drop the old match (and its bus ref) first
         switch (resolve_path(bus, uw)) {
         case ResolveResult::BusError:
             bus_ok_ = false;
+            fault_all(true, "system bus lost", faults);
             uw.next_backstop = std::chrono::steady_clock::now() +
                                std::chrono::milliseconds(kAbsentRetryMs);
             return;
@@ -380,19 +390,23 @@ private:
                                     "PropertiesChanged", &on_props_changed, &uw);
         if (r < 0) {
             spdlog::warn("spark_service: match arm failed for '{}': {}", uw.unit, err_str(-r));
-            if (auto st = read_state(bus, uw))
+            if (auto st = read_state(bus, uw)) {
                 set_terminal_from_systemd(uw, *st, emits);
-            else
+            } else {
                 bus_ok_ = false;
+                fault_all(true, "system bus lost", faults);
+            }
             uw.next_backstop = std::chrono::steady_clock::now() +
                                std::chrono::milliseconds(kAbsentRetryMs);
             return;
         }
         uw.slot.reset(slot);
-        if (auto st = read_state(bus, uw))
+        if (auto st = read_state(bus, uw)) {
             set_terminal_from_systemd(uw, *st, emits);
-        else
+        } else {
             bus_ok_ = false;
+            fault_all(true, "system bus lost", faults);
+        }
         uw.next_backstop = std::chrono::steady_clock::now() +
                            std::chrono::milliseconds(kHealthyReconcileMs);
     }
@@ -505,7 +519,7 @@ private:
                     key_unit_.emplace(cmd.key, cmd.unit);
                     if (is_new_unit) {
                         if (bus_ok_) {
-                            arm_unit(bus, *uw, emits);
+                            arm_unit(bus, *uw, emits, faults);
                         } else {
                             // Bus is down: this key is faulted from the moment
                             // it arms; reopen's re-arm-all pass will resolve it.
@@ -523,8 +537,14 @@ private:
                     } else if (uw->last) {
                         // An existing (already-resolved) unit gains a new
                         // subscriber key — give it the initial state too, since
-                        // engine subscribers are keyed per-spec.
+                        // engine subscribers are keyed per-spec. If the unit is
+                        // currently faulted, tell the new key that too (UP-2,
+                        // governance Gate-4 unhappy-path) — otherwise it'd be
+                        // handed a cached value the mechanism doesn't itself
+                        // trust yet, with no fault signal until the NEXT edge.
                         emits.push_back({cmd.key, *uw->last});
+                        if (uw->faulted)
+                            faults.push_back({cmd.key, true, "system bus lost"});
                     }
                 } else { // Cmd::Remove
                     auto kit = key_unit_.find(cmd.key);
@@ -623,7 +643,7 @@ private:
                     bus_ok_ = true;
                     fault_all(false, "recovered", faults);
                     for (auto& [name, uwp] : units_)
-                        arm_unit(bus, *uwp, emits);
+                        arm_unit(bus, *uwp, emits, faults);
                     dispatch(emits, faults);
                     spdlog::info("spark_service: system bus reconnected");
                 } else {
@@ -636,7 +656,7 @@ private:
                 for (auto& [name, uwp] : units_) {
                     if (uwp->next_backstop > now2)
                         continue;
-                    arm_unit(bus, *uwp, emits);
+                    arm_unit(bus, *uwp, emits, faults);
                 }
                 dispatch(emits, faults);
             }
@@ -1097,10 +1117,16 @@ private:
                     }
                     w->keys.insert(cmd.key);
                     key_svc_.emplace(cmd.key, folded);
-                    if (is_new)
+                    if (is_new) {
                         arm_watch(*w, emits, faults);
-                    else if (w->last)
+                    } else if (w->last) {
+                        // Same UP-2 fix as the Linux mechanism: hand a
+                        // newly-coalescing key the fault status too, not just
+                        // the cached state.
                         emits.push_back({cmd.key, *w->last});
+                        if (w->faulted)
+                            faults.push_back({cmd.key, true, "OpenService failed"});
+                    }
                 } else { // Cmd::Remove
                     auto kit = key_svc_.find(cmd.key);
                     if (kit == key_svc_.end())
