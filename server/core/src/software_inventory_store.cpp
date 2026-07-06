@@ -935,6 +935,36 @@ void SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
     });
 }
 
+std::vector<std::string> SoftwareInventoryStore::list_agent_ids(std::string_view source,
+                                                               std::string_view after_id,
+                                                               int limit) {
+    // KEYSET page over inventory_state for one source. The (agent_id, source) PK
+    // makes agent_id unique per source, so a plain `agent_id > $2 ORDER BY
+    // agent_id ASC LIMIT` walks the fleet with no DISTINCT and no unstable OFFSET.
+    // Bounded lease; empty on !open_ / no-lease / query error (degrade).
+    std::vector<std::string> out;
+    if (!open_ || source.empty())
+        return out;
+    int cap = limit > 0 ? limit : 1000;
+    if (cap > kFleetQueryRowCap)
+        cap = kFleetQueryRowCap;
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease)
+        return out;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT agent_id FROM software_inventory_store.inventory_state "
+        "WHERE source = $1 AND agent_id > $2 ORDER BY agent_id ASC LIMIT $3::bigint",
+        std::vector<std::string>{std::string(source), std::string(after_id), std::to_string(cap)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return out;
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        out.emplace_back(PQgetvalue(res.get(), i, 0));
+    return out;
+}
+
 std::optional<std::int64_t>
 SoftwareInventoryStore::count_stale_agents(std::int64_t stale_before_secs) {
     if (!open_)
