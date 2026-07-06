@@ -807,11 +807,16 @@ TEST_CASE("RbacStore: v1 -> v2 migration adds indices without data loss",
         REQUIRE_FALSE(index_exists(db, "idx_groups_source"));
         REQUIRE_FALSE(index_exists(db, "idx_group_members_username"));
 
-        // Seed data that must survive the upgrade.
+        // Seed data that must survive the upgrade. Deliberately a LOCAL
+        // group/membership, not an IdP-sourced one (#1837 v3 legitimately
+        // purges IdP-sourced group_members — that behavior is covered by
+        // its own dedicated migration test in test_oidc_principal_key.cpp;
+        // this test's purpose is unrelated generic data survival across the
+        // rest of the migration ladder).
         sqlite3_exec(db,
                     "INSERT INTO groups (name, description, source, external_id, created_at) "
-                    "VALUES ('entra:g1', 'seed', 'entra', 'g1', 100);"
-                    "INSERT INTO group_members (group_name, username) VALUES ('entra:g1', 'leo');"
+                    "VALUES ('seed-team', 'seed', 'local', '', 100);"
+                    "INSERT INTO group_members (group_name, username) VALUES ('seed-team', 'leo');"
                     "INSERT INTO roles (name, description, is_system, created_at) "
                     "VALUES ('Custom', 'seed role', 0, 100);",
                     nullptr, nullptr, nullptr);
@@ -819,7 +824,8 @@ TEST_CASE("RbacStore: v1 -> v2 migration adds indices without data loss",
     }
 
     // Reopen through the production constructor — runs the FULL migration
-    // list (v1 adoption no-op + v2 index creation) and seed_defaults().
+    // list (v1 adoption no-op + v2 index creation + v3 no-op for local
+    // groups) and seed_defaults().
     {
         RbacStore store(path);
         REQUIRE(store.is_open());
@@ -827,10 +833,10 @@ TEST_CASE("RbacStore: v1 -> v2 migration adds indices without data loss",
         // Pre-existing data preserved.
         auto groups = store.list_groups();
         auto found = std::find_if(groups.begin(), groups.end(),
-                                  [](const RbacGroup& g) { return g.name == "entra:g1"; });
+                                  [](const RbacGroup& g) { return g.name == "seed-team"; });
         REQUIRE(found != groups.end());
-        CHECK(found->source == "entra");
-        CHECK(store.get_group_members("entra:g1") == std::vector<std::string>{"leo"});
+        CHECK(found->source == "local");
+        CHECK(store.get_group_members("seed-team") == std::vector<std::string>{"leo"});
         CHECK(store.get_role("Custom").has_value());
 
         // v2 index creation — the store's own connection isn't reachable
