@@ -252,6 +252,47 @@ content_embed = custom_target(
   build_always_stale: true,  # always re-scan content/ for edits
 )
 
+# Build-time embed of the curated CPE map (PR 3, ADR-0018). Lives under
+# content/cpe-map/ deliberately — embed_content.py above globs ONLY
+# content/{definitions,packs}/**/*.yaml, so this CSV is NOT swept into the
+# Instruction-Engine bundle; it is embedded on its own as a std::string_view
+# (kCuratedCpeMap) that CpeIdentityResolver parses at construction.
+#
+# Fail-closed at CONFIGURE time (mirrors the PyYAML probe above): a curated map
+# with fewer than kMinCuratedRows (13) data rows would ship a resolver that
+# high-confidence-matches almost nothing, so refuse to build. The runtime ctor
+# enforces the same floor as defence-in-depth.
+cpe_map_csv = files('../../content/cpe-map/curated-cpe-map.csv')
+_cpe_probe = run_command(
+  embed_python, '-c',
+  '''import sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+print(sum(1 for l in lines if l.strip() and not l.strip().startswith("#")))''',
+  cpe_map_csv,
+  check: true,
+)
+_cpe_rows = _cpe_probe.stdout().strip().to_int()
+if _cpe_rows < 13
+  error(
+    'Curated CPE map has ' + _cpe_rows.to_string() + ' data rows but kMinCuratedRows '
+    + 'is 13 (server/core/src/cpe_identity_resolver.hpp). Fail-closed: a thin map '
+    + 'ships a resolver that high-confidence-matches almost nothing. See ADR-0018.'
+  )
+endif
+
+cpe_map_embed = custom_target(
+  'cpe_map_bundle',
+  input: cpe_map_csv,
+  output: 'cpe_map_bundle.cpp',
+  command: [
+    embed_python,
+    files('scripts/embed_binary.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'CuratedCpeMap',
+  ],
+)
+
 # Vendored Nayuki QR-Code-generator (MIT, pinned v1.8.0; see
 # server/core/vendor/qrcodegen/qrcodegen-NOTICE.txt). Built as its own
 # static lib with warnings off so third-party source does not trip our
@@ -294,7 +335,7 @@ yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_viz_host_js_embed, cytoscape_js_embed,
-   yuzu_css_embed, inter_embed, content_embed,
+   yuzu_css_embed, inter_embed, content_embed, cpe_map_embed,
   files(
     'src/server.cpp',
     'src/agent_registry.cpp',
@@ -317,6 +358,7 @@ yuzu_server_core_lib = static_library(
     'src/plugin_signing_helpers.cpp',
     'src/nvd_db.cpp',
     'src/nvd_version.cpp',
+    'src/cpe_identity_resolver.cpp',
     'src/nvd_client.cpp',
     'src/nvd_sync.cpp',
     'src/update_registry.cpp',
