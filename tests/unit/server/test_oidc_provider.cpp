@@ -9,8 +9,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <openssl/bn.h>
+#include <openssl/evp.h>
+#include <openssl/rsa.h> // EVP_RSA_gen
+
 #include <chrono>
+#include <memory>
 #include <string>
+#include <vector>
 
 using namespace yuzu::server::oidc;
 
@@ -717,4 +723,158 @@ TEST_CASE("OIDC: handle_callback with unknown state fails", "[oidc]") {
     auto result = provider.handle_callback("code", "nonexistent-state");
     CHECK_FALSE(result.has_value());
     CHECK(result.error().find("unknown") != std::string::npos);
+}
+
+// ── JWT signature verification (#1856 / #1782) ───────────────────────────────
+//
+// Regression guard for the CRITICAL fail-open where the Windows build stubbed
+// verify_jwt_signature to `return {}` (success) WITHOUT checking the signature,
+// accepting any forged RS256/384/512 token. The fix routes every platform
+// through the same OpenSSL EVP path. These cases assert the load-bearing
+// property the stub violated: verification must FAIL when it cannot actually
+// verify — never silently succeed. (They run identically on Windows now.)
+
+// Build a JWT with a caller-chosen header so we can exercise the alg guards.
+static std::string make_jwt_with_header(const std::string& header_json,
+                                        const std::string& payload_json) {
+    auto encode_part = [](const std::string& s) {
+        std::vector<uint8_t> bytes(s.begin(), s.end());
+        return OidcProvider::base64url_encode(bytes);
+    };
+    return encode_part(header_json) + "." + encode_part(payload_json) + ".c2ln";
+}
+
+TEST_CASE("OIDC: verify_jwt_signature fails closed when no signing key is available",
+          "[oidc][jwt][security]") {
+    // A structurally valid RS256 token, but the provider has no jwks_uri, so the
+    // JWKS cache stays empty and no key can be found. Pre-fix, the Windows build
+    // returned success here (forged-token acceptance); it must now be rejected.
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    // No jwks_uri, no redirect_uri → construction skips discovery/fetch.
+    OidcProvider provider(std::move(cfg));
+
+    auto jwt = make_jwt_with_header(R"({"alg":"RS256","kid":"nope","typ":"JWT"})",
+                                    R"({"sub":"attacker","exp":9999999999})");
+
+    auto result = provider.verify_jwt_signature(jwt);
+    REQUIRE_FALSE(result.has_value()); // MUST NOT fail open
+    CHECK(result.error().find("JWKS key") != std::string::npos);
+}
+
+TEST_CASE("OIDC: verify_jwt_signature rejects alg:none", "[oidc][jwt][security]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    auto jwt = make_jwt_with_header(R"({"alg":"none","typ":"JWT"})",
+                                    R"({"sub":"attacker","exp":9999999999})");
+
+    auto result = provider.verify_jwt_signature(jwt);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("none") != std::string::npos);
+}
+
+TEST_CASE("OIDC: verify_jwt_signature rejects unsupported alg (HS256 confusion)",
+          "[oidc][jwt][security]") {
+    // Reject symmetric/unsupported algorithms outright — an RS→HS key-confusion
+    // token must never reach the RSA verification path.
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    auto jwt = make_jwt_with_header(R"({"alg":"HS256","typ":"JWT"})",
+                                    R"({"sub":"attacker","exp":9999999999})");
+
+    auto result = provider.verify_jwt_signature(jwt);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("unsupported") != std::string::npos);
+}
+
+// Generate an RSA keypair, register its public half in `provider` as a JWKS key
+// under `kid`, and return a genuinely RS256-signed JWT over `payload_json`.
+// Drives the SAME jwk_to_pkey + EVP path that production uses. Returns "" on any
+// OpenSSL failure (the caller REQUIREs non-empty). Uses only non-deprecated
+// OpenSSL 3.0 EVP APIs, so it needs no deprecation pragmas.
+static std::string sign_and_register_rs256(OidcProvider& provider, const std::string& kid,
+                                           const std::string& payload_json) {
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pk(EVP_RSA_gen(2048), EVP_PKEY_free);
+    if (!pk)
+        return "";
+
+    // Modulus/exponent → base64url for the JWK the provider will cache.
+    BIGNUM* raw_n = nullptr;
+    BIGNUM* raw_e = nullptr;
+    if (EVP_PKEY_get_bn_param(pk.get(), "n", &raw_n) != 1 ||
+        EVP_PKEY_get_bn_param(pk.get(), "e", &raw_e) != 1) {
+        BN_free(raw_n);
+        BN_free(raw_e);
+        return "";
+    }
+    std::unique_ptr<BIGNUM, decltype(&BN_free)> bn_n(raw_n, BN_free);
+    std::unique_ptr<BIGNUM, decltype(&BN_free)> bn_e(raw_e, BN_free);
+
+    auto bn_to_b64url = [](const BIGNUM* bn) {
+        std::vector<uint8_t> buf(static_cast<size_t>(BN_num_bytes(bn)));
+        BN_bn2bin(bn, buf.data());
+        return OidcProvider::base64url_encode(buf);
+    };
+    if (!provider.add_test_jwks_key(kid, bn_to_b64url(bn_n.get()), bn_to_b64url(bn_e.get())))
+        return "";
+
+    auto b64 = [](const std::string& s) {
+        return OidcProvider::base64url_encode(std::vector<uint8_t>(s.begin(), s.end()));
+    };
+    std::string header = R"({"alg":"RS256","kid":")" + kid + R"(","typ":"JWT"})";
+    std::string signing_input = b64(header) + "." + b64(payload_json);
+
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> md(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+    if (!md || EVP_DigestSignInit(md.get(), nullptr, EVP_sha256(), nullptr, pk.get()) != 1)
+        return "";
+    const auto* in = reinterpret_cast<const unsigned char*>(signing_input.data());
+    size_t sig_len = 0;
+    if (EVP_DigestSign(md.get(), nullptr, &sig_len, in, signing_input.size()) != 1)
+        return "";
+    std::vector<uint8_t> sig(sig_len);
+    if (EVP_DigestSign(md.get(), sig.data(), &sig_len, in, signing_input.size()) != 1)
+        return "";
+    sig.resize(sig_len);
+
+    return signing_input + "." + OidcProvider::base64url_encode(sig);
+}
+
+TEST_CASE("OIDC: verify_jwt_signature accepts a valid RS256 signature and rejects tampering",
+          "[oidc][jwt][security]") {
+    // The load-bearing crypto round-trip: a token genuinely signed by the
+    // private key whose public half is cached MUST verify, and the same token
+    // with one flipped signature byte MUST be rejected. This exercises the real
+    // jwk_to_pkey + EVP_DigestVerify path the #1856 fix now runs on every
+    // platform — the earlier rejection-only tests never reach EVP.
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    auto jwt = sign_and_register_rs256(provider, "test-kid-1",
+                                       R"({"sub":"alice","exp":9999999999})");
+    REQUIRE_FALSE(jwt.empty()); // OpenSSL keygen/sign succeeded
+
+    // Positive: genuine signature over the cached key verifies.
+    auto ok = provider.verify_jwt_signature(jwt);
+    CHECK(ok.has_value());
+
+    // Negative: corrupt the first signature byte (top 6 bits of sig[0]) so the
+    // decoded signature is definitively different → EVP must reject it.
+    auto dot2 = jwt.rfind('.');
+    REQUIRE(dot2 != std::string::npos);
+    std::string forged = jwt;
+    forged[dot2 + 1] = (forged[dot2 + 1] == 'A') ? 'B' : 'A';
+    REQUIRE(forged != jwt);
+
+    auto bad = provider.verify_jwt_signature(forged);
+    REQUIRE_FALSE(bad.has_value()); // MUST NOT fail open
+    CHECK(bad.error().find("forged") != std::string::npos);
 }
