@@ -2814,6 +2814,9 @@ public:
             return;
         }
 
+        spdlog::info("[ADR-0022] on-behalf-of guard active: reserved headers rejected on "
+                     "HTTP (excl. health probes) and gRPC ingress; see "
+                     "docs/auth-architecture.md");
         spdlog::info("Yuzu Server listening on {} (agents) and {} (management)",
                      cfg_.listen_address, cfg_.management_address);
         if (gateway_service_) {
@@ -4684,15 +4687,27 @@ private:
             // sharing a source-IP bucket with authed REST traffic cannot
             // 429-starve the health probe. The endpoints themselves are
             // strictly read-only and documented as unauthenticated.
+            // Liveness/readiness probes are EXEMPT from the on-behalf-of guard
+            // below — a RECORDED ADR-0022 exception (documented in
+            // docs/auth-architecture.md; ledger entry lands with the ADR).
+            // Governance Gate 5 (CH-3/UP-5): a mesh/SSO proxy that stamps a
+            // reserved header on every request must not be able to 403 the
+            // probes and crash-loop the pod — a probe performs no
+            // identity-bearing action, nothing consumes the header on this
+            // path, and a bricked orchestrator hides the misconfiguration the
+            // guard exists to surface. Every other path rejects below.
+            if (req.path == "/livez" || req.path == "/readyz" || req.path == "/health" ||
+                req.path == "/api/health") {
+                return httplib::Server::HandlerResponse::Unhandled;
+            }
+
             // ADR-0022 Interim rules (execution-plan PR 1.1): the server accepts
             // NO on-behalf-of assertion on any surface until server-verifiable
             // delegation ships (Phase 5) — and client-asserted delegation stays
-            // rejected permanently even then. Reject (not ignore) FIRST — before
-            // the health early-return, auth, the unauthenticated allowlist, and
-            // the rate limiter — so coverage is literally universal: REST, MCP
-            // (same httplib instance), fragments, static, and even health probes
-            // (governance round 1: an exemption here would need an ADR-0022
-            // exception-ledger entry; five short compares per probe don't).
+            // rejected permanently even then. Reject (not ignore) before auth,
+            // the unauthenticated allowlist, and the rate limiter, so REST, MCP
+            // (same httplib instance), fragments, and static all reject; the four
+            // probe paths above are the single recorded exception.
             // Pre-limiter placement means a reserved-header flood gets per-request
             // 403s, not 429s — the scan is cheaper than the limiter lookup, and
             // the warn is throttled in note_rejection so the flood can't fill the
@@ -4724,11 +4739,6 @@ private:
                                            "assertions rejected' (ADR-0022)"}),
                     "application/json");
                 return httplib::Server::HandlerResponse::Handled;
-            }
-
-            if (req.path == "/livez" || req.path == "/readyz" || req.path == "/health" ||
-                req.path == "/api/health") {
-                return httplib::Server::HandlerResponse::Unhandled;
             }
 
             // Rate limiting — check before auth to protect against brute force.

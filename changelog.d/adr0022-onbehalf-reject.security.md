@@ -2,8 +2,10 @@
   (ADR-0022 Interim rules).** Five header/metadata names are reserved —
   `On-Behalf-Of`, `X-On-Behalf-Of`, `X-Yuzu-On-Behalf-Of`,
   `X-Yuzu-Delegated-Operator`, `X-Yuzu-Delegation-Artifact` (case-insensitive)
-  — and any HTTP request carrying one (REST, MCP, dashboard, static, health)
-  receives `403` with the A4 error envelope before authentication; a gRPC call
+  — and any HTTP request carrying one (REST, MCP, dashboard, static)
+  receives `403` with the A4 error envelope before authentication (sole
+  recorded exception: the four health-probe paths ignore the header, so a
+  header-stamping proxy cannot crash-loop the server); a gRPC call
   carrying one as a metadata key is cancelled at a server interceptor
   (best-effort cancel — see `docs/auth-architecture.md` for the semantics). Nothing
   previously consumed these headers, so no legitimate integration breaks — but

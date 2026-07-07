@@ -1065,10 +1065,16 @@ the list only ever grows): `On-Behalf-Of`, `X-On-Behalf-Of`,
 `X-Yuzu-On-Behalf-Of`, `X-Yuzu-Delegated-Operator`,
 `X-Yuzu-Delegation-Artifact`.
 
-Enforcement: **HTTP** — first check in the pre-routing chokepoint
-(`server.cpp`), before auth, the allowlist, and the rate limiter, so REST,
-MCP, dashboard fragments, static files, and health probes all reject with
-`403` + the A4 error envelope. **gRPC** — a single server interceptor on the
+Enforcement: **HTTP** — checked in the pre-routing chokepoint (`server.cpp`)
+before auth, the allowlist, and the rate limiter, so REST, MCP, dashboard
+fragments, and static files all reject with `403` + the A4 error envelope.
+**Recorded exception (the only one):** the four liveness/readiness probe
+paths (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt — a
+mesh/SSO proxy that stamps a reserved header on every request must not be
+able to fail the probes and crash-loop the server (governance CH-3/UP-5); a
+probe performs no identity-bearing action and nothing consumes the header on
+that path. This exception is recorded in ADR-0022's exception ledger on
+acceptance. **gRPC** — a single server interceptor on the
 one `ServerBuilder` (`grpc_on_behalf_interceptor.hpp`) covers the agent,
 management, and gateway-upstream services and every future RPC method by
 construction; a call carrying a reserved metadata key is cancelled (client
@@ -1080,7 +1086,11 @@ rejected — tracked as a follow-up (Erlang-side reject) rather than an
 exception. Rejections are counted in
 `yuzu_onbehalf_rejected_total{surface,event="security"}`; there is
 deliberately **no audit row** (the rejection fires pre-auth, so there is no
-resolved principal to attribute — the metric is the signal). When delegation
+resolved principal to attribute — the metric is the signal). **Accepted
+evidence limit:** the warn log is sampled (1 per 100 rejections per surface,
+a deliberate pre-rate-limiter flood defence), so the counter proves *how
+many* attempts occurred while only ~1% carry a forensic log line with
+timestamp/source — state this plainly if asked "can you show every attempt". When delegation
 ships it will use a **server-issued artifact**, never a client-asserted
 header, so these names stay rejected on client ingress permanently.
 
