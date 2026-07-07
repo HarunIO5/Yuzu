@@ -177,6 +177,24 @@ void RbacStore::create_tables() {
             CREATE INDEX IF NOT EXISTS idx_groups_source ON groups(source);
             CREATE INDEX IF NOT EXISTS idx_group_members_username ON group_members(username);
         )"},
+        // #1837 — purge orphaned display-name-keyed IdP memberships. Before
+        // this migration, OIDC-sourced `group_members` rows were keyed on
+        // the (mutable) display name; SSO sessions now key on the stable
+        // `oidc:<iss>#<sub>` principal instead (auth.cpp
+        // create_oidc_session). Left in place, these rows would become BOTH
+        // orphaned (never re-referenced by the new stable-keyed principal)
+        // AND a resurrected confused-deputy hazard: a LOCAL user who
+        // happens to share the old display name would silently inherit
+        // whatever roles the stale IdP-sourced group grants. Deleting every
+        // `group_members` row whose group is IdP-sourced (`groups.source !=
+        // 'local'`) is additive/safe — it only removes membership rows;
+        // `groups`/`roles`/`role_permissions`/local memberships are
+        // untouched, and IdP membership re-populates (under the new stable
+        // key) on the user's next SSO login via `reconcile_idp_memberships`.
+        {3, R"(
+            DELETE FROM group_members
+            WHERE group_name IN (SELECT name FROM groups WHERE source != 'local');
+        )"},
     };
     if (!MigrationRunner::run(db_, "rbac_store", kMigrations)) {
         spdlog::error("RbacStore: schema migration failed, closing database");

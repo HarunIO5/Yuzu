@@ -90,6 +90,7 @@
 #include "preflight_routes.hpp"
 #include "verify_routes.hpp"
 #include "preflight_run_store.hpp"
+#include "vuln_finding_store.hpp"
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
@@ -293,6 +294,20 @@ public:
           api_rate_limiter_(cfg_.rate_limit), login_rate_limiter_(cfg_.login_rate_limit) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
+        metrics_.describe("yuzu_nvd_total_cves", "Distinct CVEs in the local NVD catalog", "gauge");
+        metrics_.describe("yuzu_nvd_backfill_complete",
+                          "1 when the newest-first NVD backfill has reached its floor, else 0",
+                          "gauge");
+        metrics_.describe("yuzu_nvd_sync_failures_total",
+                          "NVD sync window failures by reason (connection/http_429/http_403/"
+                          "http_other/parse)",
+                          "counter");
+        // Initialise every reason series to 0 so the counter (and its HELP/TYPE)
+        // is present in /metrics on a healthy server — otherwise absent()-style
+        // alerts misfire and Grafana shows "No data" until the first failure (sre).
+        for (auto r : kNvdCountedReasons) {
+            metrics_.counter("yuzu_nvd_sync_failures_total", {{"reason", nvd_reason_label(r)}});
+        }
         metrics_.describe("yuzu_server_default_certs_active",
                           "1 when running with built-in per-install default certificates, else 0",
                           "gauge");
@@ -713,6 +728,14 @@ public:
         // "Sign out everywhere" which also revokes API tokens).
         metrics_.describe("yuzu_auth_sessions_revoked_total",
                           "Total session revocations, by caller, result, and scope", "counter");
+        // Durable SSO identity provisioning observability (#1852 governance
+        // round, sec-LOW/UP-5). Incremented on every successful
+        // upsert_sso_identity call (first-provision AND re-login refresh),
+        // labelled by source so an IdP-side provisioning flood is visible
+        // independently of ordinary login volume.
+        metrics_.describe("yuzu_auth_sso_provision_total",
+                          "Total durable SSO identity provision/refresh upserts, by source",
+                          "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -1155,8 +1178,11 @@ public:
         nvd_db_ = std::make_shared<NvdDatabase>(nvd_path);
 
         if (cfg_.nvd_sync_enabled && nvd_db_->is_open()) {
-            nvd_sync_ = std::make_unique<NvdSyncManager>(nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy,
-                                                         cfg_.nvd_sync_interval);
+            nvd_sync_ = std::make_unique<NvdSyncManager>(
+                nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy, cfg_.nvd_sync_interval,
+                cfg_.nvd_backfill_years);
+            // Failure counts are surfaced via SyncStatus and emitted from the /metrics
+            // scrape (pull model, #1909) — no sync-thread→metrics_ callback.
             // #1867: do NOT start the background thread here. Its first action is
             // an uncancellable NVD fetch; if a LATER ctor step fails closed (e.g.
             // the Postgres substrate probe below sets startup_failed_), ~ServerImpl
@@ -1274,6 +1300,19 @@ public:
             if (!deployment_run_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: deployment-run store migration/open failed "
                               "(database reachable but the deployment_run_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            }
+        }
+
+        // VulnFindingStore — born-on-PG CAVM findings + coverage projection.
+        // Same fail-CLOSED construction posture as the run stores (ADR-0012 §1).
+        // DORMANT: no matching engine writes to it yet (PR 4).
+        if (pg_pool_ && !startup_failed_) {
+            vuln_finding_store_ = std::make_unique<VulnFindingStore>(*pg_pool_);
+            if (!vuln_finding_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: vuln-finding store migration/open failed "
+                              "(database reachable but the vuln_finding_store schema could not be "
                               "created/opened)");
                 startup_failed_ = true;
             }
@@ -3315,6 +3354,10 @@ public:
         // (no background thread in slice 1, but keep the ADR-0012 teardown
         // discipline so a future DeploymentRunner can't UAF).
         deployment_run_store_.reset();
+        // VulnFindingStore borrows pg_pool_ — drop before the pool (no background
+        // thread this PR; keep the ADR-0012 teardown discipline so a future engine
+        // can't UAF).
+        vuln_finding_store_.reset();
         // Same discipline for the software-inventory store (gov cpp-safety): null the
         // borrowed raw pointers in both ingest services, then drop the store, BEFORE
         // the pool — otherwise the store briefly holds a dangling PgPool& after the
@@ -4795,6 +4838,33 @@ private:
                 metrics_.gauge("yuzu_server_group_members_total")
                     .set(static_cast<double>(mgmt_group_store_->count_all_members()));
             }
+            // Refresh NVD backfill gauges (multi-hour background job — needs to be
+            // observable; governance sre BLOCKING).
+            if (nvd_db_ && nvd_db_->is_open()) {
+                metrics_.gauge("yuzu_nvd_total_cves")
+                    .set(static_cast<double>(nvd_db_->total_cve_count()));
+                if (nvd_sync_) {
+                    auto st = nvd_sync_->status();
+                    metrics_.gauge("yuzu_nvd_backfill_complete").set(st.backfill_complete ? 1 : 0);
+                    // Pull model (#1909): the manager holds the authoritative monotonic
+                    // per-reason failure counts; emit them as yuzu_nvd_sync_failures_total by
+                    // incrementing the exported series by the delta since the last scrape
+                    // (Counter has no set()). No sync-thread→metrics_ callback → no teardown race.
+                    // The whole loop is serialized so two CONCURRENT /metrics scrapes (an HA
+                    // Prometheus pair) can't both read the same value(), compute the same delta,
+                    // and double-increment the counter (which would then stall until the real
+                    // tally re-exceeds it).
+                    std::lock_guard<std::mutex> emit_lock{nvd_metrics_scrape_mu_};
+                    for (auto r : kNvdCountedReasons) {
+                        const int i = nvd_reason_index(r);
+                        auto& c = metrics_.counter("yuzu_nvd_sync_failures_total",
+                                                   {{"reason", nvd_reason_label(r)}});
+                        const double delta = static_cast<double>(st.failure_counts[i]) - c.value();
+                        if (delta > 0)
+                            c.increment(delta);
+                    }
+                }
+            }
             res.set_content(metrics_.serialize(), "text/plain; version=0.0.4; charset=utf-8");
         });
 
@@ -4856,6 +4926,7 @@ private:
                 offline_endpoint_store_ && offline_endpoint_store_->is_open();
             bool software_inventory_ok =
                 software_inventory_store_ && software_inventory_store_->is_open();
+            bool vuln_finding_ok = vuln_finding_store_ && vuln_finding_store_->is_open();
             bool app_perf_daily_ok = app_perf_daily_store_ && app_perf_daily_store_->is_open();
             bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
             bool device_inventory_ok =
@@ -4866,8 +4937,9 @@ private:
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
                                  guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
-                                 offline_endpoint_ok && software_inventory_ok && app_perf_daily_ok &&
-                                 app_perf_fleet_ok && device_inventory_ok && approval_ok;
+                                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
+                                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok &&
+                                 approval_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4885,6 +4957,7 @@ private:
                   {"ca", ca_ok ? "ok" : "error"},
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
                   {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
+                  {"vuln_finding_store", vuln_finding_ok ? "ok" : "error"},
                   {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"},
                   {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"},
                   {"device_inventory_store", device_inventory_ok ? "ok" : "error"}}},
@@ -5052,6 +5125,11 @@ private:
                 // ingest and no readiness signal — surface it (gov Pattern E).
                 {"software_inventory_store",
                  software_inventory_store_ && software_inventory_store_->is_open()},
+                // CAVM born-on-PG store (ADR-0012). Fail-closed at boot; a
+                // not-open post-boot state means the PR-4 matching engine would
+                // silently no-op findings persistence — surface it (Pattern E).
+                {"vuln_finding_store",
+                 vuln_finding_store_ && vuln_finding_store_->is_open()},
                 {"app_perf_daily_store",
                  app_perf_daily_store_ && app_perf_daily_store_->is_open()},
                 {"app_perf_fleet_store",
@@ -5559,8 +5637,17 @@ private:
             auto session = require_auth(req, res);
             if (!session)
                 return;
+            // #1837: `username` is the STABLE authorization principal (an
+            // opaque `oidc:<iss>#<sub>` id for SSO sessions) — never render
+            // it alone as the nav-bar identity. `display_name` is the
+            // human-readable label consumed by every page's nav/context
+            // bar JS below; falls back to `username` for a legacy session
+            // created before this field existed.
             auto j = nlohmann::json(
-                {{"username", session->username}, {"role", auth::role_to_string(session->role)}});
+                {{"username", session->username},
+                {"display_name",
+                 session->display_name.empty() ? session->username : session->display_name},
+                {"role", auth::role_to_string(session->role)}});
             // Add RBAC role if enabled
             if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
                 j["rbac_enabled"] = true;
@@ -5865,13 +5952,20 @@ private:
                                  return;
                              }
                              nlohmann::json j;
-                             j["enabled"] = true;
+                             // "enabled" reflects whether the sync manager exists, not
+                             // merely whether the DB file is open: under --no-nvd-sync the
+                             // catalog DB is still open (for matching) but sync is off, so
+                             // reporting enabled=true then 503-ing POST /api/nvd/sync was
+                             // contradictory (#1889 review r2).
+                             j["enabled"] = (nvd_sync_ != nullptr);
                              j["total_cves"] = nvd_db_->total_cve_count();
                              if (nvd_sync_) {
                                  auto st = nvd_sync_->status();
                                  j["syncing"] = st.syncing;
                                  j["last_sync_time"] = st.last_sync_time;
                                  j["last_error"] = st.last_error;
+                                 j["backfill_complete"] = st.backfill_complete;
+                                 j["backfill_oldest_published"] = st.backfill_oldest_published;
                              }
                              res.set_content(j.dump(), "application/json");
                          });
@@ -5887,8 +5981,10 @@ private:
                     "application/json");
                 return;
             }
-            // Run sync in a detached thread so we don't block the HTTP response
-            std::thread([this] { nvd_sync_->sync_now(); }).detach();
+            // Ask the background loop to sync at its next wake and return at once.
+            // (A detached thread here could outlive the manager and use-after-free
+            // db_/fetcher_ during the hours-long backfill — governance BLOCKING.)
+            nvd_sync_->request_sync();
             res.set_content(R"({"status":"sync_started"})", "application/json");
         });
 
@@ -5903,7 +5999,7 @@ private:
                     "application/json");
                 return;
             }
-            // Parse inventory: array of {name, version} or pipe-delimited lines
+            // Parse inventory: JSON body with an "inventory" array of {name, version}.
             std::vector<SoftwareItem> inventory;
             try {
                 auto body = nlohmann::json::parse(req.body);
@@ -10667,6 +10763,9 @@ private:
     // NVD CVE feed
     std::shared_ptr<NvdDatabase> nvd_db_;
     std::unique_ptr<NvdSyncManager> nvd_sync_;
+    // Serializes the /metrics emit of yuzu_nvd_sync_failures_total so two concurrent scrapes
+    // can't double-apply the same per-reason delta (#1912 review).
+    mutable std::mutex nvd_metrics_scrape_mu_;
 
     // OTA agent updates
     std::unique_ptr<UpdateRegistry> update_registry_;
@@ -10685,6 +10784,10 @@ private:
     /// declared after it so it destructs before the pool; reset in stop().
     std::unique_ptr<PreflightRunStore> preflight_run_store_;
     std::unique_ptr<DeploymentRunStore> deployment_run_store_;
+    /// Born-on-PG CAVM findings + per-agent coverage projection (ADR-0012).
+    /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
+    /// DORMANT this PR: constructed + wired into /readyz+/healthz, no engine yet.
+    std::unique_ptr<VulnFindingStore> vuln_finding_store_;
     std::unique_ptr<AuditStore> audit_store_;
     std::unique_ptr<TagStore> tag_store_;
 
