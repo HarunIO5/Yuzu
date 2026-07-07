@@ -1880,8 +1880,68 @@ public:
                             heartbeat_ctx_.store(nullptr, std::memory_order_release);
                             if (!status.ok()) {
                                 spdlog::warn("Heartbeat failed: {}", status.error_message());
+                                // Orphan condition (#1894): the Subscribe stream is
+                                // still up but the server rejects our session —
+                                // NOT_FOUND (reaped as stale / forgotten across a
+                                // server restart) or UNAUTHENTICATED (session auth
+                                // expired, e.g. a mid-session cert rotation). The
+                                // stream never breaks for these, so the Read-loop
+                                // reconnect never fires and we would heartbeat a
+                                // dead session forever. Other codes (UNAVAILABLE /
+                                // DEADLINE_EXCEEDED) break the stream naturally and
+                                // are already covered. Force a reconnect by
+                                // cancelling the Subscribe stream.
+                                const auto hb_code = status.error_code();
+                                if (hb_code == grpc::StatusCode::NOT_FOUND ||
+                                    hb_code == grpc::StatusCode::UNAUTHENTICATED) {
+                                    // A successful Register resets reconnect_count
+                                    // (the normal backoff), so without a damper here
+                                    // a server that reaps every fresh session would
+                                    // drive a fleet-wide register→beat→reject→
+                                    // register storm (governance UP-1). Apply an
+                                    // escalating, capped, cancellable cooldown keyed
+                                    // on forced_rereg_streak_ (a member, so it
+                                    // survives the reconnect; reset on a healthy
+                                    // beat below).
+                                    constexpr auto kBase = std::chrono::seconds{2};
+                                    constexpr auto kCap = std::chrono::seconds{300};
+                                    // Cap the counter itself at 8 (not just the
+                                    // shift) so it can never overflow to a negative
+                                    // shift over a very long-lived orphan; streak 8
+                                    // already pins the cooldown at kCap. Serialized
+                                    // heartbeat threads → load/store is race-free.
+                                    const int streak = forced_rereg_streak_.load(
+                                        std::memory_order_acquire);
+                                    forced_rereg_streak_.store(std::min(streak + 1, 8),
+                                                               std::memory_order_release);
+                                    const auto cooldown =
+                                        std::min(kBase * (1 << std::min(streak, 8)), kCap);
+                                    spdlog::warn("Server rejected our session ({}) — "
+                                                 "re-registering after {}s (#1894)",
+                                                 status.error_message(),
+                                                 static_cast<long long>(cooldown.count()));
+                                    for (auto left = cooldown;
+                                         left.count() > 0 && !should_stop();) {
+                                        const auto slice = std::min<std::chrono::seconds>(
+                                            left, std::chrono::seconds{5});
+                                        std::this_thread::sleep_for(slice);
+                                        left -= slice;
+                                    }
+                                    if (!should_stop()) {
+                                        if (auto* sctx = subscribe_ctx_.load(
+                                                std::memory_order_acquire)) {
+                                            sctx->TryCancel();
+                                        }
+                                    }
+                                    break; // this connection is done; a fresh
+                                           // heartbeat thread spawns on reconnect
+                                }
                             } else {
                                 spdlog::debug("Heartbeat acknowledged (uptime={}s)", uptime);
+                                // Healthy beat — session is valid again; clear the
+                                // storm damper so a later isolated rejection starts
+                                // from the base cooldown (#1894).
+                                forced_rereg_streak_.store(0, std::memory_order_release);
                             }
                         }
                         heartbeat_ctx_.store(nullptr, std::memory_order_release);
@@ -2376,6 +2436,12 @@ private:
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> heartbeat_stop_{false};
     std::atomic<bool> sync_stop_{false}; // ADR-0016 daily-sync thread stop flag
+    // Consecutive session-rejection-forced re-registrations (#1894). A successful
+    // Register resets the normal reconnect backoff, so a server that reaps every
+    // fresh session would otherwise drive a fleet-wide re-registration storm; the
+    // heartbeat path applies its own escalating cooldown keyed on this counter,
+    // which survives across re-registrations and resets on a healthy heartbeat.
+    std::atomic<int> forced_rereg_streak_{0};
     // Set when run() returns due to a fatal STARTUP failure (the #1303 fail-closed
     // TLS posture refused to connect, or an unreadable cert/key) — not a normal
     // stop(). main() maps it to a non-zero exit. Single-threaded: written in run()
