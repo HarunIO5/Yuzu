@@ -8,9 +8,18 @@
 #include <unordered_map>
 #include <vector>
 
-#ifndef _WIN32
+// OpenSSL is an unconditional server dependency on every platform (vcpkg.json;
+// server/core/meson.build hard-errors without it). JWT/JWKS RSA verification
+// therefore uses the same OpenSSL EVP path everywhere — see verify_jwt_signature
+// (#1856/#1782: the old Windows build stubbed verification out and returned
+// success without checking the signature, accepting forged tokens).
+//
+// <openssl/evp.h> alone is safe to expose from this header: it declares none of
+// the wincrypt.h-shadowed symbols (X509_NAME, OCSP_*, PKCS7_*), so a Windows
+// consumer that includes <windows.h> before this header does not hit the macro
+// clash. If a future edit adds <openssl/x509.h> (etc.) here, that guarantee
+// breaks — such includers would then need OpenSSL-before-windows.h ordering.
 #include <openssl/evp.h>
-#endif
 
 namespace yuzu::server::oidc {
 
@@ -50,6 +59,22 @@ struct IdTokenClaims {
     int64_t iat{0};
     int64_t nbf{0}; // not-before (RFC 7519 §4.1.5); 0 = absent
     std::vector<std::string> groups; // Entra security group object IDs
+    /// True iff the token payload actually contained a `groups` key (even an
+    /// empty array). Distinguishes "IdP asserted zero groups" (a genuine
+    /// deprovisioning event) from "IdP omitted the claim" — Entra drops
+    /// `groups` entirely once a user belongs to more groups than fit in the
+    /// token and sends a `_claim_names`/`_claim_sources` overage pointer
+    /// instead (see `groups_overage`). `reconcile_idp_memberships` MUST NOT
+    /// run against an empty `groups` vector unless this is true, or a
+    /// heavily-grouped legitimate user gets every IdP-sourced RBAC
+    /// membership silently deleted on next login (governance UP-1).
+    bool groups_claim_present{false};
+    /// True when the token carries Entra/Graph group-overage indicators — a
+    /// `_claim_names` object with a `"groups"` entry and/or a
+    /// `_claim_sources` object — meaning the IdP could NOT fit the user's
+    /// full group membership in the token. `claims.groups` is therefore
+    /// partial/absent, never authoritative, for this login.
+    bool groups_overage{false};
     /// RFC 8176 Authentication Method Reference values asserted by the IdP
     /// (Entra adds the non-standard "mfa" value). Parsed so /auth/callback
     /// can seed the session's MFA-verified timestamp when the IdP attests a
@@ -57,13 +82,22 @@ struct IdTokenClaims {
     std::vector<std::string> amr;
 };
 
+/// True when `claims.groups` is safe to reconcile against the RBAC store as
+/// the user's COMPLETE asserted group set for this login (upsert asserted +
+/// DELETE everything else under that source). False when the IdP omitted the
+/// `groups` claim or replaced it with an overage pointer — in either case the
+/// caller must SKIP reconciliation entirely (leave existing memberships
+/// untouched) rather than treat an unreadable claim as "the user is in zero
+/// groups". Mirrors the `amr_asserts_mfa` free-function pattern
+/// (`mfa_step_up.hpp`) so the decision is unit-testable without a live route
+/// harness. Governance UP-1 (#1832 hardening round).
+[[nodiscard]] bool groups_claim_reconcilable(const IdTokenClaims& claims);
+
 /// Cached JWK public key for JWT signature verification.
 struct CachedJwk {
     std::string kid;
     std::string alg;
-#ifndef _WIN32
     std::shared_ptr<EVP_PKEY> pkey; // shared_ptr with custom deleter for RAII
-#endif
 };
 
 class OidcProvider {
@@ -90,6 +124,15 @@ public:
     static std::string generate_code_verifier();
     static std::string compute_code_challenge(const std::string& verifier);
     static std::expected<IdTokenClaims, std::string> parse_id_token(const std::string& jwt);
+
+    /// Test-only seam (#1856): inject an RSA verifying key into the JWKS cache
+    /// directly, bypassing the network fetch, so verify_jwt_signature can be
+    /// exercised end-to-end (jwk_to_pkey + EVP_DigestVerify) without a live IdP.
+    /// `n_b64url`/`e_b64url` are the base64url RSA modulus/exponent (JWK form).
+    /// Returns false if the key material does not parse. NOT for production use —
+    /// this mutates the trusted signing-key cache and has no production callers.
+    bool add_test_jwks_key(const std::string& kid, const std::string& n_b64url,
+                           const std::string& e_b64url);
 
     std::expected<void, std::string> validate_claims(const IdTokenClaims& claims,
                                                      const std::string& expected_nonce) const;
