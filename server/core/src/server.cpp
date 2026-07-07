@@ -4719,8 +4719,9 @@ private:
                         "on-behalf-of assertions are not accepted on any surface (ADR-0022); "
                         "remove the reserved header",
                         detail::A4ErrorOpts{
-                            .remediation = "docs/adr/0022-headless-platform-use-case-engines.md "
-                                           "Interim rules"}),
+                            .remediation = "remove the reserved header; see "
+                                           "docs/auth-architecture.md 'On-behalf-of "
+                                           "assertions rejected' (ADR-0022)"}),
                     "application/json");
                 return httplib::Server::HandlerResponse::Handled;
             }
@@ -4891,7 +4892,7 @@ private:
             }
 
             // principal_class: bounded presentation-level actor class (ADR-0022,
-            // execution-plan PR 1.2) — human / agent today, engine reserved for
+            // execution-plan PR 1.2) — human / agent / none today, engine reserved for
             // Phase 4. See principal_class.hpp for the classification contract.
             metrics_
                 .counter("yuzu_http_requests_total",
