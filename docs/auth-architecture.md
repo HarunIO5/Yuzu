@@ -1082,7 +1082,7 @@ observes `CANCELLED`; best-effort — the handler may still run, tolerable
 because no handler reads these keys). **Gateway note:** the Erlang gateway's
 own agent-facing listener reads only its known metadata keys and mints fresh
 upstream calls, so a reserved key sent to the gateway is dropped rather than
-rejected — tracked as a follow-up (Erlang-side reject) rather than an
+rejected — tracked as a follow-up (Erlang-side reject, #1974) rather than an
 exception. Rejections are counted in
 `yuzu_onbehalf_rejected_total{surface,event="security"}`; there is
 deliberately **no audit row** (the rejection fires pre-auth, so there is no
