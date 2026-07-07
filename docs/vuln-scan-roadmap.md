@@ -2,11 +2,11 @@
 
 **Status:** working roadmap for the vuln_scan / CAVM workstream (owner: Andy / @lesault).
 **Created:** 2026-06-30.
-**Last reconciled:** 2026-07-07 — against ADR-0022 (headless platform; placement note below).
+**Last reconciled:** 2026-07-08 — against ADR-0022 (headless platform; placement note below, extended for ADR-4001).
 Previously 2026-07-01 — against ADR-0018 (D1 wire-format correction, no-exceptions
 KEV-pre-filter strike, Lane 1/2/3 routing) and ADR-0019 (tri-state findings + coverage dimension).
 
-> **Placement note (2026-07-07, ADR-0022 reconciliation).** The in-server home of this ladder's
+> **Placement note (2026-07-07/08, ADR-0022 reconciliation).** The in-server home of this ladder's
 > correlation work is **interim**: vulnerability management's long-term home is the first
 > use-case-engine module (ADR-0022 + `docs/adr-0022-execution-plan.md`), and the ADR-0023 stack
 > (M1a/M1b scope: engine, findings store, triggers, securable, findings routes) is absorbed into
@@ -18,8 +18,8 @@ KEV-pre-filter strike, Lane 1/2/3 routing) and ADR-0019 (tri-state findings + co
 > ≠ the execution plan's UCE M1–M4 — always qualify which ladder a bare "M-number" means.
 > Sequencing within M1a/M1b remains this roadmap's call; beyond it, scheduling is contingent on
 > the ADR-0022 Decision-2 boundary test, adjudicated by the maintainer through governance — not
-> by either document. Details: execution plan § "Relationship to ADR-0023"; ADR-0023's own
-> placement note.
+> by either document. Details: execution plan § "Relationship to ADR-0023 and ADR-4001"; ADR-0023's and
+> ADR-4001's own placement notes.
 
 This roadmap is the **canonical sequencing** for the workstream. It reconciles three views into
 one ordered plan:
