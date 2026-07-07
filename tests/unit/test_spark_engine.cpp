@@ -334,12 +334,16 @@ TEST_CASE("SparkEngine: a handler blocked past the shutdown budget is detached, 
         std::condition_variable cv;
         bool release = false;
         std::atomic<bool> in_handler{false};
+        std::atomic<bool> finished{false}; // confirms the detached thread actually wakes
     };
     auto sync = std::make_shared<Sync>();
     auto consumer = engine.register_consumer("blocker", [sync](const SparkEvent&) {
         sync->in_handler.store(true);
-        std::unique_lock lk(sync->m);
-        sync->cv.wait(lk, [&] { return sync->release; }); // block until the test frees us
+        {
+            std::unique_lock lk(sync->m);
+            sync->cv.wait(lk, [&] { return sync->release; }); // block until the test frees us
+        }
+        sync->finished.store(true);
     });
     REQUIRE(consumer.has_value());
     REQUIRE(engine.arm(*consumer, interval_spec(20)).has_value());
@@ -353,12 +357,15 @@ TEST_CASE("SparkEngine: a handler blocked past the shutdown budget is detached, 
     CHECK(elapsed < 2000ms); // bounded (budget 120ms + generous slack), not hung
     CHECK(engine.stats().consumer_threads_detached >= 1);
 
-    // Free the detached handler so its thread exits cleanly (no leaked blocker).
+    // Free the detached handler so its thread exits cleanly (no leaked blocker),
+    // and confirm it actually does — a broken release/wakeup path would otherwise
+    // leave the thread parked forever without failing anything.
     {
         std::lock_guard lk(sync->m);
         sync->release = true;
     }
     sync->cv.notify_all();
+    CHECK(eventually([&] { return sync->finished.load(); }));
 }
 
 TEST_CASE("SparkEngine: N blocked handlers detach against ONE shared budget, not N× (UP2-3)",
@@ -374,12 +381,16 @@ TEST_CASE("SparkEngine: N blocked handlers detach against ONE shared budget, not
         std::condition_variable cv;
         bool release = false;
         std::atomic<int> wedged{0};
+        std::atomic<int> finished{0}; // confirms every detached thread actually wakes
     };
     auto sync = std::make_shared<Sync>();
     auto blocker = [sync](const SparkEvent&) {
         sync->wedged.fetch_add(1);
-        std::unique_lock lk(sync->m);
-        sync->cv.wait(lk, [&] { return sync->release; });
+        {
+            std::unique_lock lk(sync->m);
+            sync->cv.wait(lk, [&] { return sync->release; });
+        }
+        sync->finished.fetch_add(1);
     };
     for (int i = 0; i < 3; ++i) {
         auto c = engine.register_consumer("blk" + std::to_string(i), blocker);
@@ -402,6 +413,7 @@ TEST_CASE("SparkEngine: N blocked handlers detach against ONE shared budget, not
         sync->release = true;
     }
     sync->cv.notify_all();
+    CHECK(eventually([&] { return sync->finished.load() >= 3; }));
 }
 
 TEST_CASE("SparkEngine: inline tier runs on the watcher thread and is duration-accounted",
