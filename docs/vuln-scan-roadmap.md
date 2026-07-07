@@ -11,7 +11,8 @@ KEV-pre-filter strike, Lane 1/2/3 routing) and ADR-0019 (tri-state findings + co
 > use-case-engine module (ADR-0022 + `docs/adr-0022-execution-plan.md`), and the ADR-0023 stack
 > (M1a/M1b scope: engine, findings store, triggers, securable, findings routes) is absorbed into
 > ADR-0022's grandfathered surface #2 — re-homed and eventually deleted by that plan's Phase-7
-> strangler. Each further in-server PR on this ladder grows that deletion scope; milestones beyond
+> strangler — as is the ADR-4001 `/vuln` dashboard lens + `attack_path_engine` (2026-07-08, same
+> terms; ADR-4002's scoring substrate is NOT absorbed and faces its own boundary review). Each further in-server PR on this ladder grows that deletion scope; milestones beyond
 > M1a/M1b (M2 enrichment onward, M3–M6 graph/CAVM scoring) face ADR-0022 Decision 2's boundary
 > test fresh before implementation. Milestone vocabularies collide: this ladder's M1a/M1b + M2–M6
 > ≠ the execution plan's UCE M1–M4 — always qualify which ladder a bare "M-number" means.
