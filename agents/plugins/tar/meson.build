@@ -11,6 +11,7 @@ if host_machine.system() == 'windows'
   tar_deps += cxx.find_library('wintrust') # WinVerifyTrust — image signing (tar_module_etw)
   tar_deps += cxx.find_library('crypt32')  # CryptQueryObject — signer extraction (tar_module_etw)
   tar_deps += cxx.find_library('version')  # GetFileVersionInfoW / VerQueryValueW (tar_proc_perf)
+  tar_deps += cxx.find_library('wevtapi')  # EvtQuery / EvtNext / EvtRender (tar_netconn_win)
   tar_deps += cxx.find_library('mpr')      # WNetOpenEnumW / WNetGetUserW — outbound mapped drives (tar_mapdrive_collector)
   tar_deps += cxx.find_library('netapi32') # NetSessionEnum — inbound share sessions (tar_mapdrive_collector)
 elif host_machine.system() == 'darwin'
@@ -44,6 +45,8 @@ shared_library(
     'src/tar_aggregator.cpp',
     'src/tar_sql_executor.cpp',
     'src/tar_network_collector.cpp',
+    'src/tar_netqual_boot.cpp',
+    'src/tar_netconn_win.cpp',
     'src/tar_arp_collector.cpp',
     'src/tar_dns_collector.cpp',
     'src/tar_perf.cpp',
