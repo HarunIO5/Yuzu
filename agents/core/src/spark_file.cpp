@@ -184,10 +184,13 @@ public:
             // the worker free the DirWatch when the (aborted) completion drains —
             // never free memory a pending completion points at. Else drop now.
             release_ancestor(w);
-            if (w.io_pending) {
+            // Guard shape matches release_ancestor's below exactly (io_pending
+            // implies handle everywhere in this file, but check both so the
+            // two "same pattern" sites stay textually identical — governance
+            // Gate-4 consistency finding).
+            if (w.io_pending && w.handle) {
                 w.removing = true;
-                if (w.handle)
-                    ::CancelIoEx(w.handle.get(), &w.ov);
+                ::CancelIoEx(w.handle.get(), &w.ov);
                 // Free dirkey for reuse NOW — a watch() racing this unwatch()
                 // must get a fresh DirWatch, never resurrect this one (it's
                 // already been told to die and will be freed by drop_watch()
@@ -348,8 +351,13 @@ private:
         // drive, an unreachable UNC share) the naive "walk until empty" loop
         // never terminates while holding mu_, bricking the mechanism and
         // hanging shutdown behind it (governance finding, PR #1927 review).
-        // Stop at the fixed point same as spark_registry.cpp's
-        // open_nearest_ancestor guard.
+        // Stop at the fixed point — analogous to (not a literal port of)
+        // spark_registry.cpp's open_nearest_ancestor guard: registry's walk
+        // is a pure string truncation with no fixed point (it terminates by
+        // reaching "", the case that guard is built around), so copying just
+        // its "guard on emptiness" shape would NOT have fixed this hang — a
+        // rooted fs::path's parent is itself, never empty (governance Gate-4
+        // consistency finding, PR #1927 review).
         for (fs::path prev; !anc.empty() && anc != prev && !fs::is_directory(anc, ec);) {
             prev = anc;
             anc = anc.parent_path();
