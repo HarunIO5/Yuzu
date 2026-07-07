@@ -8,7 +8,7 @@ related: docs/vuln-scan-capability-map.md V5/V7; docs/fleet-viz-invariants.md; d
 supersedes-direction: the grill-session recommendation that CAVM must score on *potential* reachability from day one
 ---
 
-# 0021 — CAVM MVP scores on observed reachability; potential reachability deferred
+# 4002 — CAVM MVP scores on observed reachability; potential reachability deferred
 
 > Records a deliberate, eyes-open MVP trade-off taken 2026-07-01 (@lesault + @Tr3kkR): the first
 > CAVM increment scores attack paths over the **observed** reachability graph Yuzu already produces,
