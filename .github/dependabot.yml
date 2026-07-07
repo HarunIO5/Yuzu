@@ -62,7 +62,14 @@ updates:
   # site/ lockfile silently accumulated 8 GHSA advisories (astro/esbuild/
   # js-yaml/ws) — the main driver of the OpenSSF Scorecard Vulnerabilities
   # check decaying to 2/10. Nothing here ships in the product; it is all
-  # docs/demo/test tooling, so one grouped weekly PR per directory is enough.
+  # docs/demo/test tooling (Tier 2 — docs/dependency-updates.md "Update
+  # tiers"). Minor+patch bumps ride one grouped weekly PR per directory;
+  # majors fall outside the group and arrive as separate single-dependency
+  # PRs, so a breaking major (Astro N+1, express 5, a puppeteer line bump)
+  # never dams the patch stream behind a red migration PR. New npm
+  # directory ⇒ committed lockfile + an entry here in the same PR (no
+  # auto-discovery); see the standing convention in
+  # docs/dependency-updates.md "npm tooling".
   - package-ecosystem: "npm"
     directories:
       - "/site"
@@ -74,9 +81,12 @@ updates:
     labels:
       - "dependencies"
     groups:
-      npm-all:
+      npm-minor-patch:
         patterns:
           - "*"
+        update-types:
+          - "minor"
+          - "patch"
     cooldown:
       default-days: 7
 
