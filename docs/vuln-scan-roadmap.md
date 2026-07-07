@@ -2,8 +2,20 @@
 
 **Status:** working roadmap for the vuln_scan / CAVM workstream (owner: Andy / @lesault).
 **Created:** 2026-06-30.
-**Last reconciled:** 2026-07-01 — against ADR-0018 (D1 wire-format correction, no-exceptions
+**Last reconciled:** 2026-07-07 — against ADR-0022 (headless platform; placement note below).
+Previously 2026-07-01 — against ADR-0018 (D1 wire-format correction, no-exceptions
 KEV-pre-filter strike, Lane 1/2/3 routing) and ADR-0019 (tri-state findings + coverage dimension).
+
+> **Placement note (2026-07-07, ADR-0022 reconciliation).** The in-server home of this ladder's
+> correlation work is **interim**: vulnerability management's long-term home is the first
+> use-case-engine module (ADR-0022 + `docs/adr-0022-execution-plan.md`), and the ADR-0023 stack
+> (M1a/M1b scope: engine, findings store, triggers, securable, findings routes) is absorbed into
+> ADR-0022's grandfathered surface #2 — re-homed and eventually deleted by that plan's Phase-7
+> strangler. Each further in-server PR on this ladder grows that deletion scope; milestones beyond
+> M1a/M1b (M2 enrichment onward, M3–M6 graph/CAVM scoring) face ADR-0022 Decision 2's boundary
+> test fresh before implementation. Milestone vocabularies collide: this ladder's M1a/M1b + M2–M6
+> ≠ the execution plan's UCE M1–M4 — always qualify which ladder a bare "M-number" means.
+> Details: execution plan § "Relationship to ADR-0023"; ADR-0023's own placement note.
 
 This roadmap is the **canonical sequencing** for the workstream. It reconciles three views into
 one ordered plan:
