@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -322,20 +323,29 @@ TEST_CASE("SparkEngine: a handler blocked past the shutdown budget is detached, 
     SparkEngine engine;
     engine.set_cadence_floor_for_test(10);
     engine.set_consumer_join_budget_for_test(120); // shrink the budget for the test
-    std::mutex m;
-    std::condition_variable cv;
-    bool release = false;
-    std::atomic<bool> in_handler{false};
-    auto consumer = engine.register_consumer("blocker", [&](const SparkEvent&) {
-        in_handler.store(true);
-        std::unique_lock lk(m);
-        cv.wait(lk, [&] { return release; }); // block until the test frees us
+    // Heap-allocated: on budget expiry stop() DETACHES this handler's thread, so
+    // it may still be inside cv.wait() reacquiring `m` after this TEST_CASE
+    // returns. Stack locals captured by reference would be destroyed out from
+    // under it (UAF on the mutex/cv, observed as a libc++ "condition_variable
+    // wait failed" abort in an unrelated later test) — the shared_ptr keeps
+    // them alive for as long as the detached thread is still running.
+    struct Sync {
+        std::mutex m;
+        std::condition_variable cv;
+        bool release = false;
+        std::atomic<bool> in_handler{false};
+    };
+    auto sync = std::make_shared<Sync>();
+    auto consumer = engine.register_consumer("blocker", [sync](const SparkEvent&) {
+        sync->in_handler.store(true);
+        std::unique_lock lk(sync->m);
+        sync->cv.wait(lk, [&] { return sync->release; }); // block until the test frees us
     });
     REQUIRE(consumer.has_value());
     REQUIRE(engine.arm(*consumer, interval_spec(20)).has_value());
 
     engine.start();
-    CHECK(eventually([&] { return in_handler.load(); })); // handler is now wedged
+    CHECK(eventually([&] { return sync->in_handler.load(); })); // handler is now wedged
 
     const auto t0 = std::chrono::steady_clock::now();
     engine.stop(); // MUST return within ~budget, not block on the wedged handler
@@ -345,10 +355,10 @@ TEST_CASE("SparkEngine: a handler blocked past the shutdown budget is detached, 
 
     // Free the detached handler so its thread exits cleanly (no leaked blocker).
     {
-        std::lock_guard lk(m);
-        release = true;
+        std::lock_guard lk(sync->m);
+        sync->release = true;
     }
-    cv.notify_all();
+    sync->cv.notify_all();
 }
 
 TEST_CASE("SparkEngine: N blocked handlers detach against ONE shared budget, not N× (UP2-3)",
@@ -356,14 +366,20 @@ TEST_CASE("SparkEngine: N blocked handlers detach against ONE shared budget, not
     SparkEngine engine;
     engine.set_cadence_floor_for_test(10);
     engine.set_consumer_join_budget_for_test(200);
-    std::mutex m;
-    std::condition_variable cv;
-    bool release = false;
-    std::atomic<int> wedged{0};
-    auto blocker = [&](const SparkEvent&) {
-        wedged.fetch_add(1);
-        std::unique_lock lk(m);
-        cv.wait(lk, [&] { return release; });
+    // Heap-allocated for the same reason as the UP-1 test above: the detached
+    // handler threads may still be running (inside cv.wait()) after this
+    // TEST_CASE returns, so stack locals captured by reference are unsafe.
+    struct Sync {
+        std::mutex m;
+        std::condition_variable cv;
+        bool release = false;
+        std::atomic<int> wedged{0};
+    };
+    auto sync = std::make_shared<Sync>();
+    auto blocker = [sync](const SparkEvent&) {
+        sync->wedged.fetch_add(1);
+        std::unique_lock lk(sync->m);
+        sync->cv.wait(lk, [&] { return sync->release; });
     };
     for (int i = 0; i < 3; ++i) {
         auto c = engine.register_consumer("blk" + std::to_string(i), blocker);
@@ -371,7 +387,7 @@ TEST_CASE("SparkEngine: N blocked handlers detach against ONE shared budget, not
         REQUIRE(engine.arm(*c, interval_spec(20)).has_value()); // dedups → 1 spark, 3 subs
     }
     engine.start();
-    CHECK(eventually([&] { return wedged.load() >= 3; })); // all 3 handlers wedged
+    CHECK(eventually([&] { return sync->wedged.load() >= 3; })); // all 3 handlers wedged
 
     const auto t0 = std::chrono::steady_clock::now();
     engine.stop();
@@ -382,10 +398,10 @@ TEST_CASE("SparkEngine: N blocked handlers detach against ONE shared budget, not
     CHECK(engine.stats().consumer_threads_detached >= 3);
 
     {
-        std::lock_guard lk(m);
-        release = true;
+        std::lock_guard lk(sync->m);
+        sync->release = true;
     }
-    cv.notify_all();
+    sync->cv.notify_all();
 }
 
 TEST_CASE("SparkEngine: inline tier runs on the watcher thread and is duration-accounted",
