@@ -188,6 +188,17 @@ public:
                 w.removing = true;
                 if (w.handle)
                     ::CancelIoEx(w.handle.get(), &w.ov);
+                // Free dirkey for reuse NOW — a watch() racing this unwatch()
+                // must get a fresh DirWatch, never resurrect this one (it's
+                // already been told to die and will be freed by drop_watch()
+                // when the aborted completion drains). Leaving it keyed in
+                // dirs_ let a same-dir re-arm silently insert into a watch
+                // that's about to be freed — arm() reports success but there
+                // is no live ReadDirectoryChangesW behind it (governance
+                // finding, PR #1927 review), matching release_ancestor's
+                // existing retiring_ pattern above.
+                retiring_.push_back(std::move(di->second));
+                dirs_.erase(di);
             } else {
                 dirs_.erase(di);
             }
@@ -332,9 +343,18 @@ private:
     bool arm_ancestor(DirWatch& dependent) {
         fs::path anc = fs::path(dependent.dir);
         std::error_code ec;
-        while (!anc.empty() && !fs::is_directory(anc, ec))
+        // parent_path() of a root (drive root, UNC share root) returns itself —
+        // a fixed point, not empty — so for a root that doesn't exist (a gone
+        // drive, an unreachable UNC share) the naive "walk until empty" loop
+        // never terminates while holding mu_, bricking the mechanism and
+        // hanging shutdown behind it (governance finding, PR #1927 review).
+        // Stop at the fixed point same as spark_registry.cpp's
+        // open_nearest_ancestor guard.
+        for (fs::path prev; !anc.empty() && anc != prev && !fs::is_directory(anc, ec);) {
+            prev = anc;
             anc = anc.parent_path();
-        if (anc.empty()) {
+        }
+        if (anc.empty() || !fs::is_directory(anc, ec)) {
             release_ancestor(dependent);
             return false;
         }

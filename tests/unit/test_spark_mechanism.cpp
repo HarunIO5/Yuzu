@@ -798,6 +798,7 @@ TEST_CASE("Service spark (real mechanism): live unit transition fires Running th
 #endif
 #include <windows.h>
 
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 
@@ -906,6 +907,110 @@ TEST_CASE("File spark (real mechanism): survives parent-dir delete + recreate",
         CHECK(got.at(0).type == SparkType::File);
     engine.stop();
     fs::remove_all(root, ec);
+}
+
+TEST_CASE("File spark (real mechanism): disarm-then-rearm the same file does not lose the watch "
+          "(PR #1927 review)",
+          "[spark][mechanism][windows][resilience]") {
+    namespace fs = std::filesystem;
+    const fs::path target =
+        fs::temp_directory_path() /
+        ("spark_file_rearm_" + std::to_string(::GetCurrentProcessId()) + ".txt");
+    { std::ofstream(target) << "seed"; }
+
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::File, make_file_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(target.string());
+
+    auto sub1 = engine.arm(*c, spec);
+    REQUIRE(sub1.has_value());
+    engine.start();
+    std::this_thread::sleep_for(150ms); // let the IOCP read arm — io_pending now true
+
+    // Disarm then IMMEDIATELY re-arm the same file, no sleep between: unwatch()
+    // cancels the outstanding read (io_pending was true) and, pre-fix, left the
+    // DirWatch keyed in dirs_ with removing=true — a racing watch() reused
+    // that about-to-be-freed slot silently (arm() reports success, but there
+    // is no live ReadDirectoryChangesW behind it, and the whole entry vanishes
+    // for good once the aborted completion drains). Back-to-back disarm+arm
+    // reliably lands inside that window.
+    engine.disarm(*sub1);
+    auto sub2 = engine.arm(*c, spec);
+    REQUIRE(sub2.has_value());
+
+    std::this_thread::sleep_for(150ms); // let the NEW read arm (if the fix works)
+    { std::ofstream(target, std::ios::app) << "change"; }
+
+    CHECK(eventually([&] { return got.count() >= 1; }, 8000ms));
+    if (got.count() >= 1)
+        CHECK(got.at(0).type == SparkType::File);
+
+    engine.stop();
+    std::error_code ec;
+    fs::remove(target, ec);
+}
+
+TEST_CASE("File spark (real mechanism): arm() on a nonexistent drive root does not hang "
+          "(PR #1927 review)",
+          "[spark][mechanism][windows][resilience]") {
+    // arm_ancestor's ancestor-walk previously never terminated for a root that
+    // doesn't exist: parent_path() of a drive root is a FIXED POINT, not
+    // empty, so "walk until empty" spun forever holding the mechanism's own
+    // mu_ — bricking every other watch on this mechanism and hanging shutdown
+    // behind it. Heap-allocate everything the probe thread touches (mirrors
+    // the UP-1/UP2-3 detach-safety idiom above): on a regression this leaks a
+    // thread parked forever inside watch() instead of UAF-ing a stack-local
+    // engine out from under it — the point is proving termination, not
+    // surviving a hang gracefully.
+    char letter = 0;
+    {
+        const DWORD mask = ::GetLogicalDrives();
+        for (char cand = 'Z'; cand >= 'D'; --cand) {
+            if (!(mask & (1u << (cand - 'A')))) {
+                letter = cand;
+                break;
+            }
+        }
+    }
+    if (!letter) {
+        WARN("no free drive letter available to probe an absent root — skipping");
+        return;
+    }
+
+    struct Probe {
+        SparkEngine engine;
+        Collector got;
+        std::mutex m;
+        std::condition_variable cv;
+        bool done{false};
+        bool armed{false};
+    };
+    auto probe = std::make_shared<Probe>();
+    REQUIRE(probe->engine.register_mechanism(SparkType::File, make_file_mechanism()).has_value());
+    auto c = probe->engine.register_consumer("c", probe->got.handler());
+    REQUIRE(c.has_value());
+    const auto consumer = *c;
+    const auto spec = file_spec(std::string(1, letter) + ":\\nonexistent\\dir\\file.txt");
+    probe->engine.start();
+
+    std::thread([probe, consumer, spec] {
+        auto r = probe->engine.arm(consumer, spec);
+        std::lock_guard lk(probe->m);
+        probe->armed = r.has_value();
+        probe->done = true;
+        probe->cv.notify_all();
+    }).detach();
+
+    std::unique_lock lk(probe->m);
+    const bool finished = probe->cv.wait_for(lk, 5000ms, [&] { return probe->done; });
+    CHECK(finished); // a regression hangs this forever instead of finishing
+    lk.unlock();
+    if (finished)
+        probe->engine.stop();
+    // else: deliberately leak `probe` (and the parked thread inside it).
 }
 
 TEST_CASE("Registry spark (real mechanism): survives key delete + recreate",

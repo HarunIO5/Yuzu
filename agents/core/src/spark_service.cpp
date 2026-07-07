@@ -638,8 +638,16 @@ private:
                 dispatch(emits, faults);
                 break;
             }
-            if (fds[wake_idx].revents & POLLIN)
+            if (fds[wake_idx].revents & POLLIN) {
+                // eventfd is counter-semantics + level-triggered: an unread
+                // write leaves it readable forever, busy-spinning poll() at
+                // 100% CPU and starving the backstop/reopen block below on
+                // every subsequent iteration (governance finding, PR #1927
+                // review). Drain the counter before looping back to the top.
+                std::uint64_t drained = 0;
+                [[maybe_unused]] ssize_t n = ::read(wake_fd_, &drained, sizeof(drained));
                 continue; // a command was enqueued or stop() signalled — loop re-checks at the top
+            }
 
             // 6) Backstop expiry: reopen the bus if down, else re-arm any unit
             //    whose reconcile deadline passed.
