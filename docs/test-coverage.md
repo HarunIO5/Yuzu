@@ -91,7 +91,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 |------|-----------|----------------|
 | `test_auth.cpp` | Auth manager | Crypto primitives, user CRUD, sessions, enrollment tokens, pending agents, config persistence |
 | `test_auto_approve.cpp` | Auto-approve | Hostname glob, CIDR subnet, CA fingerprints, rule evaluation (any/all mode), config persistence |
-| `test_nvd.cpp` | NVD database | Version comparison, CVE CRUD, batch inserts, match_inventory, metadata, builtin rules |
+| `test_nvd.cpp` | NVD database | Version comparison, CVE CRUD, batch inserts, match_inventory, metadata, builtin rules, assess() coverage-aware matching, vendor composite index (EXPLAIN plans), products_for_cves CVE→product inversion, upsert_cves changed_ids delta |
 | `test_update_registry.cpp` | OTA registry | Package CRUD, latest_for version selection, rollout eligibility, binary_path |
 | `test_https_config.cpp` | HTTPS config | Default values, cookie security attributes (Secure, HttpOnly, SameSite), retention config |
 | `test_response_store.cpp` | Response store | Store/retrieve, query filters (agent_id, status, time range), pagination, TTL, ordering |
