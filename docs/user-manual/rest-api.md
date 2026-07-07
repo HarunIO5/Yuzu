@@ -8,6 +8,8 @@ This document covers every HTTP endpoint exposed by the Yuzu server. Endpoints a
 
 The Yuzu REST API uses path-based versioning. Understanding the distinction between versioned and legacy endpoints is important for building stable integrations.
 
+> **Formal policy:** the binding cross-surface versioning & deprecation policy — covering REST **and** MCP tools, the additive-vs-breaking test, the deprecation cycle (announcement channels + minimum window), and MCP tool naming on breaking changes — is [`docs/api-versioning-policy.md`](../api-versioning-policy.md). This section is the REST summary.
+
 ### Versioned API (`/api/v1/`)
 
 All endpoints under the `/api/v1/` prefix are the **stable, versioned API**. These endpoints:
@@ -25,7 +27,7 @@ Endpoints under `/api/` without the `v1` prefix are **legacy endpoints** that pr
 - Remain available for backward compatibility
 - Do **not** use the standard v1 JSON envelope
 - May return inconsistent error formats
-- Are **deprecated** and will be removed in a future major release
+- Are **deprecated** and will be removed per the deprecation cycle in [`docs/api-versioning-policy.md`](../api-versioning-policy.md) (a feature release, after the announced window)
 - Should be migrated to their v1 equivalents where available
 
 ### Migration Guidance
