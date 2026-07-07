@@ -330,7 +330,8 @@ public:
                           "histogram");
         metrics_.describe("yuzu_grpc_requests_total", "Total gRPC requests by method and status",
                           "counter");
-        metrics_.describe("yuzu_http_requests_total", "Total HTTP requests by path and status",
+        metrics_.describe("yuzu_http_requests_total",
+                          "Total HTTP requests by method, status, and principal_class",
                           "counter");
         // ADR-0022 Interim rules (execution-plan PR 1.1): rejected on-behalf-of
         // assertions, by ingress surface. Pre-seeded to 0 per
@@ -4683,29 +4684,34 @@ private:
             // sharing a source-IP bucket with authed REST traffic cannot
             // 429-starve the health probe. The endpoints themselves are
             // strictly read-only and documented as unauthenticated.
-            if (req.path == "/livez" || req.path == "/readyz" || req.path == "/health" ||
-                req.path == "/api/health") {
-                return httplib::Server::HandlerResponse::Unhandled;
-            }
-
             // ADR-0022 Interim rules (execution-plan PR 1.1): the server accepts
             // NO on-behalf-of assertion on any surface until server-verifiable
             // delegation ships (Phase 5) — and client-asserted delegation stays
-            // rejected permanently even then. Reject (not ignore) BEFORE auth and
-            // the unauthenticated allowlist so no path — REST, MCP (same httplib
-            // instance), fragments, static — can carry one. Sits after the health
-            // early-return only because those probes are fixed read-only paths
-            // where nothing acts on an identity. Reserved names + rationale:
-            // on_behalf_guard.hpp; the agent gRPC channel gets the same guard via
-            // grpc_on_behalf_interceptor.hpp.
+            // rejected permanently even then. Reject (not ignore) FIRST — before
+            // the health early-return, auth, the unauthenticated allowlist, and
+            // the rate limiter — so coverage is literally universal: REST, MCP
+            // (same httplib instance), fragments, static, and even health probes
+            // (governance round 1: an exemption here would need an ADR-0022
+            // exception-ledger entry; five short compares per probe don't).
+            // Pre-limiter placement means a reserved-header flood gets per-request
+            // 403s, not 429s — the scan is cheaper than the limiter lookup, and
+            // the warn is throttled in note_rejection so the flood can't fill the
+            // disk; the counter records every event. Log lines carry the CANONICAL
+            // reserved spelling plus sanitized method/path (httplib percent-decodes
+            // req.path, so raw control chars would otherwise forge security-log
+            // lines). Reserved names + rationale: on_behalf_guard.hpp; the agent
+            // gRPC channel gets the same guard via grpc_on_behalf_interceptor.hpp.
             if (auto reserved = onbehalf::find_reserved_key(req.headers)) {
-                metrics_
-                    .counter("yuzu_onbehalf_rejected_total",
-                             {{"surface", "http"}, {"event", "security"}})
-                    .increment();
-                spdlog::warn("[ADR-0022] rejected {} {} carrying reserved on-behalf-of "
-                             "header '{}' from {}",
-                             req.method, req.path, *reserved, req.remote_addr);
+                if (onbehalf::note_rejection(metrics_, "http")) {
+                    spdlog::warn(
+                        "[ADR-0022] rejected {} {} carrying reserved on-behalf-of "
+                        "header '{}' from {} (1 log per {} rejections; counter "
+                        "records all)",
+                        onbehalf::sanitize_for_log(req.method, 16),
+                        onbehalf::sanitize_for_log(req.path), *reserved,
+                        onbehalf::sanitize_for_log(req.remote_addr, 64),
+                        onbehalf::kLogEvery);
+                }
                 res.status = 403;
                 res.set_content(
                     detail::a4_denial(
@@ -4717,6 +4723,11 @@ private:
                                            "Interim rules"}),
                     "application/json");
                 return httplib::Server::HandlerResponse::Handled;
+            }
+
+            if (req.path == "/livez" || req.path == "/readyz" || req.path == "/health" ||
+                req.path == "/api/health") {
+                return httplib::Server::HandlerResponse::Unhandled;
             }
 
             // Rate limiting — check before auth to protect against brute force.
@@ -10617,6 +10628,9 @@ private:
             listen_port = cfg_.https_port;
 
             // Start HTTP→HTTPS redirect server
+            // No on_behalf_guard here (ADR-0022): this instance routes nothing —
+            // every request gets a 301 and the re-request hits the guarded main
+            // listener, so this is not a bypass of the pre-routing chokepoint.
             if (cfg_.https_redirect) {
                 redirect_server_ = std::make_unique<httplib::Server>();
                 auto https_port = cfg_.https_port;

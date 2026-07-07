@@ -125,6 +125,15 @@ Unauthenticated browser requests are redirected to `/login`. Unauthenticated API
 
 API tokens are created via `POST /api/v1/tokens` and can be scoped to the creating user's permissions. The raw token value is returned exactly once at creation time.
 
+**Reserved headers — do not send.** Five header names are reserved for future
+server-verifiable delegation and are **rejected on every endpoint** with `403`
++ the standard error envelope (ADR-0022): `On-Behalf-Of`, `X-On-Behalf-Of`,
+`X-Yuzu-On-Behalf-Of`, `X-Yuzu-Delegated-Operator`,
+`X-Yuzu-Delegation-Artifact` (case-insensitive). A client must never assert
+that it acts on another principal's behalf via a header; see
+`docs/auth-architecture.md` ("On-behalf-of assertions rejected") for rationale
+and the evolution path.
+
 ---
 
 ## JSON Envelope

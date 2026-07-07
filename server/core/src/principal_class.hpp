@@ -31,8 +31,12 @@ namespace yuzu::server {
     if (req.has_header("Authorization") || req.has_header("X-Yuzu-Token")) {
         return "agent";
     }
+    // Anchored match: the cookie NAME must be exactly yuzu_session — at the
+    // start of the Cookie header or after a "; " separator — so a cookie
+    // merely named e.g. not_yuzu_session doesn't classify as human.
     auto cookie = req.get_header_value("Cookie");
-    if (cookie.find("yuzu_session=") != std::string::npos) {
+    if (cookie.starts_with("yuzu_session=") ||
+        cookie.find("; yuzu_session=") != std::string::npos) {
         return "human";
     }
     return "none";

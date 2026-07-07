@@ -1055,6 +1055,35 @@ for the IdP cert in this release.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
+## On-behalf-of assertions rejected (ADR-0022 Interim rules)
+
+Until server-verifiable delegation ships (ADR-0022 auth follow-up), the server
+accepts **no** on-behalf-of assertion on **any** ingress surface — any such
+header or metadata key is **rejected, not ignored**. Five names are reserved
+(case-insensitive; source of truth `server/core/src/on_behalf_guard.hpp`, and
+the list only ever grows): `On-Behalf-Of`, `X-On-Behalf-Of`,
+`X-Yuzu-On-Behalf-Of`, `X-Yuzu-Delegated-Operator`,
+`X-Yuzu-Delegation-Artifact`.
+
+Enforcement: **HTTP** — first check in the pre-routing chokepoint
+(`server.cpp`), before auth, the allowlist, and the rate limiter, so REST,
+MCP, dashboard fragments, static files, and health probes all reject with
+`403` + the A4 error envelope. **gRPC** — a single server interceptor on the
+one `ServerBuilder` (`grpc_on_behalf_interceptor.hpp`) covers the agent,
+management, and gateway-upstream services and every future RPC method by
+construction; a call carrying a reserved metadata key is cancelled (client
+observes `CANCELLED`; best-effort — the handler may still run, tolerable
+because no handler reads these keys). **Gateway note:** the Erlang gateway's
+own agent-facing listener reads only its known metadata keys and mints fresh
+upstream calls, so a reserved key sent to the gateway is dropped rather than
+rejected — tracked as a follow-up (Erlang-side reject) rather than an
+exception. Rejections are counted in
+`yuzu_onbehalf_rejected_total{surface,event="security"}`; there is
+deliberately **no audit row** (the rejection fires pre-auth, so there is no
+resolved principal to attribute — the metric is the signal). When delegation
+ships it will use a **server-issued artifact**, never a client-asserted
+header, so these names stay rejected on client ingress permanently.
+
 ## API tokens and automation
 
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
