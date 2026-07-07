@@ -645,7 +645,10 @@ private:
                 // every subsequent iteration (governance finding, PR #1927
                 // review). Drain the counter before looping back to the top.
                 std::uint64_t drained = 0;
-                [[maybe_unused]] ssize_t n = ::read(wake_fd_, &drained, sizeof(drained));
+                ssize_t n;
+                do {
+                    n = ::read(wake_fd_, &drained, sizeof(drained));
+                } while (n < 0 && errno == EINTR);
                 continue; // a command was enqueued or stop() signalled — loop re-checks at the top
             }
 

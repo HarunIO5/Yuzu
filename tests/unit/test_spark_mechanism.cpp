@@ -925,8 +925,8 @@ TEST_CASE("File spark (real mechanism): disarm-then-rearm the same file does not
     REQUIRE(c.has_value());
     const auto spec = file_spec(target.string());
 
-    auto sub1 = engine.arm(*c, spec);
-    REQUIRE(sub1.has_value());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
     engine.start();
     std::this_thread::sleep_for(150ms); // let the IOCP read arm — io_pending now true
 
@@ -935,13 +935,17 @@ TEST_CASE("File spark (real mechanism): disarm-then-rearm the same file does not
     // DirWatch keyed in dirs_ with removing=true — a racing watch() reused
     // that about-to-be-freed slot silently (arm() reports success, but there
     // is no live ReadDirectoryChangesW behind it, and the whole entry vanishes
-    // for good once the aborted completion drains). Back-to-back disarm+arm
-    // reliably lands inside that window.
-    engine.disarm(*sub1);
-    auto sub2 = engine.arm(*c, spec);
-    REQUIRE(sub2.has_value());
+    // for good once the aborted completion drains). Whether the worker thread
+    // wins the race to drain that completion before the very next arm() runs
+    // is scheduling-dependent — repeat the cycle so one lucky interleaving
+    // can't mask a regression (governance Gate-3 quality-engineer finding).
+    for (int i = 0; i < 25; ++i) {
+        engine.disarm(*sub);
+        sub = engine.arm(*c, spec);
+        REQUIRE(sub.has_value());
+    }
 
-    std::this_thread::sleep_for(150ms); // let the NEW read arm (if the fix works)
+    std::this_thread::sleep_for(150ms); // let the final read arm (if the fix works)
     { std::ofstream(target, std::ios::app) << "change"; }
 
     CHECK(eventually([&] { return got.count() >= 1; }, 8000ms));
@@ -968,7 +972,13 @@ TEST_CASE("File spark (real mechanism): arm() on a nonexistent drive root does n
     char letter = 0;
     {
         const DWORD mask = ::GetLogicalDrives();
-        for (char cand = 'Z'; cand >= 'D'; --cand) {
+        // Scan Z down to B (skip only A, the traditional floppy letter) — a
+        // heavily-provisioned CI runner (VPN/WSL/Docker Desktop/network
+        // shares) can plausibly map every letter D-Z, and this is the ONLY
+        // regression test for the arm_ancestor hang, so a silent skip here
+        // would leave that fix unverified on exactly the runners most likely
+        // to need it (governance Gate-3 quality-engineer finding).
+        for (char cand = 'Z'; cand >= 'B'; --cand) {
             if (!(mask & (1u << (cand - 'A')))) {
                 letter = cand;
                 break;
@@ -976,8 +986,8 @@ TEST_CASE("File spark (real mechanism): arm() on a nonexistent drive root does n
         }
     }
     if (!letter) {
-        WARN("no free drive letter available to probe an absent root — skipping");
-        return;
+        FAIL("no free drive letter (B-Z) available to probe an absent root — this box has "
+             "every letter mapped, so the arm_ancestor hang fix (finding #3) is unverified here");
     }
 
     struct Probe {
@@ -1008,8 +1018,16 @@ TEST_CASE("File spark (real mechanism): arm() on a nonexistent drive root does n
     const bool finished = probe->cv.wait_for(lk, 5000ms, [&] { return probe->done; });
     CHECK(finished); // a regression hangs this forever instead of finishing
     lk.unlock();
-    if (finished)
+    if (finished) {
+        // watch()'s best-effort design always reports success — it records the
+        // key and falls back to an ancestor watch for a later (re)creation —
+        // even when neither arm_dir nor arm_ancestor found anything real to
+        // watch, so `armed == true` here is the CORRECT outcome, not a
+        // false-positive. `finished` above is the assertion that matters:
+        // termination, not a failure return.
+        CHECK(probe->armed);
         probe->engine.stop();
+    }
     // else: deliberately leak `probe` (and the parked thread inside it).
 }
 
