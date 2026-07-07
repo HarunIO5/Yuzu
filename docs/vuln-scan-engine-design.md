@@ -14,6 +14,19 @@
 | **Plain-language version** | [`vulnerability-graph-explained.md`](vulnerability-graph-explained.md) — a non-technical intro to *why a graph*, for curious readers |
 | **Related** | `docs/capability-map.md` §9, `docs/fleet-viz-invariants.md`, `docs/scope-walking-design.md`, `docs/agent-privilege-model.md`, `docs/data-architecture.md` |
 
+> **ADR-0022 reconciliation (2026-07).** This document's **server-side placement**
+> is superseded: vulnerability interpretation (feed ingest, matching, findings,
+> scoring) is a **use-case engine module**, not a server capability — the shipped
+> server-side NVD sync/matching is ADR-0022 grandfathered surface #2 and re-homes
+> via the strangler migration in `docs/adr-0022-execution-plan.md` (milestones
+> M1–M4; M4's surpass-parity criterion mirrors this doc's quality bar, and the
+> plan's pilot-readiness note cites this doc as the north-star). The
+> **domain content stands**: the matcher quality bar (§ floor — parity scanner,
+> low false positives on a patched fleet), the phased matcher roadmap, and the
+> attack-path/graph differentiator remain the north star for what the module
+> builds — the graph layer's own core-vs-engine boundary analysis is deferred to
+> its own scoping.
+
 ---
 
 ## 0. North Star in one paragraph
