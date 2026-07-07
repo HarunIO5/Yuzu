@@ -442,6 +442,59 @@ TEST_CASE("is_reserved_identity_prefix: does not false-positive on ordinary user
     CHECK_FALSE(is_reserved_identity_prefix(""));
 }
 
+// ── is_valid_principal (#1852 durable SSO identity) ─────────────────────────
+//
+// A strict superset of is_valid_username: every string the strict validator
+// accepts is accepted unchanged, and a reserved-prefixed SSO principal is
+// ADDITIONALLY accepted after a narrow control-byte/metacharacter blocklist.
+// Used ONLY at target-lookup chokepoints for an EXISTING user (elevation
+// eligibility, session revoke) — never at user-creation, which stays on
+// is_valid_username (+ is_reserved_identity_prefix).
+
+TEST_CASE("is_valid_principal: accepts a well-formed OIDC/SAML stable principal",
+          "[settings][users][principal]") {
+    CHECK(is_valid_principal("oidc:https://idp.example.com/#sub-123"));
+    CHECK(is_valid_principal("saml:https://idp.example.com/metadata#user@example.com"));
+    CHECK(is_valid_principal("ad:corp.example.com#S-1-5-21-123"));
+    // Opaque sub alphabets a real IdP may emit: URL path segments, tildes,
+    // percent-encoding, pipe-separated composite subs.
+    CHECK(is_valid_principal("oidc:https://idp/#a~b%20c|d"));
+}
+
+TEST_CASE("is_valid_principal: still accepts a strict local username unchanged",
+          "[settings][users][principal]") {
+    CHECK(is_valid_principal("bob"));
+    CHECK(is_valid_principal("admin"));
+    CHECK(is_valid_principal("alice.smith-1_2"));
+    CHECK_FALSE(is_valid_principal("")); // is_valid_username already rejects; no prefix either
+}
+
+TEST_CASE("is_valid_principal: rejects a bad-prefix string that is also not a strict username",
+          "[settings][users][principal]") {
+    // Contains ':' (fails is_valid_username) but not a reserved prefix.
+    CHECK_FALSE(is_valid_principal("notreserved:whatever"));
+    CHECK_FALSE(is_valid_principal("http://evil.example/#sub"));
+}
+
+TEST_CASE("is_valid_principal: rejects control bytes, injection metacharacters, and space",
+          "[settings][users][principal]") {
+    CHECK_FALSE(is_valid_principal(std::string("oidc:https://idp/#sub\x01")));
+    CHECK_FALSE(is_valid_principal(std::string("oidc:https://idp/#sub\x7F")));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub\nwith-newline"));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub;DROP TABLE users"));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub=malicious"));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub\\backslash"));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub'quote"));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub\"dquote"));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub`backtick"));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub with space"));
+}
+
+TEST_CASE("is_valid_principal: rejects an over-255-byte principal", "[settings][users][principal]") {
+    std::string long_sub(300, 'a');
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#" + long_sub));
+}
+
 // ── Weak-password guard — UAT-reported silent fail ─────────────────────────
 //
 // Before this fix, POSTing a new user with a password shorter than 12 chars

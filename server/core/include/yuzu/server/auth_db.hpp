@@ -107,6 +107,40 @@ public:
         auth::Role role
     );
 
+    /// Auto-provision (or refresh) a durable row for an SSO-authenticated
+    /// principal (#1852). The gate is `is_valid_principal` — a SUPERSET of
+    /// `is_valid_username`: it accepts EITHER a strict local username OR a
+    /// `"oidc:"`/`"saml:"`/`"ad:"`-reserved-prefixed identity; it does NOT
+    /// require the reserved prefix (a bare local-shaped string is also
+    /// accepted — rejected only when neither shape matches, InvalidUsername).
+    /// `source` is NOT validated against `{oidc,saml,ad}` — it is written
+    /// verbatim into `identity_source`, so a caller can construct a row
+    /// with any `identity_source` string (a security test deliberately does
+    /// this, passing `source="local"`, to build a legacy-shaped attack row
+    /// for the elevate handler's source-scope guard — see
+    /// `docs/security-reviews/sso-durable-identity-2026-07-03.md`).
+    /// TODO(#1915): tighten this seam to enforce a reserved prefix
+    /// on `principal` and `source ∈ {oidc,saml,ad}` — this call site is the
+    /// ONLY intended caller (the OIDC callback), so today's looseness is
+    /// latent, not actively exploitable, but it is a landmine for any future
+    /// caller.
+    /// On first login this INSERTs a row with `password_hash`/`salt_hex` = ''
+    /// (never resolvable on the local login path — see file header note),
+    /// `role='user'`, `elevation_eligible=0`. On every subsequent login the
+    /// `ON CONFLICT` arm refreshes ONLY `display_name`/`last_seen_at`/
+    /// `is_active` — it deliberately does NOT touch `role` or
+    /// `elevation_eligible`, so an admin's standing role grant and JIT-
+    /// elevation eligibility for this principal survive re-login. Call from
+    /// the OIDC callback AFTER minting the session (independent auth.db I/O,
+    /// not under AuthManager's `mu_`); a failure here degrades to "this
+    /// principal cannot elevate", never "cannot log in" (fail-soft — see
+    /// `AuthManager::provision_sso_identity`).
+    std::expected<void, AuthDBError> upsert_sso_identity(const std::string& principal,
+                                                          const std::string& iss,
+                                                          const std::string& sub,
+                                                          const std::string& display_name,
+                                                          const std::string& source);
+
     /// Get a user by username. Returns UserEntry on success.
     std::expected<auth::UserEntry, AuthDBError> get_user(const std::string& username);
 
@@ -184,7 +218,10 @@ public:
     /// Destroy a single session (logout).
     std::expected<void, AuthDBError> invalidate_session(const std::string& token);
 
-    /// Destroy all sessions for a user (logout all devices).
+    /// Destroy all sessions for a user (logout all devices). `username` is
+    /// validated with `is_valid_principal` (governance round cons-S1) — a
+    /// target-lookup DELETE, so a durable SSO principal (`oidc:<iss>#<sub>`)
+    /// is accepted alongside a strict local username.
     std::expected<void, AuthDBError> invalidate_all_sessions(const std::string& username);
 
     /// Remove expired sessions. Returns count of sessions removed.
@@ -448,6 +485,19 @@ bool is_valid_username(const std::string& username);
 /// contract must stay charset-only). Callers apply this ONLY at user-creation
 /// chokepoints, never at target-lookup/validation sites for existing users.
 bool is_reserved_identity_prefix(const std::string& username);
+
+/// Validate a value that may be EITHER a strict local username OR a durable
+/// SSO principal (`"oidc:"`/`"saml:"`/`"ad:"` + issuer + `#` + subject,
+/// #1852). A strict superset of `is_valid_username`: anything the strict
+/// validator accepts is accepted here unchanged; a reserved-prefixed string
+/// is additionally accepted after a narrow control-byte / SQL-metacharacter
+/// blocklist (permits `: # / . _ - @ ~ % |` — the IdP issuer URL + opaque
+/// sub alphabet), capped at 255 bytes. Use ONLY at target-lookup/validation
+/// chokepoints for an EXISTING user (elevation eligibility, session revoke)
+/// — never at user-creation chokepoints, which must keep using
+/// `is_valid_username` (+ `is_reserved_identity_prefix` to reserve the SSO
+/// namespace) so a local account can never be created inside it.
+bool is_valid_principal(const std::string& s);
 
 /// Validate that `username` is usable as the hardened-mode break-glass account:
 /// a syntactically valid username naming an existing ACTIVE user that has MFA

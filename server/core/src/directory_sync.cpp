@@ -301,6 +301,7 @@ DirectorySync::http_get(const std::string& url, const std::string& bearer_token)
     httplib::Client client(scheme + host);
     client.set_connection_timeout(15);
     client.set_read_timeout(30);
+    client.set_write_timeout(30);
 
     httplib::Headers headers = {
         {"Authorization", "Bearer " + bearer_token},
@@ -439,6 +440,7 @@ DirectorySync::acquire_token(const EntraConfig& config) {
     httplib::Client client("https://" + h);
     client.set_connection_timeout(10);
     client.set_read_timeout(15);
+    client.set_write_timeout(15);
     // Enable TLS peer verification (httplib verifies by default with OpenSSL,
     // but set explicitly for clarity)
     client.enable_server_certificate_verification(true);
