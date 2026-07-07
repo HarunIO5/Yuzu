@@ -36,7 +36,11 @@
 #include "execution_event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
+#include "grpc_on_behalf_interceptor.hpp"
 #include "instruction_store.hpp"
+#include "on_behalf_guard.hpp"
+#include "principal_class.hpp"
+#include "rest_a4_envelope_http.hpp"
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
@@ -328,6 +332,17 @@ public:
                           "counter");
         metrics_.describe("yuzu_http_requests_total", "Total HTTP requests by path and status",
                           "counter");
+        // ADR-0022 Interim rules (execution-plan PR 1.1): rejected on-behalf-of
+        // assertions, by ingress surface. Pre-seeded to 0 per
+        // docs/observability-conventions.md so absent() alerts stay meaningful.
+        metrics_.describe("yuzu_onbehalf_rejected_total",
+                          "Requests rejected for carrying a reserved on-behalf-of "
+                          "header/metadata key (ADR-0022) by surface",
+                          "counter");
+        metrics_.counter("yuzu_onbehalf_rejected_total",
+                         {{"surface", "http"}, {"event", "security"}});
+        metrics_.counter("yuzu_onbehalf_rejected_total",
+                         {{"surface", "grpc"}, {"event", "security"}});
         // PostgreSQL substrate pool metrics (#1320 PR 3 / #1368 observability).
         // Gauges are sampled every recompute cycle; counters/histogram are fed
         // live by the pool's observer hooks wired at pool construction.
@@ -2761,6 +2776,16 @@ public:
         }
 
         grpc::ServerBuilder builder;
+        // ADR-0022 Interim rules (execution-plan PR 1.1): one interceptor on the
+        // ONE builder — covers agent, management, and gateway-upstream services
+        // and every future RPC method by construction (never a per-method check).
+        {
+            std::vector<std::unique_ptr<grpc::experimental::ServerInterceptorFactoryInterface>>
+                interceptor_factories;
+            interceptor_factories.push_back(
+                std::make_unique<OnBehalfRejectInterceptorFactory>(&metrics_));
+            builder.experimental().SetInterceptorCreators(std::move(interceptor_factories));
+        }
         builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 60000);
         builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 20000);
         builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
@@ -4663,6 +4688,37 @@ private:
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
+            // ADR-0022 Interim rules (execution-plan PR 1.1): the server accepts
+            // NO on-behalf-of assertion on any surface until server-verifiable
+            // delegation ships (Phase 5) — and client-asserted delegation stays
+            // rejected permanently even then. Reject (not ignore) BEFORE auth and
+            // the unauthenticated allowlist so no path — REST, MCP (same httplib
+            // instance), fragments, static — can carry one. Sits after the health
+            // early-return only because those probes are fixed read-only paths
+            // where nothing acts on an identity. Reserved names + rationale:
+            // on_behalf_guard.hpp; the agent gRPC channel gets the same guard via
+            // grpc_on_behalf_interceptor.hpp.
+            if (auto reserved = onbehalf::find_reserved_key(req.headers)) {
+                metrics_
+                    .counter("yuzu_onbehalf_rejected_total",
+                             {{"surface", "http"}, {"event", "security"}})
+                    .increment();
+                spdlog::warn("[ADR-0022] rejected {} {} carrying reserved on-behalf-of "
+                             "header '{}' from {}",
+                             req.method, req.path, *reserved, req.remote_addr);
+                res.status = 403;
+                res.set_content(
+                    detail::a4_denial(
+                        res, 403,
+                        "on-behalf-of assertions are not accepted on any surface (ADR-0022); "
+                        "remove the reserved header",
+                        detail::A4ErrorOpts{
+                            .remediation = "docs/adr/0022-headless-platform-use-case-engines.md "
+                                           "Interim rules"}),
+                    "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+
             // Rate limiting — check before auth to protect against brute force.
             // Both /login and /login/mfa share the tighter login-rate bucket;
             // the MFA challenge is part of the same per-IP credential-brute
@@ -4823,9 +4879,14 @@ private:
                 res.set_header("Access-Control-Max-Age", "86400");
             }
 
+            // principal_class: bounded presentation-level actor class (ADR-0022,
+            // execution-plan PR 1.2) — human / agent today, engine reserved for
+            // Phase 4. See principal_class.hpp for the classification contract.
             metrics_
                 .counter("yuzu_http_requests_total",
-                         {{"method", req.method}, {"status", std::to_string(res.status)}})
+                         {{"method", req.method},
+                          {"status", std::to_string(res.status)},
+                          {"principal_class", std::string(principal_class_of(req))}})
                 .increment();
         });
 
