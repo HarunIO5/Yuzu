@@ -573,6 +573,7 @@ void OffloadTargetStore::deliver_single(const OffloadTarget& tgt, const std::str
         httplib::Client cli(scheme + "://" + host_port);
         cli.set_connection_timeout(5);
         cli.set_read_timeout(10);
+        cli.set_write_timeout(10);
 
         httplib::Headers headers;
         headers.emplace("Content-Type", "application/json");

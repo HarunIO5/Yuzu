@@ -80,13 +80,13 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | **MFA / 2FA / TOTP — full ladder** (PR 1 enrollment + login challenge; PR 2 step-up on 11 surfaces; PR 3 enforcement modes `admin-only`/`required` + OIDC `amr` short-circuit + login-time enrollment bootstrap; `docs/auth-mfa-design.md`) | "2FA/TOTP for high-risk approvals" | CC6.6 | **SHIPPED — ladder complete; only the at-rest TOTP-secret encryption follow-up remains (mechanism: ADR-0010 SecretCodec, rides the `auth` Postgres migration)** |
 | **Hardened-mode local-password disable** | "Disable local-password fallback in hardened mode" | CC6.3 | **SHIPPED** — `--auth-mode=sso-only` (`Config::auth_mode`) disables local-password login fleet-wide (only OIDC mints a session); boot **fails closed** without OIDC. Gate in `auth_routes.cpp` `POST /login` returns the same generic 401 (no oracle); denial is metric-only (`yuzu_auth_local_disabled_total`). See `docs/auth-architecture.md` "Hardened mode". |
 | **Break-glass account policy** (constrained, audited, rotated) | "or tightly constrain break-glass account policy" | CC6.6 | **SHIPPED** — `--break-glass-user` exempt from sso-only **only while armed** (`users.break_glass_armed_until`, migration v4, auto-expiring `--break-glass-window-secs` default 24h); **mandatory MFA** enforced fail-closed at boot AND forced at login; armed out-of-band via the host CLI `--break-glass-arm` (audited `auth.breakglass.armed`, OS-principal-attributed); use audits `auth.breakglass.login` + metric `yuzu_auth_break_glass_login_total`. |
-| **SAML 2.0 SP** (some enterprises require SAML, not OIDC) | implicit ("SSO enforcement") | CC6.1 | **MISSING** |
+| **SAML 2.0 SP** (some enterprises require SAML, not OIDC) | implicit ("SSO enforcement") | CC6.1 | **PARTIAL (thin slice + group→role mapping shipped)** — SP-initiated login (HTTP-Redirect binding), assertion-signature validation against a pinned IdP cert, replay-protected (`InResponseTo` single-use), ephemeral session (`auth_source="saml"`, `role=admin` via exact-match IdP-attested group membership — `--saml-group-attribute`/`--saml-admin-group`, mirrors the OIDC `--oidc-admin-group` guard — else `role=user`), Linux/macOS only. Admins are now reachable via SAML without a local account. Deferred: AuthnRequest signing, AttributeStatement parsing beyond the group attribute, Windows support, IdP-metadata auto-fetch, Settings-UI reconfigure. See `docs/auth-architecture.md` "SAML 2.0 SP". |
 | **SCIM v2 provisioning** (auto-provision/deprovision from IdP) | "Periodic access reviews" automation | CC6.2/6.8 | **MISSING** |
-| **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **MISSING** |
-| **Inactivity session timeout** — `auth_db.cpp:363` reserves `last_activity_at` column with DEFAULT but **no `UPDATE` writes anywhere** in the codebase; expiry-only today. Treat as from-scratch work, not a tweak. | "inactivity timeout" | CC6.3 | **MISSING (column reserved)** |
+| **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **SHIPPED** — `POST /api/v1/elevate` (`--jit-max-elevation-secs`); see priority item 9 below |
+| **Inactivity session timeout** | "inactivity timeout" | CC6.3 | **SHIPPED** — `--session-inactivity-secs` (default 0 = disabled, opt-in). Sliding idle window enforced in `AuthManager::validate_session` on the in-memory `Session` (monotonic `last_activity_at`), under the absolute 8h lifetime; cookie sessions only (API/MCP tokens exempt). Best-effort throttled `auth.db` mirror via `AuthDB::touch_session_activity`. See `docs/auth-architecture.md` "Inactivity session timeout". |
 | **Session revocation REST surface** | "expiration, revocation" | CC6.3 | **SHIPPED** — `DELETE /api/v1/sessions?username=<name>` (admin) + `DELETE /api/v1/sessions/me` (self) in `rest_api_v1.cpp` (audit `session.revoke_all`/`session.revoke_all.self`, step-up, self-target guard), over `AuthDB::invalidate_all_sessions()` |
 | **API token rotation workflow** — UI-driven pair-of-tokens overlap. No `rotate` symbols in `api_token_store.{cpp,hpp}` today; only create + revoke. | "rotation process" | CC6.3 | **MISSING** |
-| **API token inventory + last-used view** — data layer shipped (`api_tokens.last_used_at` written/read at `api_token_store.cpp:291,325-345`); dashboard inventory view missing. | "token inventory" | CC6.6 | **PARTIAL — UI only** |
+| **API token inventory + last-used view** — data layer, Settings → API Tokens dashboard fragment (`render_api_tokens_fragment` in `settings_routes.cpp`), and `GET /api/v1/tokens` REST route all shipped, both surfacing owner/created/last-used columns. | "token inventory" | CC6.6 | **SHIPPED** |
 | **Periodic access reviews** (export of role assignments + attestation flow) | "Periodic access reviews with manager/security attestation" | CC6.2 | **MISSING** |
 | **Account lockout after N failed logins** | implicit (auth hygiene) | CC6.3 | **SHIPPED** — `auth.db` v3 columns (`failed_login_count`/`last_failed_login_at`/`locked_until`) + `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins`; `--auth-lockout-threshold`/`--auth-lockout-window-secs`; generic-401 pre-check (no enum/oracle, skips PBKDF2), auto-expiring window w/ fresh budget, admin unlock `POST /api/v1/users/<name>/unlock`; audit `auth.lockout.applied`/`.cleared` + metrics. See `docs/auth-architecture.md` "Account lockout". |
 | **Service-account governance** (separate principal type, no human login) | "Privileged access controls" | CC6.6 | **MISSING** |
@@ -189,19 +189,66 @@ matches the customer ask.
 
 ### Priority 1 — enterprise-friction reducers
 
-6. **SAML 2.0 SP** with metadata exchange + signed assertion validation.
-   Mirrors OIDC's group-to-role mapping. Same enforcement surface as OIDC.
+6. **SAML 2.0 SP** — thin first slice shipped, **plus group→role mapping**
+   (`feat/auth-saml-group-role`). SP-initiated login via HTTP-Redirect
+   binding; ACS via HTTP-POST binding. Assertion signature validated against
+   the pinned IdP cert (in-document `<KeyInfo>` ignored); XML
+   signature-wrapping defended; audience / recipient / expiry validated;
+   solicited-only + single-use `InResponseTo` (replay-protected). Sessions are
+   ephemeral, `auth_source="saml"`; role is `admin` when the assertion's
+   IdP-attested groups (`--saml-group-attribute`) contain the configured
+   `--saml-admin-group` (exact match only, parsed from the same
+   XSW-verified assertion node as NameID — mirrors the OIDC
+   `--oidc-admin-group` guard), else `role=user`. Both flags empty (default)
+   reproduces the original all-`role=user` behaviour. **Linux and macOS
+   only** — Windows fails closed at startup. **Remaining (next slice):**
+   AuthnRequest signing, AttributeStatement parsing beyond the group
+   attribute, Windows support, IdP-metadata auto-fetch, Settings-UI
+   reconfigure. See `docs/auth-architecture.md` "SAML 2.0 SP".
 7. **SCIM v2 provisioning** — auto-create/disable users from the IdP.
    Reuses `auth.db` user table; new endpoint surface under `/scim/v2/`
    with bearer-token auth (separate from operator API tokens).
-8. **Inactivity session timeout** — wire the reserved `last_activity_at`
-   column at `auth_db.cpp:363` end-to-end: per-request `UPDATE` on every
-   authenticated touch, expiry check inside `validate_session()` against
-   `now - last_activity_at > inactivity_window`, configurable per
-   deployment. Treat as from-scratch since no `UPDATE` writes exist today.
-9. **JIT admin elevation** — `POST /api/v1/elevate` accepting a justification
-   + duration; promotes the caller's effective role for the window, audits
-   `role.elevation.requested|granted|expired`. Returns to base role on TTL.
+8. ~~**Inactivity session timeout**~~ **DONE** — `--session-inactivity-secs`
+   (`YUZU_SESSION_INACTIVITY_SECS`, `Config::session_inactivity_secs`), **default
+   0 = disabled** (opt-in; existing deployments unaffected; recommended 900).
+   Enforced in `AuthManager::validate_session` against the in-memory `Session`
+   (the authoritative read path — `auth.db` sessions are v1 dead-writes): a
+   **monotonic `steady_clock` `last_activity_at`** is bumped on each
+   authenticated touch (sliding window) and the session is rejected + evicted
+   once idle past the window, *under* the absolute 8h `kSessionDuration`. Cookie
+   sessions only — API/MCP tokens resolve via `synthesize_token_session`, never
+   `validate_session`, so they are **never idle-timed-out**. The `auth.db`
+   `last_activity_at` mirror is best-effort + throttled (`touch_session_activity`,
+   ≤1 write/session/60s, off `mu_`). See `docs/auth-architecture.md` "Inactivity
+   session timeout"; `tests/unit/server/test_auth.cpp` `[idle]`.
+9. ~~**JIT admin elevation**~~ **DONE** — `POST /api/v1/elevate` `{justification,
+   duration_secs}` promotes the caller's **effective role** to admin for a
+   bounded window (`--jit-max-elevation-secs`, default 1h), then auto-reverts.
+   Eligibility = the per-user `users.elevation_eligible` flag (auth.db migration
+   v5, admin-set via `POST /api/v1/users/<name>/elevation-eligibility`; keyed on
+   a `users` row, which OIDC login does not create — a federated identity needs
+   one provisioned first), distinct from standing admin and enumerable for
+   access reviews. Gated on eligibility + **mandatory MFA enrollment**
+   (unconditional — elevation is the privilege boundary) + a fresh MFA step-up;
+   the grant audit is fail-closed, revoking eligibility ends active elevations,
+   and self-grant is blocked. A local session's factor is local TOTP; an OIDC
+   session with an IdP-MFA (`amr`) proof satisfies this WITHOUT local
+   enrollment, per `--jit-oidc-amr-elevation` (default true) — an OIDC session
+   never consults a local namesake account's TOTP enrollment, and
+   `--no-jit-oidc-amr-elevation` blocks OIDC sessions from elevating entirely
+   (they cannot present a local TOTP step-up).
+   `auth::effective_role(session)` (admin while
+   `now < elevated_until`) is honoured by `require_admin` + the permission gates;
+   the window is monotonic `steady_clock`, in-memory per **cookie** session
+   (restart/logout drops it; API/MCP tokens can never elevate). Audits
+   `role.elevation.{granted,denied,revoked,expired}` + `user.elevation_eligibility.set`;
+   `POST /api/v1/elevate/revoke` for step-down. Passive expiry is now audited
+   too — lazily, at the `AuthRoutes::resolve_session` cookie chokepoint on the
+   operator's next authenticated request after the window lapses (no
+   background reaper); a session already at/past its own absolute lifetime is
+   rejected `401` rather than granted a zero-length window (dead-window guard).
+   See `docs/auth-architecture.md` "JIT admin elevation";
+   `tests/unit/server/test_auth_jit_elevation.cpp`.
 10. **Self-managed Certificate Authority (mTLS + code signing).** A single
     PKI root, server-managed, that operators can use instead of standing up
     their own CA. Two consumers:
@@ -241,10 +288,11 @@ matches the customer ask.
 10. **API token rotation workflow** — pair-of-tokens overlap window in the
     dashboard; "Rotate" creates a new token while the old keeps working
     until the operator confirms cutover.
-11. **API token inventory view** — surface the existing `last_used_at` /
-    owner / created_at columns from `api_token_store.cpp:325-345` into a
-    sortable Settings → API Tokens UI. (Data layer already shipped; this
-    is a dashboard-only PR.)
+11. ~~**API token inventory view.**~~ **DONE** — `render_api_tokens_fragment`
+    (Settings → API Tokens, `settings_routes.cpp`) and `GET /api/v1/tokens`
+    (`rest_api_v1.cpp`) both surface owner / created / last-used columns from
+    `api_token_store.cpp:325-345`. (The skill matrix previously listed this
+    as PARTIAL — it has in fact shipped.)
 12. **Periodic access-review export** — JSON/CSV of `(user, role, last_login)`
     triples plus an attestation upload endpoint.
 13. **Service-account principal type** — distinct from human users, no

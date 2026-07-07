@@ -33,13 +33,34 @@ struct UserEntry {
     Role role;
     std::string salt_hex;
     std::string hash_hex;
+    /// #1852 — `'local'` for a password-authenticated account (auth.db
+    /// migration v6 default; every pre-v6 row and every row created via
+    /// `upsert_user` is `'local'`), `'oidc'`/`'saml'`/`'ad'` for a durable
+    /// SSO identity auto-provisioned by `AuthDB::upsert_sso_identity`. Not
+    /// populated by every list/read path — see the call site's doc comment.
+    std::string identity_source{"local"};
 };
 
 struct Session {
+    /// STABLE authorization principal. For local/API-token auth this is the
+    /// login username; for OIDC/SSO auth (#1837) this is `"oidc:" + iss +
+    /// "#" + sub` — the IdP-issuer-scoped, immutable subject claim — NEVER a
+    /// human-readable label. `check_permission`, `reconcile_idp_memberships`,
+    /// elevation eligibility, and every audit `principal` field key on THIS
+    /// field. Two SSO users who happen to share a display name (or a display
+    /// name that later changes, e.g. after a legal name change) must never
+    /// collide or resolve to the same principal — see
+    /// docs/auth-architecture.md "Stable principal vs. display name".
     std::string username;
+    /// Human-readable label for UI/audit-DETAIL rendering only — NEVER used
+    /// for authorization or as a map/store key. For local auth this mirrors
+    /// `username`; for OIDC/SSO auth this is the IdP `name` claim (falling
+    /// back to `email`) at the time of the most recent login, so it tracks
+    /// display-name changes without perturbing the stable `username` above.
+    std::string display_name;
     Role role;
     std::chrono::steady_clock::time_point expires_at;
-    std::string auth_source{"local"}; // "local", "oidc", "api_token", or "mcp_token"
+    std::string auth_source{"local"}; // "local", "oidc", "saml", "api_token", or "mcp_token"
     std::string oidc_sub;             // OIDC subject claim (empty for local auth)
     std::string token_scope_service;  // Non-empty = token scoped to this service
     std::string mcp_tier;             // "readonly", "operator", "supervised", or "" (not MCP)
@@ -49,7 +70,52 @@ struct Session {
     /// `steady_clock::now() - cfg.mfa_step_up_window_secs` by high-risk
     /// route handlers. SOC 2 CC6.6 — see docs/auth-mfa-design.md.
     std::chrono::steady_clock::time_point mfa_verified_at{};
+
+    /// JIT admin elevation (SOC 2 CC6.3/CC6.6). When `steady_clock::now() <
+    /// elevated_until`, this session's EFFECTIVE role is `admin` regardless of
+    /// the base `role` — a time-boxed, justified, MFA-gated activation set by
+    /// `POST /api/v1/elevate` (eligibility = `users.elevation_eligible`). The
+    /// default-constructed sentinel (epoch) means "not elevated" — fail-closed,
+    /// monotonic (an NTP step can't extend it). Per-session + in-memory: a
+    /// restart or logout drops the elevation. See `effective_role()` and
+    /// docs/auth-architecture.md "JIT admin elevation".
+    std::chrono::steady_clock::time_point elevated_until{};
+
+    /// Inactivity (idle) timeout support (SOC 2 CC6.3). `last_activity_at` is
+    /// bumped toward `steady_clock::now()` on authenticated requests when the
+    /// idle timeout is enabled (`AuthManager::session_inactivity_ > 0`),
+    /// throttled to once per touch-granularity; `validate_session` rejects the
+    /// session once `now - last_activity_at` exceeds the window — a sliding
+    /// window UNDER the absolute `expires_at`. steady_clock (monotonic) so an
+    /// NTP step can neither extend nor collapse it. `last_activity_persisted_at`
+    /// throttles the best-effort AuthDB mirror (`touch_session_activity`) to at
+    /// most one write per session per kActivityPersistGranularity, keeping the
+    /// hot path off a per-request SQL write.
+    ///
+    /// Both are STAMPED at each of the three session-creation sites
+    /// (authenticate / create_local_session / create_oidc_session). The `{}`
+    /// member-init is the steady_clock EPOCH, which is fail-closed: an unstamped
+    /// session reads as instantly-idle (rejected), never a spurious keep-alive.
+    /// **Invariant:** any future path that inserts a Session into
+    /// `AuthManager::sessions_` (e.g. the v2 session-rehydration-from-auth.db
+    /// work) MUST stamp `last_activity_at`, or the restored session is
+    /// idle-evicted on its first validate when the feature is on.
+    std::chrono::steady_clock::time_point last_activity_at{};
+    std::chrono::steady_clock::time_point last_activity_persisted_at{};
 };
+
+/// True iff `s` currently holds an unexpired JIT admin elevation.
+inline bool is_elevated(const Session& s) {
+    return s.elevated_until.time_since_epoch().count() != 0 &&
+           std::chrono::steady_clock::now() < s.elevated_until;
+}
+
+/// The session's EFFECTIVE legacy role: `admin` while a JIT elevation is active,
+/// otherwise the base `role`. THE authorization functions
+/// (`require_admin`/`require_permission`/`require_scoped_permission`) must gate
+/// on this, never the raw `role`, so an elevated session is treated as admin for
+/// the window and auto-reverts when it lapses.
+inline Role effective_role(const Session& s) { return is_elevated(s) ? Role::admin : s.role; }
 
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
 
@@ -151,6 +217,12 @@ class AuthManager {
 public:
     static constexpr auto kSessionDuration = std::chrono::hours(8);
     static constexpr int kPbkdf2Iterations = 100'000;
+    /// Minimum spacing between best-effort AuthDB `last_activity_at` mirror
+    /// writes for one session, so the per-request idle-timeout touch does not
+    /// become a per-request SQL write. The in-memory `Session::last_activity_at`
+    /// is always fresh; only the durable mirror is throttled. 60 s matches the
+    /// AuthDB cleanup-thread cadence.
+    static constexpr auto kActivityPersistGranularity = std::chrono::seconds(60);
 
     /// Load users from config file. Returns false if file missing/corrupt.
     bool load_config(const std::filesystem::path& cfg_path);
@@ -186,6 +258,64 @@ public:
     /// /login/mfa/stepup route (PR 2) to mark an already-issued session
     /// as freshly MFA-verified.
     bool mark_session_mfa_verified(const std::string& token);
+
+    /// JIT admin elevation: set `elevated_until = min(now + duration,
+    /// session.expires_at)` on the named session, so its effective role is admin
+    /// for the window (SOC 2 CC6.3/CC6.6). The window is clamped to the
+    /// session's own absolute lifetime — an elevation can never outlive the
+    /// cookie session that carries it (residual-risk follow-up B, security
+    /// review 2026-06-30). The CALLER is responsible for the eligibility +
+    /// MFA-step-up gates; this only mutates the in-memory session. Returns the
+    /// absolute (possibly-clamped) expiry `steady_clock::time_point` on success
+    /// (so the route can report it), nullopt if the session does not exist OR
+    /// is already at/past its own `expires_at` (a dead-window guard, governance
+    /// hardening round UP-1/UP-4: a session that crosses its absolute lifetime
+    /// between validate_session and this call is REJECTED rather than granted a
+    /// zero-or-negative-length window — the session is left unmutated, so no
+    /// spurious `role.elevation.granted`/`role.elevation.expired` pair). The
+    /// caller's nullopt→401 path already covers this. `duration` is assumed
+    /// already clamped to the configured `--jit-max-elevation-secs` cap by the
+    /// caller.
+    std::optional<std::chrono::steady_clock::time_point>
+    elevate_session(const std::string& token, std::chrono::seconds duration);
+
+    /// Revoke an active JIT elevation (manual step-down): clear `elevated_until`
+    /// on the named session. Returns true if the session existed and was
+    /// elevated (so the route can distinguish a real revoke from a no-op).
+    bool revoke_elevation(const std::string& token);
+
+    /// Clear any active JIT elevation on EVERY session of `username` (all
+    /// devices). Called when an admin removes a user's elevation eligibility so
+    /// an in-flight elevation is terminated immediately — symmetric with the
+    /// session wipe on demote/delete (governance UP-1). Returns the number of
+    /// sessions whose elevation was cleared.
+    int revoke_user_elevations(const std::string& username);
+
+    /// Lazily reap a PASSIVELY-lapsed JIT elevation (residual-risk follow-up A,
+    /// security review 2026-06-30): if `token`'s session holds an elevation
+    /// whose window has elapsed (`elevated_until` set and `now >=
+    /// elevated_until`), clears it to the sentinel and returns the session's
+    /// username so the caller can emit `role.elevation.expired`. Returns
+    /// nullopt when the session does not exist, is oversized, is not elevated,
+    /// or its elevation is still live — including when `elevated_until` is
+    /// already the sentinel (never-elevated OR already reaped OR manually
+    /// revoked via `revoke_elevation`/`revoke_user_elevations`, both of which
+    /// also clear to the sentinel — so a manual step-down never ALSO reports a
+    /// passive expiry). Clearing on the FIRST observing call makes emission
+    /// exactly-once: a second call on the same lapsed window returns nullopt.
+    /// Called from `AuthRoutes::resolve_session` (the cookie chokepoint) on
+    /// every authenticated request — there is no background reaper thread.
+    std::optional<std::string> reap_expired_elevation(const std::string& token);
+
+    /// TEST-ONLY: push `token`'s absolute `expires_at` backward by `offset`
+    /// (a positive offset moves it into the past) without sleeping. Governance
+    /// hardening round — exercises `elevate_session`'s dead-window guard
+    /// (UP-1/UP-4: a session already at/past its own lifetime must be
+    /// REJECTED, not granted a zero-or-negative-length elevation). Mirrors
+    /// `AgentRegistry::expire_trusted_gateway_for_test`. Production code MUST
+    /// NOT call this — no caller in `server/core/src/**` references it. A
+    /// no-op if `token` is not a live session.
+    void expire_session_for_test(const std::string& token, std::chrono::seconds offset);
 
     /// Look up a session by cookie token.
     std::optional<Session> validate_session(const std::string& token) const;
@@ -243,6 +373,13 @@ public:
     /// If not set, falls back to config file I/O (backwards compatible).
     void set_auth_db(yuzu::server::AuthDB* db) { auth_db_ = db; }
 
+    /// Configure the idle (inactivity) session timeout (SOC 2 CC6.3). When > 0,
+    /// `validate_session` rejects a cookie session idle longer than `window` and
+    /// bumps `last_activity_at` on each authenticated touch. 0 (default)
+    /// disables the feature — only the absolute `kSessionDuration` applies.
+    /// Wired from Config::session_inactivity_secs at startup.
+    void set_session_inactivity(std::chrono::seconds window) { session_inactivity_ = window; }
+
     /// Non-owning AuthDB pointer (or nullptr if not configured). Exposed
     /// for the MFA-aware login flow at AuthRoutes::POST /login, which
     /// needs to call mfa_status / mfa_verify_login_code without taking
@@ -279,11 +416,60 @@ public:
     /// high-risk action. Must be `steady_clock` (not the wall-clock `iat`)
     /// so an NTP step cannot extend the step-up window — see
     /// docs/auth-mfa-design.md hard invariant #5.
+    ///
+    /// #1837 — the session's STABLE `username` (authorization principal) is
+    /// derived from `"oidc:" + iss + "#" + oidc_sub`, NOT `display_name`: a
+    /// display name is a mutable, IdP-side, human-editable label (two users
+    /// can share one, and a rename must not sever an existing user's group
+    /// memberships/roles). `iss` is the token issuer that scopes `sub` to a
+    /// specific IdP (RFC 7519 — `sub` is only unique per-issuer). `display_name`
+    /// is retained on the `Session` purely for human-readable rendering. There
+    /// is no persistent principal→display-name directory for rendering a
+    /// principal outside a live session (e.g. an admin user list, or audit-row
+    /// rendering) — the human name for such a case is recovered from that
+    /// specific SSO audit row's `display=`/`email=` detail field instead (see
+    /// /auth/callback's `audit_log_for_principal` calls). A durable directory
+    /// is tracked in #1852.
     std::string create_oidc_session(const std::string& display_name, const std::string& email,
-                                    const std::string& oidc_sub,
+                                    const std::string& oidc_sub, const std::string& iss,
                                     const std::vector<std::string>& groups = {},
                                     const std::string& admin_group_id = {},
                                     std::chrono::steady_clock::time_point mfa_verified_at = {});
+
+    /// Create an ephemeral session for a verified SAML assertion's NameID.
+    /// Role: admin if `groups` contains `admin_group` (exact match), user
+    /// otherwise — mirrors create_oidc_session's admin_group_id guard exactly.
+    /// Both `groups` and `admin_group` default-empty, so an unconfigured
+    /// deployment still mints `user` unconditionally (thin-slice-compatible).
+    /// The session's `auth_source` is `"saml"`. `last_activity_at` is stamped
+    /// per the standing invariant: any new session-creation site MUST stamp it
+    /// or the idle-eviction gate will instantly expire the session (auth.hpp §78).
+    std::string create_saml_session(const std::string& name_id,
+                                    const std::vector<std::string>& groups = {},
+                                    const std::string& admin_group = {});
+
+    /// #1852 — auto-provision (or refresh) a durable `users` row for an
+    /// OIDC-authenticated principal, so JIT admin elevation (which reads
+    /// `auth.db users.elevation_eligible`) has something to key on. Forwards
+    /// to `AuthDB::upsert_sso_identity(..., "oidc")` when `auth_db_` is set
+    /// (a legacy config-file-only deployment has no durable store — a
+    /// silent no-op). `principal` is the stable `"oidc:" + iss + "#" + sub`
+    /// form (matches `create_oidc_session`'s construction exactly — pass
+    /// the SAME string). Call this AFTER `create_oidc_session` at the route
+    /// layer, NOT from inside `create_oidc_session` itself: that method
+    /// holds `mu_` for the in-memory session map, and this performs
+    /// independent auth.db I/O that must not serialize behind it.
+    /// **Fail-soft**: an AuthDB error is logged and swallowed — the
+    /// caller's session is already minted and must not be un-minted
+    /// because provisioning failed; the principal simply cannot elevate
+    /// until a future successful login provisions it. SAML is NOT wired
+    /// to this method yet — SAML sessions are keyed on the raw NameID
+    /// (no reserved-prefix stable principal; see `create_saml_session`'s
+    /// "#1837 fast-follow" comment), which `is_valid_principal` would
+    /// reject, so a SAML session cannot elevate until that fast-follow
+    /// lands (docs/auth-architecture.md).
+    void provision_sso_identity(const std::string& principal, const std::string& iss,
+                                const std::string& sub, const std::string& display_name);
 
     const std::filesystem::path& config_path() const { return cfg_path_; }
 
@@ -443,6 +629,11 @@ private:
     // Non-owning pointer to AuthDB; if set, persistence goes through DB.
     yuzu::server::AuthDB* auth_db_ = nullptr;
 
+    /// Idle-timeout window (SOC 2 CC6.3). 0 = disabled (absolute expiry only).
+    /// Read on the validate_session hot path; set once at startup before any
+    /// request is served, so a plain member (no extra lock) is sufficient.
+    std::chrono::seconds session_inactivity_{0};
+
     // Non-owning pointer to MetricsRegistry; null in tests/CLI tools.
     yuzu::MetricsRegistry* metrics_ = nullptr;
 
@@ -459,6 +650,18 @@ std::filesystem::path default_cert_dir();
 
 std::string role_to_string(Role r);
 Role string_to_role(const std::string& s);
+
+/// Shared group→role resolution for federated (OIDC/SAML) session creation.
+/// Security-load-bearing: defaults to `Role::user`; promotes to `Role::admin`
+/// ONLY on an EXACT match between `admin_group` and one entry of `groups`.
+/// Never matches on NameID/email/display_name — those are attacker-controlled
+/// values that ride in the same assertion/claims. `admin_group` empty ⇒
+/// always `Role::user` (unconfigured deployment stays thin-slice-compatible).
+/// Extracted from create_oidc_session's original guard (byte-equivalent
+/// behaviour) and reused verbatim by create_saml_session — do not change
+/// this function's semantics without security-guardian review.
+Role resolve_role_from_groups(const std::vector<std::string>& groups,
+                              const std::string& admin_group);
 
 std::string pending_status_to_string(PendingStatus s);
 

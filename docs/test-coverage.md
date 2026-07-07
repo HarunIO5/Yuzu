@@ -1,15 +1,15 @@
 # Test Coverage Tracking
 
-Last updated: 2026-06-26
+Last updated: 2026-07-03
 
 ## Overview
 
 | Suite | Executable | Test Files | Status |
 |-------|-----------|------------|--------|
-| Agent unit tests | `yuzu_agent_tests` | 16 files | Active |
+| Agent unit tests | `yuzu_agent_tests` | 17 files | Active |
 | Server unit tests | `yuzu_server_tests` | 38 files | Active (requires `build_server=true`) |
 
-**Totals:** 48 test files. Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests.
+**Totals:** 49 test files (+1: `test_installed_apps_inventory.cpp`, blob contract v2). Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests. Note: these per-suite file counts and the "Tested" tables below have drifted from `tests/meson.build`'s actual source list on prior updates too — treat as directionally accurate, not authoritative; `tests/meson.build` is the source of truth for what's actually compiled.
 
 Run all tests: `meson test -C build-linux --print-errorlogs`
 
@@ -36,8 +36,10 @@ Run all tests: `meson test -C build-linux --print-errorlogs`
 | `test_tar_diff.cpp` | TAR diff engine | Process tree diff, network change detection, service state transitions |
 | `test_tar_store.cpp` | TAR store | Timeline event persistence, query by time range, agent scoping |
 | `test_fleet_snapshot.cpp` | TAR fleet_snapshot.v1 JSON builder | Envelope shape, processes/connections round-trip with `remote_host`, default + custom redaction patterns, truncation flags, `process_source_paused` / `tcp_source_paused` markers, `schema_minor` field, payload size bound at full cap (12 cases) |
-| `test_inventory_sync.cpp` | Agent daily-sync (ADR-0016): `sync_scheduler`, `sync_source_installed_software` | Canonical-hash cross-pin; SyncScheduler first-run jitter / hash-skip / change / need_full / phase-spread / weekly full-floor / consecutive-need_full backoff; installed_apps parse; `clamp_field` separator-strip + codepoint-boundary truncation (UP-10) + invalid-UTF-8 scrub to U+FFFD (UP-IN1); empty-name drop (UP-1); empty-inventory skip (UP-IN6); invalid-UTF-8 parity vector (16 cases) |
+| `test_inventory_sync.cpp` | Agent daily-sync (ADR-0016): `sync_scheduler`, `sync_source_installed_software` | Canonical-hash cross-pin (blob contract v2, 12 fields); SyncScheduler first-run jitter / hash-skip / change / need_full / phase-spread / weekly full-floor / consecutive-need_full backoff; `inv|` row parse incl. short/over-long-row tolerance; `clamp_field` separator-strip + codepoint-boundary truncation (UP-10) + invalid-UTF-8 scrub to U+FFFD (UP-IN1); empty-name drop (UP-1); empty-inventory skip (UP-IN6); invalid-UTF-8 parity vector (16 cases); `LocalDispatcher` `capture_cap` plumbing regression (default-cap truncates / explicit larger cap doesn't) |
+| `test_installed_apps_inventory.cpp` | `installed_apps_inventory.hpp` pure helpers (blob contract v2) | Per-ecosystem line parsers (`parse_dpkg_inv_line`/`parse_rpm_inv_line`/`parse_pacman_inv_line`/`parse_apk_inv_line`) incl. held-package/native-package/epoch-only/wrong-token-count edge cases; EVR splitters (deb/pacman `[epoch:]ver-rel`, apk `name-ver-rN`); rpm `(none)`→empty mapping; `/etc/os-release` quote/comment/CRLF handling; `pipe_safe`; `format_inv_row` 13-token layout |
 | `test_win_str_utils.cpp` _(Windows-only)_ | Shared `yuzu::win` wide<->UTF-8 helpers (#1681): `agents/shared/win_str.hpp` | `to_wide`/`from_wide` round-trip preserving "Café"; empty + null input; 512-wchar value with no terminator (#652); lone surrogate → U+FFFD; `reg_sz_to_utf8` trailing-NUL strip (none/one/two), embedded-NUL first-stop (#1682 R6), entry-level full-512 no-terminator, non-wchar-multiple size floor, null buffer + empty payload |
+| `test_service_binpath.cpp` _(Windows-only)_ | SCM `--service` binPath quoting (#1822): `agents/core/src/service_win.hpp` `make_service_binpath` | Spaceless path; `Program Files`-style path (exe-only quoting); exact ` --service` suffix (3 cases) |
 
 ### Untested Agent Components
 
@@ -49,6 +51,8 @@ Run all tests: `meson test -C build-linux --print-errorlogs`
 | **Certificate discovery** | Windows-specific CryptoAPI | Low |
 | **Cloud identity** | Requires cloud environment | Low |
 | **Identity store** | File I/O, low logic density | Low |
+| **SCM dispatcher** (#1822, `service_win.cpp` `service_main`/`handler_ex`/`run_service`) | Requires a real SCM-launched process (`StartServiceCtrlDispatcherW`); verified via live Windows-service testing instead (install/start/stop/crash-recovery/fail-closed-exit, documented on issue #1822) — see #1840 for a proposed testable-seam extraction | Low |
+| **`win_sc_handle.hpp` `ScHandle`** (RAII SC_HANDLE, move-only) | No dedicated move-semantics unit test yet (same gap as the pre-existing local copy in `guard_service.cpp`) — see #1840 | Low |
 
 ### Untested Plugin Runtime Logic
 
@@ -58,7 +62,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 |--------|--------------------------|---------------------------|
 | chargen | `chargen_line()` in string_utils | Thread/sleep loop |
 | script_exec | `split_args()` in string_utils | CreateProcess/fork/execvp |
-| installed_apps | `icontains()`, `sanitize_utf8()` | Registry enum, dpkg, rpm |
+| installed_apps | `icontains()`, `sanitize_utf8()`, and (blob v2) the full `installed_apps_inventory.hpp` parse/format surface — see `test_installed_apps_inventory.cpp` above | Registry enum, dpkg/rpm/pacman/apk subprocess invocation, `/etc/os-release` file I/O |
 | vuln_scan | `compare_versions()`, `icontains()`, `escape_pipes()` | Registry, package queries |
 | event_logs | `sanitize_input()` | PowerShell, journalctl, log |
 | os_info | `format_uptime()` | uname, sysctl, registry |
@@ -87,7 +91,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 |------|-----------|----------------|
 | `test_auth.cpp` | Auth manager | Crypto primitives, user CRUD, sessions, enrollment tokens, pending agents, config persistence |
 | `test_auto_approve.cpp` | Auto-approve | Hostname glob, CIDR subnet, CA fingerprints, rule evaluation (any/all mode), config persistence |
-| `test_nvd.cpp` | NVD database | Version comparison, CVE CRUD, batch inserts, match_inventory, metadata, builtin rules |
+| `test_nvd.cpp` | NVD database | Version comparison, CVE CRUD, batch inserts, match_inventory, metadata, builtin rules, assess() coverage-aware matching, vendor composite index (EXPLAIN plans), products_for_cves CVE→product inversion, upsert_cves changed_ids delta |
 | `test_update_registry.cpp` | OTA registry | Package CRUD, latest_for version selection, rollout eligibility, binary_path |
 | `test_https_config.cpp` | HTTPS config | Default values, cookie security attributes (Secure, HttpOnly, SameSite), retention config |
 | `test_response_store.cpp` | Response store | Store/retrieve, query filters (agent_id, status, time range), pagination, TTL, ordering |
@@ -111,12 +115,13 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | `test_legacy_shim.cpp` | Legacy command shim | Raw command-to-instruction translation |
 | `test_management_group_store.cpp` | Management groups | Group CRUD, hierarchy, device membership |
 | `test_migration_runner.cpp` | Schema migrations | Migration execution, version tracking |
-| `test_software_inventory_store.cpp` | `SoftwareInventoryStore` + `inventory_ingestion` seam (ADR-0016) | Canonical-hash cross-pin, hash-skip ingest (full/touched/need_full/drift/cold-cache), atomic full-replace, invalid-UTF-8 scrub-to-U+FFFD store + agent hash coordination (UP-IN1), codepoint-boundary truncation (UP-10), oversized-blob drop+nack (UP-2/UP-4), kError→need_full nack (UP-2), fleet query (live PostgreSQL) |
+| `test_software_inventory_store.cpp` | `SoftwareInventoryStore` + `inventory_ingestion` seam (ADR-0016) | Canonical-hash cross-pin (blob contract v2, 12 fields), hash-skip ingest (full/touched/need_full/drift/cold-cache), atomic full-replace, invalid-UTF-8 scrub-to-U+FFFD store + agent hash coordination (UP-IN1), codepoint-boundary truncation (UP-10), oversized-blob drop+nack (UP-2/UP-4), kError→need_full nack (UP-2), fleet query (live PostgreSQL); v2 12-field round-trip through store + ingest seam; v1→v2 mixed-version compat (bounded need_full loop, not infinite); migration v5 upgrade (pre-v5 rows read `''` in new columns) |
+| `test_vuln_finding_store.cpp` + `test_vuln_finding_store_adversarial.cpp` | `VulnFindingStore` (born-on-PG, ADR-0023 M1a) | Fail-closed ctor + idempotent migration, reconcile sequence (upsert-always / authoritative-gated sweep + `disposed_clean` delete + coverage clobber), monotonic in-txn `run_ts` + NTP-step-back safety, re-observe/status-upgrade in place, three-way coverage read (Ok/NotFound/Degraded under real pool exhaustion), authoritative `fleet_summary` (nullopt-on-degrade, excludes resolved), nullable cvss/fixed_in NULL round-trip, non-finite cvss (NaN/+Inf)→NULL no-abort (FIX 2), UP-2 mass-resolve backstop arm/narrow (FIX 3), NUL-in-identity reject (FIX 4), mixed-case severity/status query-filter normalization (FIX 6), whole-batch rollback on a bad row (mid-batch), duplicate-key-in-batch upsert, per-agent advisory-lock serialization + cross-store namespace isolation (deterministic `pg_try_advisory_xact_lock` proof), SQL-metacharacter parameterization; also exercises `SoftwareInventoryStore::list_agent_ids` keyset pager (live PostgreSQL) |
 | `test_notification_store.cpp` | Notifications | In-app notification CRUD, read/unread status |
-| `test_oidc_provider.cpp` | OIDC SSO | PKCE flow, JWT validation, group claim parsing |
+| `test_oidc_provider.cpp` | OIDC SSO | PKCE flow, JWT validation, group claim parsing (present/empty/absent, Entra `_claim_names`/`_claim_sources` group-overage detection, `groups_claim_reconcilable` gate) |
 | `test_quarantine_store.cpp` | Quarantine | Device quarantine/release, network isolation state |
 | `test_rate_limiter.cpp` | Rate limiting | Token bucket, per-IP/per-token limits |
-| `test_rbac_store.cpp` | RBAC store | Role CRUD, permission assignment, deny-override logic |
+| `test_rbac_store.cpp` | RBAC store | Role CRUD, permission assignment, deny-override logic; IdP-group reconciliation (#1832): namespacing/confused-deputy, add/remove diff, empty-asserted full deprovisioning (incl. a local-role-grant-survives regression guard), group-count cap (boundary + over-cap), reserved-prefix guard on `create_group`, `reconcile_idp_memberships` source-verify against a pre-existing differently-sourced namespaced row, `source=="local"`/empty rejection, blank/oversized `external_id` skip, `{added,removed}` count reporting, v1→v2 schema migration (indices + no data loss) |
 | `test_result_envelope.cpp` | Result envelope | Structured response formatting |
 | `test_schedule_engine.cpp` | Scheduler | Cron scheduling, next-run calculation, scope-based targeting |
 | `test_webhook_store.cpp` | Webhooks | Subscription CRUD, HMAC-SHA256 signing, delivery |

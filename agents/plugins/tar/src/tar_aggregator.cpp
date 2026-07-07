@@ -221,8 +221,19 @@ std::string_view diff_state_key(std::string_view source) {
         return "arp";
     if (source == "dns")
         return "dns";
-    // perf/procperf keep an in-memory previous reading; netqual is stateless;
-    // module is a stream-drained source (no snapshot-diff baseline).
+    // §3.8 — mapdrive is a snapshot-diff source: the collect_slow leg keeps a
+    // baseline under get_state/set_state "mapdrive", so the on-disable clear must
+    // reach it or a re-enable would emit ghost appeared/removed mapping deltas for
+    // the paused window (#538). (The one-time historical backfill does NOT use this
+    // baseline — it inserts directly, gated by the mapdrive_backfill_done key.)
+    if (source == "mapdrive")
+        return "mapdrive";
+    // perf/procperf keep an in-memory previous reading; netqual holds only a
+    // wall-clock-guarded in-memory baseline (re-anchored on a long gap, never a
+    // stored diff); netconn is high-water-mark based (its only state is the
+    // netconn_backfill_hwm config key, deliberately kept across a disable so the
+    // OS event log recovers the paused window); module is stream-drained. None
+    // of these has a snapshot-diff baseline to clear here.
     return {};
 }
 
@@ -308,6 +319,20 @@ std::string_view canonical_source_enabled(std::string_view stored_value) {
     if (stored_value == "false")
         return "false";
     return "errored"; // anything else was written outside the plugin
+}
+
+// #560 — gate on the canonical tri-state, not `!= "false"`. A value the plugin
+// never writes ("maybe", "1", "", a bit-flip) maps to "errored", which is NOT
+// "true", so collection STOPS (fail closed). The bare `!= "false"` treated every
+// such value as enabled, so a source an operator paused for forensics whose
+// `_enabled` value was corrupted or tampered kept collecting — and disagreed
+// with the tri-state `status` reports. run_retention() shares the same canonical
+// gate so an "errored" source's rows are preserved, not pruned. Also the
+// authoritative paused-guard for the Phase 15.A `tar.purge_source` action.
+bool source_enabled(TarDatabase& db, std::string_view source) {
+    const char* def = source_default_enabled(source) ? "true" : "false";
+    return canonical_source_enabled(db.get_config(std::format("{}_enabled", source), def)) ==
+           "true";
 }
 
 void run_retention(TarDatabase& db, int64_t now_epoch) {

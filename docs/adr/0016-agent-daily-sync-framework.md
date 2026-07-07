@@ -81,8 +81,10 @@ A small, source-agnostic seam:
   blob when the hash is unchanged** since the last successful sync.
 - The server is **authoritative**: on stored-hash mismatch *or no record* it
   replies `need_full` for that source, and the agent re-pushes the full list
-  (conditional-request / HTTP-304 pattern). This covers all cold-cache cases:
-  DB wiped, new/migrated server, reassigned agent.
+  (conditional-request / HTTP-304 pattern); the resend is jittered so a
+  server-side cold cache doesn't trigger a synchronized full-resend herd.
+  This covers all cold-cache cases: DB wiped, new/migrated server,
+  reassigned agent.
 - A **weekly full-floor** (send full regardless) is the defense-in-depth
   backstop.
 - **Hash trust:** the server **recomputes the canonical hash server-side from
@@ -266,3 +268,159 @@ agent cannot re-stamp itself), so **migration v3** clamps any pre-fix row whose
 staleness window. Options weighed and rejected: a `min(collected_at, now)`
 *clamp* (kills only future-skew, not past-skew) and a *separate server-stamped
 column* (correct but an unnecessary migration given the absent display consumer).
+
+### 2026-06-30 — source #3 `device_ci` (device hardware/OS identity, CMDB CI record)
+
+A third sync source, **`device_ci`**, collects the machine's stable
+hardware/OS identity by invoking the existing `hardware`, `device_identity`,
+`os_info`, and `network_config` plugins in-process (`LocalDispatcher`) and
+rendering them into a canonical CI record: manufacturer, model, **serial
+number**, **system UUID**, BIOS vendor/version/date, CPU model/cores/threads,
+RAM bytes, a disks summary, **primary MAC** + a MAC summary + NIC count, OS
+name/version/build, and architecture. A new `hardware` plugin `system` action
+collects serial + UUID (Windows WMI, Linux `/sys/class/dmi/id` via
+`cap_dac_read_search`, macOS `ioreg`). **Volatile telemetry — disk free space,
+uptime, IP addresses — is deliberately excluded** so the content hash is stable
+and hash-skip suppresses steady-state traffic (an IP that churns on DHCP renewal
+would flap the hash and force a daily full resend).
+
+**No proto change and no gateway gpb regen.** A new source is a new KEY in the
+existing `plugin_data`/`content_hashes` maps, not a new proto FIELD — §6's regen
+requirement is about new fields (`content_hashes`/`need_full` themselves), which
+already shipped. `app_perf` (source #2) established this precedent; `device_ci`
+confirms it. The Erlang gateway decodes/re-encodes only the existing map fields
+and never inspects opaque map values, so a new key survives the hop unchanged.
+
+**Store.** Born-on-PG `DeviceInventoryStore` (schema `device_inventory_store`,
+table `device_ci`) — **1:1 per agent** (one identity per machine, the
+`OfflineEndpointStore` shape), not the 1:N parent+child of §7 (that is for the
+N-row `installed_software`). Ingest via the shared `device_ci_ingestion.*` seam
+on **both** `ReportInventory` and gateway `ProxyInventory` (§5 parity). Failure
+posture per §7: ingest fail-soft, reads authoritative (`std::expected` /
+`std::nullopt`, never silent-empty). `last_seen`/`first_seen` are the server
+receipt time from day one (#1685).
+
+**Data classification + co-determination (supersedes the borrowed §8 citation).**
+§8's "no PII / no co-determination trigger" argument was constructed for
+`installed_software` (HKLM app names) and does **not** transfer unchanged:
+`serial`, `system_uuid`, and `primary_mac` are **stable device-persistent
+identifiers**, which are personal data under GDPR when a device is
+person-assigned, and the *capability* to track a device (and by association its
+user) over time triggers EU works-council co-determination review regardless of
+per-user data. The collection is still **machine-scope** (no username/SID/user
+path). The existing **`--inventory-disable`** flag is the collection toggle and
+covers `device_ci` at the same gate as the other sources (it gates the whole
+daily-sync thread).
+
+**DPIA status update (gov Gate 6 compliance-officer, PR2).** The line above
+originally scoped the DPIA/Workstream-E entry as a "pre-correlation-PR assurance
+item" — written when this data was store-only (central Postgres, no operator
+surface). That framing is now stale: the `/inventory` Devices tab CI columns +
+per-device CI panel (PR2 of this ladder) make serial/system_uuid/primary_mac
+**operator-visible** for the first time, which is a co-determination trigger
+point distinct from mere central storage (works-council review is about
+monitoring *capability becoming exercised*, not just data existing in a DB).
+The interim posture — already-permissioned operators, management-group scoped,
+audited via the behavioural-PII tier (`emit_behavioral_audit`) — is a
+defensible control pending the DPIA, not a reason to withhold the read surface.
+But the DPIA / Workstream-E data-inventory entry for centralizing
+serial/UUID/MAC is now an **outstanding item that applies to a live,
+operator-visible surface**, not a future-tense placeholder — track it as a
+dated, owned issue (see the SOC2 Workstream E data-inventory doc) rather than
+leaving it as prose here.
+
+**Binding requirement for a future CMDB-correlation PR (unscheduled) — do NOT
+correlate on `"unknown"`.** (Note: the ladder's actual "PR2" — the `/inventory`
+Devices tab CI columns + per-device CI panel — is dashboard-**read**-only; it joins
+purely on `agent_id` and does not implement CMDB correlation/merge, so this
+requirement does not apply to it and remains open for whichever future PR adds
+cross-device correlation.) When the platform identity subsystem is unavailable, or
+a host genuinely has no SMBIOS serial (many VMs; Linux without the capability),
+`serial`/`system_uuid` are the literal `"unknown"`. The PR1 collect skips a cycle
+only when manufacturer AND model are both `"unknown"` (a wholesale WMI/DMI outage —
+`core_identity_unavailable`), which prevents a transient blip from overwriting a
+good row and flapping the hash; but a serial-less VM with real manufacturer/model
+is persisted with `serial="unknown"` by design. **A future CMDB correlation/merge
+feature MUST treat `serial=="unknown"` / `system_uuid=="unknown"` as ABSENT and
+never merge distinct devices on it** (otherwise every WMI-down or serial-less host
+collapses into one CI). The store keys on `agent_id`, so there is no PR1
+collision — this is purely a future correlation-feature concern. Also note
+**macOS `IOPlatformUUID` ≠ the SMBIOS UUID** reported on Windows/Linux, so
+cross-OS correlation by UUID will miss.
+
+**Known inherited property (forward).** The content hash covers the field *set*,
+so a mixed-version rollout (an agent that adds/removes a field vs an older server)
+round-trips to a different hash → continuous `need_full` until both sides match.
+This is identical to `installed_software` and is a **framework-wide** trait;
+hashing the raw received blob bytes instead of the re-serialized record would
+neutralize it (and the multi-copy scrub/clamp drift surface) but must be done for
+**all** sources together, not `device_ci` alone — tracked as a follow-up. The
+agent↔server scrub/clamp byte-equality is locked by a clean **and dirty** cross-pin
+test today. A 1-byte blob format-version prefix is the other future-proofing option.
+
+The `yuzu_inventory_stale_agents` freshness gauge is **not** yet extended to
+`device_ci` (it reads `SoftwareInventoryStore::count_stale_agents` only); the
+#1685 server-stamped `last_seen` is in place but its gauge consumer is a deferred
+follow-up (same as `app_perf`).
+
+### 2026-07-02 — blob contract v2: package-manager fields on `installed_software`
+
+The `installed_software` wire blob grows from 4 to **12 fields** per record, in
+this exact order (append-only; 0x1F between fields, 0x1E terminating a record):
+
+```
+name, version, publisher, install_date,
+kind, ecosystem, epoch, release, arch, signature_status, distro_id, distro_version
+```
+
+Motivation: the server-authoritative vulnerability-matching direction (ADR-0018)
+needs full EVR (`epoch:version-release`) + `arch` + the host's distro release for
+Lane-1 OVAL matching, and an honest `kind=app` discriminator for the Lane-3
+OS-native tail. The population contract is **honest-empty**: a field the
+ecosystem does not store is `''`, never synthesised (rpm = full NEVRA + PACKAGER
++ stored-tag signature status; deb = NEVRA + Maintainer + arch, installed AND
+held; apk = name/version/pkgrel; pacman = name/EVR; Windows/macOS = `kind=app`
+with name/version/publisher only; `distro_id`/`distro_version` from
+`/etc/os-release` stamped on every Linux row; `homebrew` is a reserved
+ecosystem value, not collected). `version` is now the upstream version with the
+release/revision split into its own field, and rpm `publisher` switches
+VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
+
+Mechanics:
+
+- The fields ride **inside** the `plugin_data["installed_software"]` blob — no
+  proto change, no gateway pb regen (§6 applies only to outer-envelope fields).
+- Collection is a new `installed_apps` action **`list_inventory`** (13-token
+  `inv|` rows); the operator-facing `list`/`query`/`list_per_user` output is a
+  stable contract and is byte-unchanged (rpm `list` keeps VENDOR).
+- Store: migration v5 adds the 8 columns as `TEXT NOT NULL DEFAULT ''`
+  (metadata-only on PG11+). REST/MCP rows carry all 12 fields.
+- Caps: unchanged (`kMaxEntries` 20k, `kMaxFieldLen` 1024, `kMaxBlobBytes`
+  3 MiB — a 20k-row v2 blob is ~2.8 MB, still under the 4 MiB gRPC ceiling).
+  The sync source passes a per-call **3.5 MiB** capture cap to
+  `LocalDispatcher` (the shared 2 MiB default would silently truncate — and
+  therefore cycle-skip — hosts above ~14k packages).
+- **One-time rekey herd (expected):** the hash reformats even when every new
+  field is empty, so each upgraded agent's first v2 report mismatches its stored
+  v1 hash → one `need_full` full resend per agent, phase-spread over the ~24 h
+  window, self-healing. Mixed-version windows settle into the bounded
+  ~2-RPC/day loop described in the "Known inherited property" paragraph above —
+  this change deliberately does NOT add a one-source compat hash; the raw-blob
+  hash / 1-byte format-version prefix remain the framework-wide follow-up.
+- The v1→v2 parse compatibility (a 4-field record reads with fields 5–12 empty)
+  is pinned by tests on both sides, as is the identical 12-field cross-pin hash.
+- **Deploy order: server before agents.** The server accepts both v1 and v2
+  wire blobs from the moment it's deployed, so a new agent against an old
+  server is possible but not the intended path — it degrades gracefully (the
+  old server's 4-field parser drops fields 5-12, same bounded loop as any
+  other mixed-version window). Deploying the server first means every agent
+  upgrade lands against a server that already understands v2.
+- **PII scope note.** §8's "no end-user PII, no works-council trigger" finding
+  is about the *monitored device's* end user — it is unaffected by v2. It does
+  NOT extend to third-party package-maintainer metadata: the deb `Maintainer`
+  tag (unchanged from v1) and the rpm `PACKAGER`/`VENDOR` tags can, per upstream
+  packaging convention, carry an individual maintainer's real name + email
+  (common on community/COPR-built packages) — that is third-party data-subject
+  data, not the monitored end-user's, and is out of scope for the
+  co-determination analysis above. `distro_id`/`distro_version` add no new
+  exposure (already derivable from the existing `os_info` source).

@@ -343,6 +343,36 @@ int main(int argc, char* argv[]) {
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_AUTH_LOCKOUT_WINDOW_SECS");
 
+    // JIT admin elevation — SOC 2 CC6.3/CC6.6. See docs/auth-architecture.md.
+    app.add_option("--jit-max-elevation-secs", cfg.jit_max_elevation_secs,
+                   "Maximum lifetime (seconds) of a time-boxed admin elevation granted via "
+                   "POST /api/v1/elevate (default: 3600 = 1h, max 86400 = 24h). A request asking "
+                   "for longer is clamped. Eligibility is the per-user users.elevation_eligible "
+                   "flag; elevation is in-memory per-session and auto-reverts on lapse.")
+        ->default_val(3600)
+        ->check(CLI::Range(1, 86400))
+        ->envname("YUZU_JIT_MAX_ELEVATION_SECS");
+
+    app.add_flag("--jit-oidc-amr-elevation,!--no-jit-oidc-amr-elevation",
+                 cfg.jit_oidc_amr_elevation,
+                 "Allow an OIDC session whose IdP login attested MFA (the `amr` claim) to "
+                 "satisfy POST /api/v1/elevate's mandatory second-factor requirement without "
+                 "local TOTP enrollment (default: true). A no-amr (single-factor) OIDC session "
+                 "is still denied regardless. Pass --no-jit-oidc-amr-elevation to disable it — "
+                 "OIDC sessions then cannot use JIT elevation at all (an operator must elevate "
+                 "from a local session with local TOTP).")
+        ->envname("YUZU_JIT_OIDC_AMR_ELEVATION");
+
+    // Operator dashboard idle (inactivity) session timeout — SOC 2 CC6.3.
+    app.add_option("--session-inactivity-secs", cfg.session_inactivity_secs,
+                   "Seconds of inactivity after which an operator dashboard session is invalidated "
+                   "server-side — a sliding window UNDER the absolute 8h session lifetime "
+                   "(default: 0 = disabled; recommended 900 = 15 min). Only affects cookie "
+                   "sessions; OIDC re-login and API tokens are unaffected.")
+        ->default_val(0)
+        ->check(CLI::NonNegativeNumber) // 0 disables; negative is rejected
+        ->envname("YUZU_SESSION_INACTIVITY_SECS");
+
     // Metrics auth
     app.add_flag("--metrics-no-auth", "Allow unauthenticated /metrics access from any source")
         ->each([&cfg](const std::string&) { cfg.metrics_require_auth = false; })
@@ -432,6 +462,11 @@ int main(int argc, char* argv[]) {
     app.add_flag("--no-nvd-sync", "Disable NVD CVE feed sync")->each([&cfg](const std::string&) {
         cfg.nvd_sync_enabled = false;
     });
+    app.add_option("--nvd-backfill-years", cfg.nvd_backfill_years,
+                   "How many years back the newest-first NVD backfill walks (<=0 = full history; "
+                   "default: 8)")
+        ->default_val(8)
+        ->envname("YUZU_NVD_BACKFILL_YEARS");
 
     // OTA agent update options
     app.add_option("--update-dir", cfg.update_dir, "Directory for agent update binaries")
@@ -481,6 +516,30 @@ int main(int argc, char* argv[]) {
     app.add_flag("--oidc-skip-tls-verify", cfg.oidc_skip_tls_verify,
                  "Disable TLS certificate verification for OIDC endpoints (INSECURE, dev only)")
         ->envname("YUZU_OIDC_SKIP_TLS_VERIFY");
+
+    // SAML 2.0 SSO options (not supported on Windows — fail-closed)
+    app.add_option("--saml-idp-entity-id", cfg.saml_idp_entity_id,
+                   "SAML IdP entityID (must match Issuer element in assertions)")
+        ->envname("YUZU_SAML_IDP_ENTITY_ID");
+    app.add_option("--saml-idp-sso-url", cfg.saml_idp_sso_url,
+                   "SAML IdP SSO URL (HTTP-Redirect binding endpoint)")
+        ->envname("YUZU_SAML_IDP_SSO_URL");
+    app.add_option("--saml-idp-cert", cfg.saml_idp_cert,
+                   "Filesystem path to IdP signing certificate PEM (pinned key)")
+        ->envname("YUZU_SAML_IDP_CERT");
+    app.add_option("--saml-sp-entity-id", cfg.saml_sp_entity_id,
+                   "SAML SP entityID (used as AudienceRestriction in assertions)")
+        ->envname("YUZU_SAML_SP_ENTITY_ID");
+    app.add_option("--saml-sp-acs-url", cfg.saml_sp_acs_url,
+                   "SAML SP Assertion Consumer Service URL (POST binding endpoint)")
+        ->envname("YUZU_SAML_SP_ACS_URL");
+    app.add_option("--saml-group-attribute", cfg.saml_group_attribute,
+                   "SAML <Attribute Name=\"...\"> whose values are group identifiers "
+                   "(e.g. the Entra groups claim URI); empty disables group parsing")
+        ->envname("YUZU_SAML_GROUP_ATTRIBUTE");
+    app.add_option("--saml-admin-group", cfg.saml_admin_group,
+                   "SAML group value (from --saml-group-attribute) that maps to admin role")
+        ->envname("YUZU_SAML_ADMIN_GROUP");
 
     // Data infrastructure options
     app.add_option("--response-retention-days", cfg.response_retention_days,
@@ -544,6 +603,20 @@ int main(int argc, char* argv[]) {
                      cfg.mfa_enforcement,
                      cfg.mfa_enforcement == "required" ? "users" : "admins");
     }
+    // ── JIT elevation OIDC-amr posture advisory (SRE SHOULD) ──
+    // Surface once at boot, alongside the other auth-posture lines, so an
+    // incident responder can discover this without reading source or an
+    // individual audit row's `mfa=` detail. Gated on the SAME predicate
+    // `oidc::Config::is_enabled()` uses (issuer AND client-id both set — see
+    // the --auth-mode=sso-only guard below) so a local-only deployment never
+    // sees an OIDC-flavoured log line.
+    if (!cfg.oidc_issuer.empty() && !cfg.oidc_client_id.empty() &&
+        cfg.jit_oidc_amr_elevation) {
+        spdlog::info("OIDC MFA (amr) may satisfy the elevation second-factor without local TOTP "
+                     "enrollment — pass --no-jit-oidc-amr-elevation to disable it, in which case "
+                     "OIDC sessions cannot use JIT elevation at all (an operator must elevate from "
+                     "a local session with local TOTP).");
+    }
     // NOTE: the --auth-mode=sso-only fail-closed guard + posture log live just
     // before the server starts to SERVE (below), NOT here — so the host-CLI
     // one-shots (--break-glass-arm, --mfa-reset) can run on an sso-only
@@ -573,6 +646,29 @@ int main(int argc, char* argv[]) {
     } else {
         spdlog::warn("Account lockout DISABLED (--auth-lockout-threshold=0) — local-password "
                      "logins have no brute-force throttle.");
+    }
+    // Idle (inactivity) session-timeout posture (SOC 2 CC6.3 evidence). Unlike
+    // lockout this is an in-memory control (no auth.db dependency), so it is
+    // honestly "active" whenever configured. The absolute 8h session lifetime
+    // applies regardless.
+    if (cfg.session_inactivity_secs > 0) {
+        // Derive the absolute-lifetime seconds from the single source of truth
+        // (kSessionDuration) so this warn threshold and the docs can't silently
+        // drift if the absolute lifetime ever changes (governance consistency).
+        const auto abs_lifetime_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                           yuzu::server::auth::AuthManager::kSessionDuration)
+                                           .count();
+        spdlog::info("Idle session timeout active: operator dashboard sessions are invalidated "
+                     "after {}s of inactivity (under the absolute {}s session lifetime).",
+                     cfg.session_inactivity_secs, abs_lifetime_secs);
+        if (cfg.session_inactivity_secs >= abs_lifetime_secs) {
+            spdlog::warn("--session-inactivity-secs={} >= the absolute session lifetime ({}s); "
+                         "the idle window will never trigger before absolute expiry.",
+                         cfg.session_inactivity_secs, abs_lifetime_secs);
+        }
+    } else {
+        spdlog::info("Idle session timeout DISABLED (--session-inactivity-secs=0) — only the "
+                     "absolute 8h session lifetime applies.");
     }
     // PR2 governance Gate 2 sec-M6: the step-up gate honours
     // window_secs <= 0 as an "escape hatch" that lets every request
@@ -745,6 +841,9 @@ int main(int argc, char* argv[]) {
         config_file.empty() ? auth::default_config_path() : std::filesystem::path(config_file);
 
     auth::AuthManager auth_mgr;
+    // Idle (inactivity) session timeout — SOC 2 CC6.3. In-memory feature, set
+    // unconditionally (works with or without auth.db). 0 = disabled.
+    auth_mgr.set_session_inactivity(std::chrono::seconds(cfg.session_inactivity_secs));
 
     if (!auth_mgr.load_config(cfg_path)) {
         spdlog::warn("No user config found at {}", cfg_path.string());

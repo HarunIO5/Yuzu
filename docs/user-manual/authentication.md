@@ -185,6 +185,14 @@ curl -s -b cookies.txt -X POST http://localhost:8080/logout
 
 Returns `200 OK` with `{"status":"ok"}`. The session is invalidated server-side and the `yuzu_session` cookie is cleared via `Set-Cookie` with `Max-Age=0`.
 
+### Session lifetime
+
+Dashboard cookie sessions have an **absolute lifetime of 8 hours** from login. When this expires the operator is redirected to `/login`. Sessions are also invalidated server-side on logout, on session revocation (Settings → User Management → Revoke sessions, or "Sign out everywhere"), and on server restart.
+
+An optional **idle (inactivity) timeout** can shorten this. When `--session-inactivity-secs` (`YUZU_SESSION_INACTIVITY_SECS`) is set to a positive value, a session idle longer than that window is invalidated server-side and the operator is prompted to log in again — regardless of the 8-hour absolute limit. The default `0` disables it (only the absolute lifetime applies). The window is **sliding**: any authenticated request resets it. Scope is **cookie sessions only** — API tokens and MCP tokens are never idle-timed-out, and OIDC users simply re-authenticate via SSO. A recommended hardened value is `900` (15 minutes).
+
+See [Server Administration — CLI flags](server-admin.md) for configuration and `docs/auth-architecture.md` "Inactivity session timeout" for design detail.
+
 ### Auth Middleware Behavior
 
 | Client type | Unauthenticated behavior |
@@ -244,7 +252,7 @@ Navigate to **Settings > Directory Integration / OIDC SSO** in the dashboard. En
 | `--oidc-client-id` | Application (client) ID from the IdP |
 | `--oidc-client-secret` | Client secret (required for Entra/Azure AD web apps) |
 | `--oidc-redirect-uri` | Callback URL (auto-computed from the request `Host` header if omitted; must match IdP registration if set explicitly) |
-| `--oidc-admin-group` | Entra group object ID that maps to the admin role |
+| `--oidc-admin-group` | Entra group object ID that maps to the admin role (the value is trimmed automatically, same as `--saml-admin-group` — #1830) |
 | `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC endpoints (insecure, dev only) |
 
 Example startup:
@@ -289,6 +297,22 @@ Admin via OIDC is granted **only** through explicit membership in the configured
 
 > **Note:** Only a single admin group mapping is currently supported via the `--oidc-admin-group` CLI flag. Multi-role group mapping (e.g., mapping different groups to ITServiceOwner or Operator) is planned for a future release and will use the RBAC store's group-scoped role assignments.
 
+### RBAC Group Provisioning (#1832)
+
+Independently of the `--oidc-admin-group` admin mapping above, every OIDC login reconciles the IdP's `groups` claim into the RBAC store so that group-scoped role assignments take effect for SSO users. There is no dedicated group-membership UI — a group-scoped role grant is made via the management-group role-delegation API, `POST /api/v1/management-groups/{id}/roles`, whose `principal_id` field is free text: set `"principal_type": "group"` and `"principal_id": "entra:<group-id>"` to delegate `Operator` or `Viewer` to everyone the IdP asserts is in that group. Each asserted group is written as `entra:<group-id>` — **namespaced** by identity source, never the raw IdP group id — so a locally-created RBAC group can never collide with (or be impersonated by) a same-named IdP group.
+>
+> **Do not confuse the two forms.** `--oidc-admin-group` (the admin mapping above) matches against the **raw** IdP group object id as it appears in the token's `groups` claim — configure it with the raw id (e.g. `a1b2c3d4-…`), *not* the namespaced `entra:<id>` form, or admin elevation silently fails. Only group-scoped RBAC role delegation (`principal_id`) uses the namespaced `entra:<id>` form.
+
+The reconcile also removes any of the user's `entra:`-owned memberships that the IdP no longer asserts, so a group removal on the IdP side takes effect on the user's **next SSO login** — memberships are **not** revoked mid-session; a live cookie session or already-issued API token retains its prior roles until re-authentication (residual, tracked in #1836 — the operator's manual mitigation in the interim is `DELETE /api/v1/sessions?username=<name>`, "Session lifetime" above). A malformed or oversized (`>200` groups) assertion, or a reconcile-store failure, denies the login outright rather than granting a session with stale roles.
+
+**Entra group overage.** Once a user belongs to more groups than fit in the ID token (Entra's documented threshold is 200 groups), Entra omits the `groups` claim entirely and sends a `_claim_names`/`_claim_sources` indirection pointer instead. Reconciliation is **skipped** for that login — existing memberships are left exactly as they were, and the login still succeeds — rather than reading the resulting empty claim as "this user is in zero groups" and deleting every one of their existing memberships. A heavily-grouped legitimate user simply doesn't get their SSO-driven roles updated on an overaged login until Entra can report the full set (out-of-band group lookup, e.g. via Microsoft Graph, is not implemented in this release).
+
+See the `auth.sso_group_provision` audit action (`docs/user-manual/audit-log.md`) for the full `result=ok|skipped|error` contract and detail-field shape.
+
+> **Upgrade note:** Before this fix, OIDC groups were synced under their raw (un-namespaced) id, so an operator may have assigned an RBAC role directly to a group named e.g. `8f3c...` (the raw Entra group id). Those role assignments do **not** automatically move to the new namespaced group. **Re-assign any such role to `entra:<group-id>`** via the same `POST /api/v1/management-groups/{id}/roles` API — the old raw-id group row is left in place (harmless, but no longer reachable by future logins) and can be deleted once you've confirmed the namespaced group has the role.
+
+> **Operational note (fail-closed):** a transient `rbac.db` failure during an OIDC login denies the login outright (no session minted) rather than granting one under unreconciled roles (`docs/auth-architecture.md` "RBAC group provisioning (#1832)"). This does not affect the break-glass/local-password path (`/login`, hardened-mode escape hatch): break-glass logins never call `/auth/callback` and so never touch RBAC group reconciliation.
+
 ### Entra ID Setup Checklist
 
 1. Register an application in Entra ID (Azure Portal > App registrations).
@@ -297,6 +321,153 @@ Admin via OIDC is granted **only** through explicit membership in the configured
 4. Under Token configuration, add the `groups` optional claim to the ID token.
 5. Grant `openid`, `profile`, and `email` API permissions.
 6. Pass the tenant-specific issuer URL, client ID, secret, and admin group ID to the Yuzu server flags (`--oidc-issuer`, `--oidc-client-id`, `--oidc-client-secret`, `--oidc-admin-group`).
+
+## SAML 2.0 SSO
+
+Yuzu supports SAML 2.0 SP-initiated single sign-on against a single, statically-configured IdP. This is an alternative to OIDC for enterprises whose identity infrastructure requires SAML rather than OpenID Connect.
+
+> **Platform note:** SAML is supported on Linux and macOS only. A Windows server logs an error at startup and does not enable SAML regardless of flag values. If you need SSO on Windows, use OIDC.
+
+> **Role note:** SAML sessions default to `role=user`. Configure `--saml-group-attribute` + `--saml-admin-group` to promote users in a specific IdP-attested group to `role=admin` — see [SAML Group-to-Role Mapping](#saml-group-to-role-mapping) below. Leave both flags unset (the default) and every SAML session lands as `role=user`, same as prior releases. JIT elevation is still non-functional for SAML users regardless of role (the elevation check requires a local `users` row in auth.db, which SAML users do not have) — a SAML admin gets `role=admin` directly at login via group mapping, not via the elevation endpoint.
+
+> **HTTPS required:** SAML uses a `Secure` browser-binding cookie (`__Host-yuzu_saml_bind`). Browsers silently drop `Secure` cookies over plain HTTP. SAML fails closed at startup when `--https-cert`/`--https-key` are not configured. Do not run SAML over HTTP.
+
+> **MFA step-up:** MFA step-up is not supported for SAML sessions in this release. A SAML session hitting any of the 11 step-up-gated endpoints (token mint/revoke, session revoke, Guardian rule write, software deploy, user management) receives a `403` regardless of `--mfa-enforcement` mode. Use `--mfa-enforcement=optional` and rely on your IdP to enforce MFA at login time. Do not use `--mfa-enforcement=required` for SAML deployments — it denies SAML users at all step-up gates.
+
+### Registering the SP with Your IdP
+
+Before configuring the server, register Yuzu as a Service Provider with your identity provider:
+
+1. **SP Entity ID** — a URI that identifies this Yuzu installation to the IdP (e.g. `https://yuzu.example.com`). You choose this value; it must be unique within the IdP's SP registry.
+2. **ACS URL** — the Assertion Consumer Service URL where the IdP will POST the SAML response. This is `https://yuzu.example.com/saml/acs` (or the equivalent for your host and port). Set this as the ACS / reply URL in your IdP.
+3. **Bindings** — configure the IdP to use **HTTP-Redirect** for the AuthnRequest and **HTTP-POST** for the response to the ACS.
+4. **IdP signing certificate** — download or copy the IdP's assertion-signing certificate in PEM format and store it on the Yuzu server host (e.g. `/etc/yuzu/idp-signing.pem`, readable by the `yuzu` service account).
+
+### Server Configuration
+
+SAML is enabled via CLI flags (or the matching environment variables). All five flags (`--saml-idp-entity-id`, `--saml-idp-sso-url`, `--saml-idp-cert`, `--saml-sp-entity-id`, `--saml-sp-acs-url`) are validated at startup as one unit — supplying any subset produces a startup warning that names the missing flag, and SAML is disabled (fail-closed). A partial configuration never logs "SAML SP initialized".
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--saml-idp-entity-id` | `YUZU_SAML_IDP_ENTITY_ID` | Entity ID URI of the IdP (must match what the IdP uses in its assertions) |
+| `--saml-idp-sso-url` | `YUZU_SAML_IDP_SSO_URL` | IdP's HTTP-Redirect SSO endpoint URL |
+| `--saml-idp-cert` | `YUZU_SAML_IDP_CERT` | Path to the IdP signing certificate PEM file on the server host |
+| `--saml-sp-entity-id` | `YUZU_SAML_SP_ENTITY_ID` | Entity ID URI this SP advertises to the IdP |
+| `--saml-sp-acs-url` | `YUZU_SAML_SP_ACS_URL` | Full public URL of the ACS endpoint (`https://<host>/saml/acs`) |
+
+Example startup:
+
+```bash
+./yuzu-server \
+  --https --https-port 8443 \
+  --https-cert /etc/yuzu/server.crt \
+  --https-key  /etc/yuzu/server.key \
+  --saml-idp-entity-id "https://idp.example.com/saml" \
+  --saml-idp-sso-url   "https://idp.example.com/saml/sso" \
+  --saml-idp-cert      /etc/yuzu/idp-signing.pem \
+  --saml-sp-entity-id  "https://yuzu.example.com" \
+  --saml-sp-acs-url    "https://yuzu.example.com/saml/acs"
+```
+
+### SAML Group-to-Role Mapping
+
+Two additional flags, both optional and independent of the five required
+SAML flags above, let you grant admin access via IdP-attested group
+membership:
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--saml-group-attribute` | `YUZU_SAML_GROUP_ATTRIBUTE` | Name of the `<Attribute Name="...">` in the assertion's `<AttributeStatement>` whose `<AttributeValue>`s are group identifiers (e.g. Entra's `http://schemas.microsoft.com/ws/2008/06/identity/claims/groups`) |
+| `--saml-admin-group` | `YUZU_SAML_ADMIN_GROUP` | The single group value (from `--saml-group-attribute`) that grants `role=admin` |
+
+When both flags are configured and the assertion's group list contains the
+value in `--saml-admin-group`, the resulting session is `role=admin`.
+Otherwise (including when either flag is left empty) the session is
+`role=user` — the same default as prior releases.
+
+Matching is **exact string equality only** — no wildcard, prefix, or regex
+matching, and only a single admin group is supported (no multi-group /
+multi-role mapping, same limitation as OIDC's `--oidc-admin-group`).
+
+Admin via SAML is granted **only** through explicit membership in the
+configured group. `NameID`, email, and display name are **never** used to
+elevate privileges — mirrors the OIDC guard described above
+(`create_oidc_session`) — and group values are read from the same
+signature-verified assertion as `NameID`, so a forged or wrapped assertion
+element cannot inject group membership that the IdP didn't attest to.
+
+> **Configuring `--saml-admin-group` against a real IdP:**
+>
+> - The value must be the **exact identifier your IdP puts in the assertion**
+>   — not a human-friendly display name. Entra ID, for example, sends group
+>   **object ID GUIDs** (e.g. `4fb5b234-...`) in the group claim, not the
+>   group's display name; configure the GUID, not "Admins".
+> - Matching is **case-sensitive** — a value that differs only in case (or
+>   has stray leading/trailing whitespace copy-pasted from a portal — the
+>   admin-group value is trimmed automatically, but the group values inside
+>   the assertion itself are compared as the IdP sent them) will not match.
+> - **Entra ID "groups overage"**: a user who is a member of more than ~150
+>   groups gets **no `groups` claim at all** in the assertion — Entra
+>   substitutes a Graph API link instead. Such a user's assertion carries zero
+>   group values, so `--saml-admin-group` can never resolve them to admin
+>   regardless of actual group membership. Either keep the target admin's
+>   group count under the overage threshold or use a dedicated,
+>   low-membership group for the admin mapping.
+> - At most **64 group values** from the configured attribute are considered
+>   (a DoS guard); a value beyond the 64th is never evaluated.
+
+Changing either flag requires a server restart to take effect (no hot-reload,
+same as the other SAML flags).
+
+> **Unlike OIDC, SAML group values are not synced into `rbac_store`:**
+> SAML group values feed the admin/user role decision only; they are NOT
+> synced into `rbac_store` (group-scoped RBAC role assignments do not apply
+> to SAML principals) — deferred pending source-aware group resolution, see
+> issue #1832.
+
+### SAML Login Flow
+
+1. The operator navigates directly to `GET /auth/saml/start`. There is no "Sign in with SAML" button on the login page in this release — the login-page SSO button for SAML is deferred.
+2. The server generates a `<samlp:AuthnRequest>` and redirects the browser to the IdP via **HTTP-Redirect binding** (the request is deflate-compressed and URL-encoded in the `SAMLRequest` query parameter).
+3. The operator authenticates at the IdP.
+4. The IdP POSTs a `<samlp:Response>` containing a signed assertion to the ACS endpoint (`POST /saml/acs`) via **HTTP-POST binding**.
+5. The server validates the assertion (signature, audience, recipient, expiry, and replay protection) and mints a session cookie on success.
+
+```
+Browser           Yuzu Server               IdP
+  |                    |                          |
+  |-- GET /auth/saml/start -->                    |
+  |                    |-- 302 SAMLRequest? ---->|
+  |                    |                          |
+  |                    |      (user authenticates)|
+  |                    |                          |
+  |                    |<--- POST /saml/acs ------|
+  |<-- Set-Cookie -----|                          |
+```
+
+The resulting session behaves identically to an OIDC session — it is subject to the same 8-hour absolute lifetime and the optional `--session-inactivity-secs` idle timeout. See [Session lifetime](#session-lifetime) for details.
+
+### What Is and Is Not Supported
+
+| Capability | Status |
+|---|---|
+| SP-initiated login (HTTP-Redirect AuthnRequest) | Supported |
+| Signed assertion validation (pinned IdP cert) | Supported |
+| Audience / recipient / expiry validation | Supported |
+| Replay protection (`InResponseTo` single-use) | Supported |
+| Group-to-role mapping | Supported — `--saml-group-attribute` + `--saml-admin-group`, exact-match only; both unset ⇒ all SAML users are `role=user` (see [SAML Group-to-Role Mapping](#saml-group-to-role-mapping)) |
+| Admin access for SAML users | Supported via group mapping above; JIT elevation itself is still non-functional for SAML users (no local `users` row) — an admin session is granted directly at login, not via the elevation endpoint |
+| Login-page SSO button | Not in this release — navigate directly to `GET /auth/saml/start` |
+| MFA step-up at high-risk endpoints | Not supported — SAML sessions receive 403 at all step-up-gated endpoints regardless of `--mfa-enforcement`; rely on IdP MFA |
+| `--auth-mode=sso-only` with SAML-only | Not supported — `sso-only` requires OIDC configuration; local-password login cannot be disabled with SAML alone |
+| Multi-replica / HA without sticky sessions | Not supported — pending AuthnRequest state is in-process; configure load-balancer session affinity on `/auth/saml/start` and `/saml/acs` |
+| AuthnRequest signing | Not in this release — the IdP must accept unsigned requests; use OIDC if the IdP requires signed requests |
+| AttributeStatement parsing | Only the configured `--saml-group-attribute` is read (for group-to-role mapping); no other assertion attributes are stored or surfaced beyond `NameID` |
+| IdP-metadata auto-fetch | Not in this release — cert and SSO URL are configured statically |
+| IdP cert hot-reload | Not supported — update `--saml-idp-cert` and restart the server |
+| Runtime reconfigure via dashboard | Not in this release — a server restart is required to change SAML flags |
+| SP metadata endpoint | Not in this release — register the SP manually using the flag values |
+| Windows | Not supported — SAML is Linux/macOS only |
 
 ## API Tokens
 
@@ -439,6 +610,55 @@ Returns `200 OK` with:
 
 Returns `404` if the token ID is not found. Returns `503 service unavailable` if the server's token store database failed to open at startup — a storage outage is never reported as `404` (see the API Tokens section of the [REST API reference](rest-api.md)).
 
+## JIT Admin Elevation
+
+To reduce **standing** privilege (SOC 2 CC6.3/CC6.6), an operator can hold a non-admin role day-to-day and **activate** admin **just-in-time** for a short, justified window — so a compromised everyday session is not a standing admin session. Two steps:
+
+**1. An admin grants eligibility** (one-time, per operator):
+
+```bash
+curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+  -H "Content-Type: application/json" -d '{"eligible":true}' \
+  https://yuzu.example.com/api/v1/users/alice/elevation-eligibility
+```
+
+Eligibility is the per-user `users.elevation_eligible` flag — distinct from holding standing admin, and enumerable for access reviews. An admin **cannot** grant their own eligibility (another admin must). Revoking it (`{"eligible":false}`) immediately ends any elevation the user currently holds.
+
+**2. The eligible operator elevates** when they need admin. A second factor is **mandatory** to elevate, regardless of `--mfa-enforcement` — but which second factor depends on how the operator signed in:
+
+- **Local (password) sessions** must have **MFA enrolled** and are challenged for a fresh **TOTP code** via the shared step-up gate.
+- **OIDC/SSO sessions** are NOT challenged for a TOTP code (a durable SSO identity has no local TOTP secret to check against — see "SSO operators" below) — the second factor is the **IdP-attested `amr` claim** captured at login.
+
+```bash
+curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Content-Type: application/json" \
+  -d '{"justification":"prod incident #42","duration_secs":600}' \
+  https://yuzu.example.com/api/v1/elevate
+# -> {"status":"ok","expires_in":598,"expires_at":"2026-07-02T13:10:00Z"}
+```
+
+`expires_in` is the TRUE remaining seconds computed after the grant (always `<=` the requested `duration_secs` — it is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute lifetime, so it is never an exact echo of the request), and `expires_at` is the same window as a wall-clock RFC3339 UTC timestamp. The session is now admin for the window (capped by `--jit-max-elevation-secs`, default 1h). It **auto-reverts** when the window lapses, on logout, or on a server restart — the elevation is never persisted. Step down early with `POST /api/v1/elevate/revoke`. Every step (`role.elevation.granted`/`denied`/`revoked`/`expired`, `user.elevation_eligibility.set`) is audited — the `granted` row's detail records which factor was used (`mfa=local_totp` or `mfa=oidc_amr`). Technical invariants: `docs/auth-architecture.md` "JIT admin elevation".
+
+### SSO operators
+
+An OIDC/SSO operator elevates through the same two steps above, with the following differences:
+
+- **Eligibility is granted on the durable, stable principal** — `oidc:<iss>#<sub>` (the IdP-issuer-scoped subject claim, never the display name) — via the **query form** of the eligibility endpoint, `POST /api/v1/users/elevation-eligibility?username=<principal>`, e.g.:
+
+  ```bash
+  curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+    -H "Content-Type: application/json" -d '{"eligible":true}' \
+    'https://yuzu.example.com/api/v1/users/elevation-eligibility?username=oidc:https://idp.example.com/%23sub-4821'
+  ```
+
+  The path form (`POST /api/v1/users/{username}/elevation-eligibility`) remains for local usernames only — an SSO principal contains `/` and `#`, which a path segment cannot carry (the server percent-decodes and strips the URL fragment before route matching), so it must use the query form instead.
+
+  The operator must have **logged in at least once** before an admin can grant eligibility — first login auto-provisions a durable row for the principal (`AuthDB::upsert_sso_identity`); granting eligibility against a principal with no row yet **404s** ("user not found"), since the grant is an `UPDATE` against an existing row, not an `INSERT`.
+- **The second factor is the IdP-attested `amr` claim**, captured on the OIDC session at login — never a local TOTP challenge. A session created from a login where the IdP did not assert `amr` is denied elevation unconditionally (`403`, "elevation requires an IdP-attested MFA proof"), independent of the `--mfa-enforcement` setting. Disabling `--jit-oidc-amr-elevation` (default enabled) turns OIDC JIT elevation off entirely — an OIDC session cannot fall back to a local TOTP step-up (its step-up challenge is re-authenticating via SSO), so operators must elevate from a local-authenticated session with local TOTP instead.
+- **Finding the principal string**: Settings → Users lists every durable SSO identity with an **SSO** badge next to its row; the row's displayed name IS the `oidc:<iss>#<sub>` principal to use in the eligibility-grant URL above.
+- **SAML operators cannot elevate today** — SAML carries no `amr`-equivalent claim, so a SAML session fails closed at the same MFA gate a non-MFA'd OIDC session would hit. SAML JIT elevation is a deferred workstream (see `docs/auth-architecture.md` "JIT admin elevation").
+- **Cross-protocol identity-source scoping**: an elevation grant is scoped to the identity *source* that earned it, not just the principal string — the check is a **direct equality** between the session's own `auth_source` and the eligible row's `identity_source` (`local`↔`local`, `oidc`↔`oidc`, `saml`↔`saml`), not an "oidc-or-else-local" fallback. A local session can only spend a grant recorded against an `identity_source='local'` row; a SAML session (SAML JIT elevation is not yet provisioned — see below) would need an `identity_source='saml'` row, which no row carries today, so SAML fails closed at this gate too. This closes a theoretical collision where a crafted SAML NameID (or a legacy local row) shares a principal string with a real OIDC identity.
+
 ## MCP Tokens
 
 MCP (Model Context Protocol) tokens are API tokens with an additional `mcp_tier` field that controls what the token holder can do through the MCP endpoint (`POST /mcp/v1/`). MCP tokens enable AI models and automation tools to interact with Yuzu's fleet management capabilities via JSON-RPC 2.0.
@@ -453,7 +673,7 @@ MCP (Model Context Protocol) tokens are API tokens with an additional `mcp_tier`
 
 Tier enforcement happens *before* RBAC checks. A tier can block an operation even when RBAC would permit it; conversely, if the tier permits but RBAC denies, the request is still blocked. Both layers must allow.
 
-The `supervised` tier marks destructive operations as approval-gated. Until the Phase 2 approval re-dispatch path lands, supervised-tier writes are blocked on every transport (MCP JSON-RPC and REST API) with `auth.approval_required` audit; only Reads and trivially-allowed operations succeed.
+The `supervised` tier marks destructive operations as approval-gated, and the behaviour now depends on the transport. On the MCP `/mcp/v1/` transport these run through the **ticket-then-recall** approval flow: the first call mints a pending approval, and after an admin approves it, a recall carrying the `approval_id` executes the operation. On a non-MCP transport (the REST API) an approval-gated operation is denied with an `auth.approval_required` audit; only Reads and trivially-allowed operations succeed there.
 
 ### Creating an MCP Token
 
@@ -532,18 +752,20 @@ The following audit actions are emitted for authentication and authorization eve
 | `auth.admin_required` | `denied` | Token blocked from admin route (service-scoped, MCP, or non-admin) |
 | `auth.permission_required` | `denied` | Token blocked from permission-gated operation |
 | `auth.scoped_permission_required` | `denied` | Token blocked from agent-scoped operation |
-| `auth.approval_required` | `denied` | Supervised-tier MCP token blocked from an approval-gated operation **on the REST transport** (Phase 2 re-dispatch not yet implemented). The MCP **tool** transport audits the same denial as `mcp.<tool_name>` / `denied` (see `mcp.md`), and returns JSON-RPC `-32004` (`TierDenied`), not `-32006`. |
+| `auth.approval_required` | `denied` | Supervised-tier MCP token blocked from an approval-gated operation **on a non-MCP (REST) transport**. On the MCP `/mcp/v1/` transport there is no such denial — the operation runs through the ticket-then-recall approval flow (the first call mints JSON-RPC `-32006` `ApprovalRequired`; a recall with the approved `approval_id` executes). See `mcp.md`. |
 | `auth.login` | `success` | Successful local password login |
 | `auth.login_failed` | `failure` | Failed login attempt |
 | `auth.logout` | `success` | User-initiated logout |
 | `auth.oidc_login` | `success` | Successful OIDC SSO login |
 | `auth.oidc_login_failed` | `failure` | Failed OIDC login attempt |
+| `auth.saml_login` | `ok` | Successful SAML 2.0 SSO login |
+| `auth.saml_login_failed` | `error` | Failed SAML login attempt (missing binding cookie, oversize body, missing SAMLResponse, or signature/audience/expiry/replay validation failure) |
 
 All `denied` results include a `detail` field explaining the reason. Examples per action:
 - `auth.admin_required` → `"MCP token blocked from admin route"`, `"service-scoped token blocked from admin route"`, `"non-admin user blocked from admin route"`
 - `auth.permission_required` → `"MCP token tier 'readonly' does not allow Execution:Execute"`, `"RBAC denied Execution:Execute"`
 - `auth.scoped_permission_required` → `"agent service 'X' does not match token scope 'Y'"`, `"MCP token tier 'readonly' does not allow Tag:Write"`
-- `auth.approval_required` → `"MCP token tier 'supervised' requires approval for Execution:Execute (Phase 2 not implemented)"` — this is the **REST path** detail (`auth_routes.cpp`). The **MCP tool path** is a *separate* audit row: verb `mcp.<tool_name>`, result `denied`, with the distinct detail string `"approval-gated execution not implemented"` (`mcp_server.cpp`).
+- `auth.approval_required` → audit detail `"MCP token tier 'supervised' requires approval for Execution:Execute on a non-MCP transport"`, client-facing message `"operation requires approval for this MCP tier on this transport"` — this is the **non-MCP (REST) path** (`auth_routes.cpp`). On the MCP `/mcp/v1/` transport there is no `auth.approval_required` denial: the ticket-then-recall approval flow handles the operation (`mcp_server.cpp`), so the MCP tool call mints `-32006` `ApprovalRequired` and a recall with the approved `approval_id` executes.
 
 ### JSON Error Envelope
 
@@ -574,6 +796,8 @@ HTTP status codes:
 | `POST` | `/logout` | Session | Invalidate current session; returns JSON `{"status":"ok"}` |
 | `GET` | `/auth/oidc/start` | No | Begin OIDC PKCE login flow (302 redirect to IdP) |
 | `GET` | `/auth/callback` | No | OIDC callback (IdP redirects here; creates session, 302 to `/`) |
+| `GET` | `/auth/saml/start` | No | Begin SAML 2.0 SP-initiated login flow (302 redirect to IdP via HTTP-Redirect binding); Linux/macOS only |
+| `POST` | `/saml/acs` | No | SAML Assertion Consumer Service — IdP POSTs the response here; validates and creates session; Linux/macOS only |
 | `GET` | `/api/v1/me` | Any (session, Bearer, or X-Yuzu-Token) | Current user info and role |
 | `POST` | `/api/v1/tokens` | RBAC `ApiToken:Write` | Create a new API token |
 | `GET` | `/api/v1/tokens` | RBAC `ApiToken:Read` | List tokens owned by the authenticated user |

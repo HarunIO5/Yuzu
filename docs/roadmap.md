@@ -116,14 +116,14 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 13.2 | [#286](https://github.com/Tr3kkR/Yuzu/issues/286) | Composable Instruction Chains | Open |
 | | 13.3 | [#287](https://github.com/Tr3kkR/Yuzu/issues/287) | Process / Sync Logging UI | Open |
 | | 13.4 | [#288](https://github.com/Tr3kkR/Yuzu/issues/288) | Dashboard Branding | Open |
-| | 13.5 | [#289](https://github.com/Tr3kkR/Yuzu/issues/289) | MCP Phase 2 (Write Tools) | Open |
+| | 13.5 | [#289](https://github.com/Tr3kkR/Yuzu/issues/289) | MCP Phase 2 (Write Tools) | Done |
 | **14** | 14.1 | [#290](https://github.com/Tr3kkR/Yuzu/issues/290) | P2P Content Distribution | Open |
 | | 14.2 | [#291](https://github.com/Tr3kkR/Yuzu/issues/291) | Multi-Gateway Topology | Open |
 | | 14.3 | [#292](https://github.com/Tr3kkR/Yuzu/issues/292) | Database Sharding (Response Partitioning) | Open |
 | | 14.4 | [#293](https://github.com/Tr3kkR/Yuzu/issues/293) | vCenter Connector | Open |
 | | 14.5 | [#294](https://github.com/Tr3kkR/Yuzu/issues/294) | Additional Connectors (BigFix, O365, Oracle) | Open |
 | | 14.6 | [#295](https://github.com/Tr3kkR/Yuzu/issues/295) | High Availability (Active-Passive) | Open |
-| **15** | 15.A | [#547](https://github.com/Tr3kkR/Yuzu/issues/547) | TAR dashboard page shell + retention-paused source list | **In progress — PR-A.A shipped** (paused_at + status extension + dashboard page + Scan + Re-enable; purge action + persistence pending) |
+| **15** | 15.A | [#547](https://github.com/Tr3kkR/Yuzu/issues/547) | TAR dashboard page shell + retention-paused source list | **Shipped** (paused_at + status extension + dashboard page + Scan + Re-enable + typed-confirmation Purge) |
 | | 15.B | [#548](https://github.com/Tr3kkR/Yuzu/issues/548) | Result-set store + REST API (composable scope, the differentiator) | Open |
 | | 15.C | [#549](https://github.com/Tr3kkR/Yuzu/issues/549) | Scope-engine `from_result_set:` + dashboard chip + sidebar + breadcrumb | Open |
 | | 15.D | [#550](https://github.com/Tr3kkR/Yuzu/issues/550) | TAR SQL frame: relocate, scope-walking-aware, "save as result set" | Open |
@@ -1393,8 +1393,16 @@ White-label customization for enterprise deployments:
 **Files:** `server/core/src/css_bundle.cpp`, `server/core/src/settings_routes.cpp`, `server/core/src/runtime_config_store.cpp`
 
 ### Issue 13.5: MCP Phase 2 (Write Tools)
-**Capabilities:** 24.8 (extension) | **Scope:** Server | **Status:** Open
+**Capabilities:** 24.8 (extension) | **Scope:** Server | **Status:** Done (#289)
 **Depends on:** 7.20 (MCP Phase 1)
+
+> **Shipped (R2, 2026-07):** all five write tools (`set_tag`, `delete_tag`,
+> `approve_request`, `reject_request`, `quarantine_device`) are dispatched;
+> `execute_instruction` was already done. Approval-gated ops use the
+> ticket-then-recall flow (mint `kApprovalRequired` + `approval_id`/`status_url` →
+> admin approves → recall consumes once). "SSE streaming for execution progress"
+> is satisfied by the shipped `GET /api/v1/events` (sprint W5.1) — not rebuilt.
+> See `docs/mcp-server.md` Phase 2 and `docs/user-manual/mcp.md`.
 
 6 write/execute tools for the MCP server:
 - `set_tag`, `delete_tag` — device tag management
@@ -1485,22 +1493,28 @@ Active-passive failover for server resilience:
 
 *The differentiating operator experience. Composable scope from previous query results, surfaced in the dashboard and the YAML DSL, anchored on a dedicated TAR page that puts retention awareness, ad-hoc SQL, and process-tree forensics under one roof. The reference end-to-end walkthrough is the Chrome IR scenario in `docs/scope-walking-design.md` §10.*
 
+> **Status correction (2026-07-01).** The bulk of this phase shipped on 2026-05-31 but the item statuses below were never updated from "Open". Corrected here: **15.A–15.E and 15.H are shipped**; **15.G is largely shipped** (GC-sweep thread, quota/pin caps, re-eval, GC/alive gauges); **15.F (this item) is the only substantially-open piece** and is in progress on `feat/tar-15f-chrome-ir-e2e`.
+
 ### Issue 15.A: TAR Dashboard Page Shell + Retention-Paused Source List
-**Capability:** new | **Scope:** Server (dashboard + REST) + TAR plugin (status extension) | **Status:** In progress
+**Capability:** new | **Scope:** Server (dashboard + REST) + TAR plugin (status extension) | **Status:** **Shipped** — `/tar` page shell + retention-paused source list (scan / one-click re-enable) live 2026-05-31; typed-confirmation purge completed the frame 2026-07-01 (`tar_page_ui.cpp`, `dashboard_routes.cpp`). Persistence remains a tracked follow-up.
 
 New `/tar` page off the main dashboard nav. First frame is the retention-paused source list — directly enabled by the issue #539 retention guard. Per-source `<source>_paused_at` timestamp added to `tar.status`, server aggregates per-device responses, dashboard renders a sortable filterable table with one-click re-enable and a typed-confirmation purge. Independent re-enable per source (the #539 invariant).
+
+**As shipped:** the destructive **Purge data** action (design §3.4) is a new agent action `tar.purge_source` (drops all warehouse tiers for a source, leaving it paused), a `POST /fragments/tar/retention-paused/purge` handler gated on `Infrastructure:Delete`, and a typed-hostname confirmation (a native `prompt()` — CSP-safe, no custom modal). The paused-guard is **agent-side** (`tar.purge_source` refuses if the source is enabled) — authoritative, and it closes the scan→purge TOCTOU; the server frame is an ephemeral live scan (no persisted paused-state, so no server-side `SOURCE_NOT_PAUSED` check). Audit verb `tar.source.purge`; metric `yuzu_tar_source_purge_total{result}`. `rows_deleted` is computed agent-side (returned in the response record), not in the fire-and-forget dispatch audit row.
 
 **Files:** `server/core/src/dashboard_routes.cpp`, `server/core/src/dashboard_ui.cpp`, `agents/plugins/tar/src/tar_plugin.cpp`, new `tests/unit/server/test_tar_dashboard_*`. Design: `docs/tar-dashboard.md` §3.
 
 ### Issue 15.B: Result-Set Store + REST API
-**Capability:** new (foundational) | **Scope:** Server | **Status:** Open
+**Capability:** new (foundational) | **Scope:** Server | **Status:** **Shipped** 2026-05-31 (`68427bba`)
 
 `result_set_store.cpp` with new `result_sets.db`. Schema per `docs/scope-walking-design.md` §3 — immutable lineage edges, TTL with pin override, source payload JSON for live re-eval. REST: `POST /api/v1/result-sets`, `from-inventory-query`, `from-tar-query`, `from-instruction-result`, `GET .../{id}`, `.../{id}/members`, `.../{id}/lineage`, `pin` / `unpin` / `re-eval`, `DELETE`. Audit hooks per §9.
 
-**Files:** new `server/core/src/result_set_store.{cpp,hpp}`, new `server/core/src/result_set_routes.cpp`, `migration_runner.cpp`. Design: `docs/scope-walking-design.md` §3, §6, §9.
+**As shipped:** `result_set_store.{cpp,hpp}` is **SQLite** (born before the 2026-06-09 Postgres flip; queued for migration in `docs/postgres-migration-ladder.md`). The REST surface landed **in `rest_api_v1.cpp`**, not a separate `result_set_routes.cpp`. Covered by `test_result_set_store.cpp`, `test_result_set_matcher.cpp`, `test_rest_result_sets_async.cpp`.
+
+**Files:** `server/core/src/result_set_store.{cpp,hpp}`, `server/core/src/result_set_matcher.{cpp,hpp}`, `server/core/src/rest_api_v1.cpp`. Design: `docs/scope-walking-design.md` §3, §6, §9.
 
 ### Issue 15.C: Scope Engine `from_result_set:` + Dashboard Chip + Sidebar + Breadcrumb
-**Capability:** 1.6 (extension) | **Scope:** Server | **Status:** Open
+**Capability:** 1.6 (extension) | **Scope:** Server | **Status:** **Shipped** 2026-05-31 (`68427bba`; owner-scope + IDOR/DoS hardening `4f10a69b`). `from_result_set:` short-circuit in `scope_engine`/`agent_registry`, sidebar/breadcrumb/chip UI in `result_sets_ui`. Covered by `test_scope_walking_authz.cpp`, `test_scope_engine.cpp`.
 **Depends on:** 15.B
 
 Scope Engine grammar gains `from_result_set:<id-or-alias>` as a third short-circuit kind alongside `__all__` and `group:<name>`. Composes with attribute predicates via `AND`/`OR`/`NOT`. Dashboard sidebar lists active result sets (last_used_at then created_at DESC); chain breadcrumb above every query frame mirrors `parent_id` walks; scope chip surfaces in TAR / inventory / instruction frames.
@@ -1508,7 +1522,7 @@ Scope Engine grammar gains `from_result_set:<id-or-alias>` as a third short-circ
 **Files:** `server/core/src/scope_engine.{cpp,hpp}`, `server/core/src/dashboard_routes.cpp`, `server/core/src/dashboard_ui.cpp`. Design: `docs/scope-walking-design.md` §4, §8.
 
 ### Issue 15.D: TAR SQL Frame — Relocate, Scope-Walking-Aware, Save-as-Result-Set
-**Capability:** new | **Scope:** Server | **Status:** Open
+**Capability:** new | **Scope:** Server | **Status:** **Shipped** 2026-05-31 (`e7b47ca3`, PR-D). Async producers (`from-tar-query` / `from-instruction-result`), re-eval, the response matcher (`result_set_matcher.cpp`), and the scope-walking-aware TAR SQL frame. Covered by `test_rest_result_sets_async.cpp`, `test_result_set_matcher.cpp`.
 **Depends on:** 15.A, 15.B, 15.C
 
 Relocate the existing `/fragments/tar-sql` route onto the TAR dashboard page. Wire scope-chip resolution to `from_result_set:` (15.C). Add "Save as result set" affordance on the results pane — server creates a new result set with `source_kind=tar_query`, members = union of agents that returned ≥1 row by default. Default name is `tar-<5-char-sql-hash>`.
@@ -1516,7 +1530,7 @@ Relocate the existing `/fragments/tar-sql` route onto the TAR dashboard page. Wi
 **Files:** `server/core/src/dashboard_routes.cpp`, `server/core/src/agent_service_impl.cpp` (TAR result envelope to carry the producing agent IDs explicitly). Design: `docs/tar-dashboard.md` §4.
 
 ### Issue 15.E: YAML DSL `fromResultSet:` + `definition_store` Validation + Spec Amendment
-**Capability:** new | **Scope:** Server (DSL) | **Status:** Open
+**Capability:** new | **Scope:** Server (DSL) | **Status:** **Shipped** 2026-05-31 (`e6361a3a`, relocation `9a6b15f7`, governance fixes `89c7b46c`, PR-E). `selector:` / `fromResultSet:` parses and lowers (`scope_yaml.{cpp,hpp}`); rules 1–2 enforced at create; rule 3 at dispatch via the `instruction.scope_resolution_failed` audit row. **Policy `fromResultSet:` deferred to PR-E2** (TTL vs. continuous policy eval; needs `Policy.owner_principal` + pinned-set rule). Covered by `test_scope_yaml.cpp`, `test_yaml_scan.cpp`.
 **Depends on:** 15.B, 15.C
 
 `scope:` block in `InstructionDefinition`, `InstructionSet`, `Policy` gains `fromResultSet:` as a mutually-exclusive (or composable-with-`selector:`) form. Validation: `fromResultSet + assignment.managementGroups` rejected at YAML load; `fromResultSet` requires `assignment.mode = static`. Resolution at instruction *invocation* time, not load time. Spec section in `docs/yaml-dsl-spec.md`.
@@ -1524,18 +1538,22 @@ Relocate the existing `/fragments/tar-sql` route onto the TAR dashboard page. Wi
 **Files:** `server/core/src/definition_store.cpp`, `server/core/src/policy_store.cpp`, `docs/yaml-dsl-spec.md`. Design: `docs/scope-walking-design.md` §7.
 
 ### Issue 15.F: Reference Walkthrough — Chrome IR End-to-End Integration Test
-**Capability:** new (regression net) | **Scope:** Tests | **Status:** Open
+**Capability:** new (regression net) | **Scope:** Tests | **Status:** **In progress** (`feat/tar-15f-chrome-ir-e2e`, 2026-07-01)
 **Depends on:** 15.B, 15.C, 15.D, 15.E
 
-`tests/integration/test_chrome_ir_chain.cpp` drives the full §10 walkthrough against a live UAT stack with synthetic agents. Asserts: each step's audit row carries `parent_result_set_id` and `result_result_set_id`; the resulting lineage chain is complete; pinning prevents mid-incident GC; the final un-quarantine + watch step terminates cleanly. The reference test for end-to-end correctness — when this passes, scope walking is real.
+Drives the §10 walkthrough (inventory-ground → TAR-query narrow → instruction-result narrow → pin) and asserts: the lineage chain is complete (`GET /{id}/lineage` reconstructs root→leaf); the audit trail is complete (one `result_set.create` per step + the pin); pinning prevents mid-incident GC (a pinned set survives `gc_sweep()` and cannot be deleted until unpinned); and the chain tears down cleanly.
 
-**Files:** `tests/integration/test_chrome_ir_chain.cpp`, supporting fixtures in `scripts/uat/synthetic-fleet.sh`. Design: `docs/scope-walking-design.md` §10.
+**As built:** an **in-process Catch2 test** at `tests/unit/server/test_chrome_ir_chain.cpp` (server suite), driving the real `/api/v1/result-sets` handlers via `TestRouteSink` with a real `ResultSetStore` + a recording fake command-dispatch — CI-runnable, no live stack. There is **no** `tests/integration/` dir or `scripts/uat/synthetic-fleet.sh`; those design-doc paths were aspirational. A full multi-process UAT-stack variant remains a future option.
+
+**Files:** `tests/unit/server/test_chrome_ir_chain.cpp`, `tests/meson.build`. Design: `docs/scope-walking-design.md` §10.
 
 ### Issue 15.G: Operational Hardening — Live Re-Eval, GC Sweep, Prometheus + Audit Polish
-**Capability:** new | **Scope:** Server | **Status:** Open
+**Capability:** new | **Scope:** Server | **Status:** **Largely shipped** (2026-05-31 ladder) — remaining items tracked below.
 **Depends on:** 15.B
 
 Live re-eval (`POST /api/v1/result-sets/{id}/re-eval`); background GC sweep every 5 min; per-operator 10K result-set quota + 50 pin cap with `429 RESULT_SET_QUOTA` / `409 PIN_LIMIT`; Prometheus metrics (`yuzu_result_sets_total`, `yuzu_result_sets_alive`, `yuzu_result_set_resolve_seconds` histogram, GC counter, quota-rejection counter); audit polish on every state transition.
+
+**Shipped:** re-eval endpoint; background GC-sweep thread wired in `server.cpp` (`ResultSetStore::gc_sweep()`); Prometheus `yuzu_result_sets_total`, `yuzu_result_sets_alive`, `yuzu_result_set_gc_total`, and `yuzu_result_set_quota_rejected`; quota (`kMaxPerOwner=10000` → `429`) and pin cap (`kMaxPinsPerOwner=50` → `409`) enforced in the store. **Still open:** the `yuzu_result_set_resolve_seconds` histogram and a final audit-polish pass. Recommend narrowing 15.G to just these remainders.
 
 **Files:** `server/core/src/result_set_store.cpp`, `server/core/src/result_set_routes.cpp`, `server/core/src/server.cpp`. Design: `docs/scope-walking-design.md` §3.3, §9.
 
@@ -1601,11 +1619,11 @@ macOS equivalents using Apple's Endpoint Security (ES) framework — *requires t
 *Implements the four agentic-first invariants from `docs/agentic-first-principle.md` (A1 dashboard parity, A2 discovery, A3 observability, A4 error envelope). Source: `docs/capability-agentic-audit-2026-05.md` §7 P1. Every operation a human can perform via the dashboard must be performable by an authenticated agentic worker through a documented, discoverable, machine-readable surface.*
 
 ### Issue 17.1: Introspection Endpoints (`/api/v1/discover/*`)
-**Capability:** new | **Scope:** Server (REST + MCP) | **Status:** Proposed
+**Capability:** new | **Scope:** Server (REST + MCP) | **Status:** Done (tracker #1794)
 
-`/api/v1/discover/routes` (sourced from `openapi_spec()`), `/discover/plugins` (sourced from registered `PluginInfo`), `/discover/scope-kinds`, `/discover/permissions` (RBAC catalog), `/discover/instructions`. Each mirrored as an MCP tool (`discover_routes`, etc.). Supplants out-of-band YAML / Markdown for agent worker capability discovery. Implements **A2**.
+`/api/v1/discover/routes` (sourced from `openapi_spec()`), `/discover/plugins` (sourced from registered `PluginInfo`), `/discover/scope-kinds`, `/discover/permissions` (RBAC catalog), `/discover/instructions`. Each mirrored as an MCP tool (`discover_routes`, etc.). Supplants out-of-band YAML / Markdown for agent worker capability discovery. Implements **A2**. See `docs/agentic-first-principle.md` §A2 for the shipped shape of each endpoint.
 
-**Files:** new `server/core/src/discovery_routes.{cpp,hpp}`, `mcp_server.cpp` tool registration, `docs/agentic-first-principle.md` §A2.
+**Files:** `server/core/src/discover_routes.{cpp,hpp}` (module named `discover_routes.*`/`DiscoverRoutes`, singular — the filename originally planned here, `discovery_routes.{cpp,hpp}`, was already taken by an unrelated pre-existing module: directory sync / patch management / deployment / network-discovery routes at `/api/directory/*`, `/api/patches/*`, `/api/deployments/*`, `/api/discovery/*`), `server/core/src/openapi_spec_access.hpp` (exposes `openapi_spec()` for external linkage), `mcp_server.cpp` tool registration, `docs/agentic-first-principle.md` §A2.
 
 ### Issue 17.2: Dashboard JSON Content Negotiation
 **Capability:** new | **Scope:** Server (dashboard) | **Status:** Proposed

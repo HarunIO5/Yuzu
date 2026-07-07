@@ -68,6 +68,16 @@ All Yuzu metrics follow a consistent naming scheme.
 | `yuzu_server_default_certs_active` | gauge | `1` when the server is running with built-in per-install **default** certificates, `0` otherwise. Alert on `== 1` for any production deployment — defaults are convenience certs and should be replaced (see `security-hardening.md`). |
 | `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` | gauge | Unix timestamp (seconds) at which the default cert set expires (the leaves are sized to the CA's `notAfter`, so `cert="default-ca"` is the binding expiry). Default certs are 10-year with **no auto-renewal**; the `yuzu-tls` alert rules (`YuzuCertificateExpiringSoon` warn @7d, `YuzuCertificateExpiryCritical` crit @1d in `docs/prometheus/yuzu-alerts.yml`) fire on `value - time() < window`. |
 
+## SSO login metrics
+
+Every SAML and OIDC login attempt — success or failure — increments its provider's login counter. Both counters carry a uniform `{result, role}` label set on every series (including error paths), so a dashboard can group by either label without hitting an unlabelled/labelled split.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_auth_saml_login_total{result, role}` | counter | SAML `/saml/acs` outcomes. `result` is `ok` or `error`. `role` is the resolved session role (`admin` / `user`) on `result="ok"`, and `role="none"` on every `result="error"` series (no session was ever created, so there is no role to attribute the failure to). |
+| `yuzu_auth_oidc_login_total{result, role}` | counter | OIDC `/auth/callback` outcomes. Same `{result, role}` shape as the SAML counter above — `role="none"` on all error-path increments (IdP-returned error, missing `code`/`state`, and token-exchange/claim-validation failure). |
+| `yuzu_saml_group_cap_truncated_total` | counter, no labels | Bumped once per SAML login (not once per dropped group value) when the assertion's `groups` attribute exceeded the 64-value cap and real group values were dropped. A non-zero rate means some SAML-asserted group-based RBAC role mappings may not be taking effect for the affected principal — check the assertion's attribute statement. OIDC has no equivalent counter: OIDC group claims are bounded by JWT/ID-token size rather than a fixed value-count cap, so the two providers hit different limits and are not expected to have parity here. |
+
 ## DEX live-read metrics
 
 The synchronous live-read endpoint (`POST /api/v1/dex/devices/{id}/live`) is bounded by a server-wide concurrency cap; these metrics surface its saturation and outcomes.
@@ -76,6 +86,12 @@ The synchronous live-read endpoint (`POST /api/v1/dex/devices/{id}/live`) is bou
 |---|---|---|
 | `yuzu_server_live_requests_total{kind, outcome}` | counter | Live-read requests by `kind` (`uptime` / `processes` / `unknown`) and terminal HTTP `outcome` (`200` / `400` / `403` / `429` / `500` / `502` / `503` / `504`). A rising `outcome="429"` rate means the concurrency cap is shedding load. |
 | `yuzu_server_live_inflight` | gauge | Current in-flight synchronous live-read polls. Approaching the cap (default 4) indicates saturation; sustained at the cap alongside 429s means the live surface is a bottleneck. |
+
+## Pre-flight runner metrics
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_preflight_tick_errors_total` | counter | Exceptions caught by the background `PreflightRunner`'s per-tick try/catch (60 s cadence). A rising rate means pre-flight runs are not being re-dispatched/settled — check the server log. |
 
 ## Fleet visualization metrics
 
@@ -397,6 +413,41 @@ appears if an agent of that OS still emits the retired tag).
 | `yuzu_server_guardian_observations_reaped_total` | counter | Cumulative DEX observation rows deleted by the retention reaper (disposal evidence for the behavioral-PII projection). Exposed as TYPE `counter` (store-read value set via the gauge API, like `events_written_total`). |
 
 Broader Guardian metrics — rule push counts, agent apply latency, parse errors, and a fleet compliance-state distribution (compliant/drifted/error/unknown) — are on the roadmap alongside agent-side enforcement metrics.
+
+## NVD CVE sync metrics
+
+The server maintains a local mirror of the NVD (National Vulnerability Database)
+CVE catalog (see [NVD CVE sync](server-admin.md#nvd-cve-sync) for the sync flags).
+These metrics surface the catalog's size, backfill progress, and sync-window
+health. The gauges are refreshed on every `/metrics` scrape.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_nvd_total_cves` | gauge | Distinct CVEs in the local NVD catalog. Grows as the newest-first backfill walks history, then holds steady with periodic freshness re-checks. |
+| `yuzu_nvd_backfill_complete` | gauge | `1` when the newest-first NVD backfill has reached its floor (`--nvd-backfill-years`), else `0`. `0` for an extended period on a fresh server without an API key is expected — the backfill is rate-limited (see below). |
+| `yuzu_nvd_sync_failures_total{reason}` | counter | NVD sync window failures, labelled by `reason` ∈ {`connection`, `http_429`, `http_403`, `http_other`, `parse`}. All five `reason` series are initialised to `0` at startup, so the counter (and its HELP/TYPE) is present on a healthy server — `absent()`-style alerts stay meaningful and Grafana never shows "No data" until the first failure. A shutdown-triggered cancel is deliberately **not** counted. |
+
+**Reading the `reason` label:** `http_429` is rate-limiting (backed off and retried
+automatically — expected during a large backfill without an API key, not a fault);
+`http_403` is a bad or revoked `--nvd-api-key` (not retried — rotate the key);
+`connection` is an egress/network failure to `services.nvd.nist.gov`; `http_other`
+is any other non-2xx status; `parse` is a malformed response body. See
+[Rate-limit and auth-error handling](server-admin.md#nvd-cve-sync) for operator guidance.
+
+**Alerting.** Only `http_403` is unambiguously operator-actionable, so page on it and
+merely record the rest:
+
+```
+# Page: bad/revoked API key — sync makes no progress until rotated
+increase(yuzu_nvd_sync_failures_total{reason="http_403"}[1h]) > 0
+# Do NOT page on http_429 — it is expected rate-limiting, self-heals via backoff.
+```
+
+Note that `http_429` **will** climb during a first-run full backfill on a server with no
+`--nvd-api-key` (each window that exhausts its retry budget increments it before the next
+tick retries) — that is expected first-run behaviour, not a regression. A sustained
+`yuzu_nvd_backfill_complete == 0` (see above) is the durable "mirror stuck" signal, not the
+failures counter on its own.
 
 ## Management group metrics
 

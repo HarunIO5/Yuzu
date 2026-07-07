@@ -724,6 +724,73 @@ bool TarDatabase::create_warehouse_tables() {
     return true;
 }
 
+std::expected<int, std::string> TarDatabase::purge_source(const std::string& source) {
+    // Resolve the source's tier tables from the schema registry — never hardcode.
+    // Table names are <name>_<suffix> (same construction as stats()/DDL).
+    const CaptureSourceDef* def = nullptr;
+    for (const auto& s : capture_sources()) {
+        if (s.name == source) {
+            def = &s;
+            break;
+        }
+    }
+    if (!def)
+        return std::unexpected("unknown source: " + source);
+
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return std::unexpected(std::string("database not open"));
+
+    char* err_msg = nullptr;
+    if (sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        std::string e = err_msg ? err_msg : "unknown";
+        sqlite3_free(err_msg);
+        return std::unexpected("BEGIN failed: " + e);
+    }
+
+    int total = 0;
+    for (const auto& g : def->granularities) {
+        const std::string table = std::string(def->name) + "_" + std::string(g.suffix);
+        const std::string sql = "DELETE FROM " + table;
+        if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &err_msg) != SQLITE_OK) {
+            std::string e = err_msg ? err_msg : "unknown";
+            sqlite3_free(err_msg);
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return std::unexpected("purge failed on " + table + ": " + e);
+        }
+        // Safe under mu_: it serialises every access to db_, so no concurrent
+        // step() can race this changes() read (the #1033 hazard needs a shared,
+        // concurrently-used handle). O(1) vs stepping RETURNING rows on a bulk
+        // delete.
+        total += sqlite3_changes(db_);
+    }
+
+    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        std::string e = err_msg ? err_msg : "unknown";
+        sqlite3_free(err_msg);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return std::unexpected("COMMIT failed: " + e);
+    }
+
+    // Forensic-erasure completion: secure_delete=ON (open path) zeroes the
+    // deleted rows in the MAIN-db pages, but under journal_mode=WAL the pre-delete
+    // page images (still bearing the purged data) linger in the -wal file until a
+    // checkpoint truncates it. For a "permanent / cannot be undone" purge that is
+    // a real residue window — and the operator often purges to reclaim disk, which
+    // a passive checkpoint won't do promptly. Force a TRUNCATE checkpoint here so
+    // the erasure is complete and the WAL is reclaimed at return. Best-effort: the
+    // DELETE already committed, so a checkpoint that can't fully complete (e.g. a
+    // lingering reader) is logged, not fatal — the residue clears at the next one.
+    if (int wrc = sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr,
+                                            nullptr);
+        wrc != SQLITE_OK) {
+        spdlog::warn("purge_source({}): WAL checkpoint(TRUNCATE) returned {} — purged data may "
+                     "persist in the WAL until the next checkpoint",
+                     source, wrc);
+    }
+    return total;
+}
+
 // ── Typed inserts ───────────────────────────────────────────────────────────
 
 bool TarDatabase::insert_process_events(const std::vector<ProcessEvent>& events) {
@@ -1193,6 +1260,66 @@ bool TarDatabase::insert_dns_events(const std::vector<DnsEvent>& events) {
     return true;
 }
 
+bool TarDatabase::insert_mapdrive_events(const std::vector<MapDriveEvent>& events) {
+    std::lock_guard lock(mu_);
+    if (!db_ || events.empty())
+        return events.empty();
+
+    char* err_msg = nullptr;
+    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
+    if (rc_begin != SQLITE_OK) {
+        spdlog::error("insert_mapdrive_events BEGIN: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        return false;
+    }
+    sqlite3_free(err_msg);
+
+    const char* sql = R"(
+        INSERT INTO mapdrive_live (ts, snapshot_id, action, direction, local_mount, remote_path, remote_host, username, provider, origin)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )";
+
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("insert_mapdrive_events prepare: {}", sqlite3_errmsg(db_));
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    for (const auto& ev : events) {
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
+        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
+        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 4, ev.direction.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 5, ev.local_mount.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 6, ev.remote_path.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 7, ev.remote_host.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 8, ev.username.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 9, ev.provider.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 10, ev.origin.c_str(), -1, SQLITE_STATIC);
+
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            spdlog::error("insert_mapdrive_events step: {}", sqlite3_errmsg(db_));
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return false;
+        }
+    }
+
+    err_msg = nullptr;
+    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK) {
+        spdlog::error("insert_mapdrive_events commit: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    return true;
+}
+
 bool TarDatabase::insert_perf_sample(const PerfRow& row) {
     std::lock_guard lock(mu_);
     if (!db_)
@@ -1400,6 +1527,101 @@ bool TarDatabase::insert_netqual_samples(const std::vector<NetQualRow>& rows) {
         return false;
     }
     sqlite3_free(err_msg);
+    return true;
+}
+
+bool TarDatabase::insert_netconn_events(const std::vector<NetConnRow>& rows) {
+    std::lock_guard lock(mu_);
+    if (!db_ || rows.empty())
+        return rows.empty();
+
+    char* err_msg = nullptr;
+    if (sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        spdlog::error("insert_netconn_events BEGIN: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        return false;
+    }
+    sqlite3_free(err_msg);
+
+    const char* sql = R"(
+        INSERT INTO netconn_live
+            (ts, snapshot_id, action, channel, category, capability,
+             iface_kind, reason_code)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    )";
+    sqlite3_stmt* raw_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("insert_netconn_events prepare: {}", sqlite3_errmsg(db_));
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    for (const auto& r : rows) {
+        sqlite3_bind_int64(stmt.get(), 1, r.ts);
+        sqlite3_bind_int64(stmt.get(), 2, r.snapshot_id);
+        sqlite3_bind_text(stmt.get(), 3, r.action.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 4, r.channel.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 5, r.category.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 6, r.capability.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 7, r.iface_kind.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt.get(), 8, r.reason_code);
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            spdlog::error("insert_netconn_events step: {}", sqlite3_errmsg(db_));
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return false;
+        }
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+    }
+
+    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        spdlog::error("insert_netconn_events COMMIT: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    sqlite3_free(err_msg);
+    return true;
+}
+
+bool TarDatabase::insert_netqual_boot_row(const NetQualBootRow& row) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return false;
+
+    // One row per boot — a single autocommit INSERT, no transaction needed.
+    const char* sql = R"(
+        INSERT INTO netqual_boot
+            (ts, snapshot_id, boot_ts, window_s, retrans_segs, segs_out,
+             estab_resets, if_in_errors, if_in_discards, if_out_errors,
+             if_out_discards, if_in_octets, if_out_octets)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )";
+    sqlite3_stmt* raw_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("insert_netqual_boot_row prepare: {}", sqlite3_errmsg(db_));
+        return false;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    sqlite3_bind_int64(stmt.get(), 1, row.ts);
+    sqlite3_bind_int64(stmt.get(), 2, row.snapshot_id);
+    sqlite3_bind_int64(stmt.get(), 3, row.boot_ts);
+    sqlite3_bind_int64(stmt.get(), 4, row.window_s);
+    sqlite3_bind_int64(stmt.get(), 5, row.retrans_segs);
+    sqlite3_bind_int64(stmt.get(), 6, row.segs_out);
+    sqlite3_bind_int64(stmt.get(), 7, row.estab_resets);
+    sqlite3_bind_int64(stmt.get(), 8, row.if_in_errors);
+    sqlite3_bind_int64(stmt.get(), 9, row.if_in_discards);
+    sqlite3_bind_int64(stmt.get(), 10, row.if_out_errors);
+    sqlite3_bind_int64(stmt.get(), 11, row.if_out_discards);
+    sqlite3_bind_int64(stmt.get(), 12, row.if_in_octets);
+    sqlite3_bind_int64(stmt.get(), 13, row.if_out_octets);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        spdlog::error("insert_netqual_boot_row step: {}", sqlite3_errmsg(db_));
+        return false;
+    }
     return true;
 }
 

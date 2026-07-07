@@ -448,9 +448,12 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     auto token = generate_session_token();
     Session s;
     s.username = username;
+    s.display_name = username; // local auth: username IS the human label
     s.role = it->second.role;
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "local";
+    s.last_activity_at = std::chrono::steady_clock::now();
+    s.last_activity_persisted_at = s.last_activity_at;
     sessions_[token] = std::move(s);
 
     spdlog::info("User '{}' authenticated (role={})", username, role_to_string(it->second.role));
@@ -524,9 +527,12 @@ std::string AuthManager::create_local_session(const std::string& username, Role 
     auto token = generate_session_token();
     Session s;
     s.username = username;
+    s.display_name = username; // local auth: username IS the human label
     s.role = role;
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "local";
+    s.last_activity_at = std::chrono::steady_clock::now();
+    s.last_activity_persisted_at = s.last_activity_at;
     if (mfa_verified) {
         s.mfa_verified_at = std::chrono::steady_clock::now();
     }
@@ -559,6 +565,106 @@ bool AuthManager::mark_session_mfa_verified(const std::string& token) {
     return true;
 }
 
+std::optional<std::chrono::steady_clock::time_point>
+AuthManager::elevate_session(const std::string& token, std::chrono::seconds duration) {
+    if (token.size() > auth::kMaxSessionTokenLength)
+        return std::nullopt;
+    std::unique_lock lock(mu_);
+    auto it = sessions_.find(token);
+    if (it == sessions_.end())
+        return std::nullopt;
+    // Clamp to the session's own absolute lifetime — an elevation can never
+    // outlive the cookie session that carries it (follow-up B, security review
+    // 2026-06-30). (std::min) parenthesised to dodge the <windows.h> `min`
+    // function-like macro on MSVC (see the note at validate_session below).
+    const auto now = std::chrono::steady_clock::now();
+    const auto until = (std::min)(now + duration, it->second.expires_at);
+    // Dead-window guard (governance hardening round, UP-1/UP-4): a session
+    // that crosses its own absolute expires_at between validate_session and
+    // this call clamps to `until <= now` — a window already in the past. Do
+    // NOT mutate the session or report success for that: no granted audit, no
+    // "200 ok" that misleads a scripted caller into believing it holds admin,
+    // and no later spurious `role.elevation.expired` for a window that never
+    // conferred privilege. The caller (POST /api/v1/elevate) already treats
+    // nullopt as "session vanished between validate and elevate" → 401, which
+    // is the correct outcome here too.
+    if (until <= now)
+        return std::nullopt;
+    it->second.elevated_until = until;
+    return until;
+}
+
+bool AuthManager::revoke_elevation(const std::string& token) {
+    if (token.size() > auth::kMaxSessionTokenLength)
+        return false;
+    std::unique_lock lock(mu_);
+    auto it = sessions_.find(token);
+    if (it == sessions_.end())
+        return false;
+    const bool was_elevated = is_elevated(it->second);
+    it->second.elevated_until = {}; // clear → effective role reverts to base
+    return was_elevated;
+}
+
+std::optional<std::string> AuthManager::reap_expired_elevation(const std::string& token) {
+    if (token.size() > auth::kMaxSessionTokenLength)
+        return std::nullopt;
+
+    // Shared-lock-first (governance UP-1): this runs on EVERY authenticated
+    // cookie request via AuthRoutes::resolve_session, so it must match
+    // validate_session's discipline of staying on the shared lock in the
+    // overwhelmingly common case (no lapsed elevation to reap) — an
+    // unconditional exclusive lock here would reintroduce the full
+    // serialisation of dashboard auth on `mu_` that validate_session's
+    // need_write dance was built to avoid.
+    {
+        std::shared_lock lock(mu_);
+        auto it = sessions_.find(token);
+        if (it == sessions_.end())
+            return std::nullopt;
+        // Sentinel (epoch) means "never elevated" OR "already reaped/revoked"
+        // — nothing to report. Still-live means nothing to report yet either.
+        if (it->second.elevated_until.time_since_epoch().count() == 0 ||
+            std::chrono::steady_clock::now() < it->second.elevated_until)
+            return std::nullopt;
+    }
+
+    // A lapsed, non-sentinel elevation was observed — escalate to the
+    // exclusive lock to clear it. Re-find and re-check under the new lock
+    // (TOCTOU): another thread may have reaped, manually revoked
+    // (revoke_elevation / revoke_user_elevations), or invalidated the session
+    // entirely between the two locks. The exactly-once / no-double-emit
+    // guarantee is preserved by this re-check, not by the shared-lock probe.
+    std::unique_lock lock(mu_);
+    auto it = sessions_.find(token);
+    if (it == sessions_.end())
+        return std::nullopt;
+    if (it->second.elevated_until.time_since_epoch().count() != 0 &&
+        std::chrono::steady_clock::now() >= it->second.elevated_until) {
+        it->second.elevated_until = {};
+        return it->second.username;
+    }
+    return std::nullopt;
+}
+
+void AuthManager::expire_session_for_test(const std::string& token, std::chrono::seconds offset) {
+    std::unique_lock lock(mu_);
+    if (auto it = sessions_.find(token); it != sessions_.end())
+        it->second.expires_at -= offset;
+}
+
+int AuthManager::revoke_user_elevations(const std::string& username) {
+    std::unique_lock lock(mu_);
+    int cleared = 0;
+    for (auto& [token, s] : sessions_) {
+        if (s.username == username && is_elevated(s)) {
+            s.elevated_until = {};
+            ++cleared;
+        }
+    }
+    return cleared;
+}
+
 std::optional<Session> AuthManager::validate_session(const std::string& token) const {
     // Reject overly-long tokens early to prevent DoS via map key exhaustion (#630).
     // This check intentionally fires BEFORE the mutex acquire below — rejecting
@@ -567,6 +673,8 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
     if (token.size() > auth::kMaxSessionTokenLength)
         return std::nullopt;
 
+    const bool idle_enabled = session_inactivity_ > std::chrono::seconds(0);
+
     std::shared_lock lock(mu_);
 
     auto it = sessions_.find(token);
@@ -574,17 +682,99 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
         return std::nullopt;
 
     auto now = std::chrono::steady_clock::now();
-    if (now > it->second.expires_at)
+    if (now > it->second.expires_at) // absolute lifetime — always enforced
         return std::nullopt;
 
-    // Opportunistic reap: if sessions exceed threshold, upgrade lock and sweep (G2-SEC-A1-004).
-    // Copy the session BEFORE any lock manipulation to avoid dangling iterator after erase_if.
+    // Idle (inactivity) timeout (SOC 2 CC6.3): a sliding window UNDER the
+    // absolute expiry. Decided here, BEFORE the touch below, so an active
+    // session is kept alive while one idle past the window is rejected.
+    const bool idle_expired =
+        idle_enabled && (now - it->second.last_activity_at > session_inactivity_);
+
+    // Throttle the in-memory touch (governance UP-1/UP-2). Sliding the window
+    // needs the exclusive lock, so touching on EVERY request would serialise all
+    // dashboard auth on `mu_` once the feature is on. Instead we slide it at most
+    // once per `touch_granularity`, so a burst of requests for an active session
+    // stays on the shared lock. The granularity is a quarter of the idle window
+    // capped at 30s, so `last_activity_at` never lags real activity by more than
+    // that — far inside any minutes-scale window — and an active session can
+    // therefore never be wrongly evicted (it is always re-touched well before the
+    // window elapses; idle-out fires within [window - granularity, window] of the
+    // last request). Sub-4s windows floor the granularity at 0 → touch every
+    // request (test/degenerate windows; correctness preserved, no throttle gain).
+    // (std::min) is parenthesised to dodge the `min` function-like macro that
+    // <windows.h> leaks on MSVC (without it: C2589 "illegal token '(' on right
+    // side of '::'"). Portable; a no-op elsewhere.
+    const auto touch_granularity =
+        idle_enabled ? (std::min)(session_inactivity_ / 4, std::chrono::seconds(30))
+                     : std::chrono::seconds(0);
+    const bool need_touch = idle_enabled && !idle_expired &&
+                            (now - it->second.last_activity_at >= touch_granularity);
+
+    // Copy the session BEFORE any lock manipulation to avoid a dangling
+    // iterator after the erase/reap below.
     auto session_copy = it->second;
-    if (sessions_.size() > 100) {
+
+    // Take the exclusive lock ONLY when something must change: evict an idle
+    // session, slide the (throttled) activity window, or run the large-map
+    // opportunistic reap. The common cases — idle disabled, or an active session
+    // already touched within the granularity — stay on the shared lock with no
+    // serialisation (UP-1) and no O(N) sweep (UP-2).
+    const bool need_write = idle_expired || need_touch || sessions_.size() > 100;
+    bool persist = false;
+    if (need_write) {
         lock.unlock();
         std::unique_lock wlock(mu_);
-        auto reap_now = std::chrono::steady_clock::now();
-        std::erase_if(sessions_, [&](const auto& p) { return reap_now > p.second.expires_at; });
+        auto wnow = std::chrono::steady_clock::now();
+
+        // Opportunistic reap (G2-SEC-A1-004), extended to drop idle sessions
+        // when the feature is on. Runs on the large map (pre-existing cadence)
+        // and, when idle is enabled, whenever we already hold the lock to
+        // touch/evict — so idle sessions stay bounded without a per-request
+        // O(N) sweep.
+        if (sessions_.size() > 100 || (idle_enabled && (need_touch || idle_expired))) {
+            std::erase_if(sessions_, [&](const auto& p) {
+                if (wnow > p.second.expires_at)
+                    return true;
+                return idle_enabled && (wnow - p.second.last_activity_at > session_inactivity_);
+            });
+        }
+
+        if (idle_expired) {
+            // The reap above already removed THIS session if it is still idle
+            // under the write lock (the predicate re-reads last_activity with a
+            // fresh `wnow`, so a concurrent boundary refresh keeps it alive).
+            // Either way this request, which observed it idle, is rejected —
+            // fails safe (a spurious 401 → the browser re-authenticates).
+            return std::nullopt;
+        }
+
+        if (need_touch) {
+            // Slide the window forward. Throttle the durable AuthDB mirror to at
+            // most one write per kActivityPersistGranularity so the touch is not
+            // a per-request SQL write.
+            if (auto wit = sessions_.find(token); wit != sessions_.end()) {
+                wit->second.last_activity_at = wnow;
+                session_copy.last_activity_at = wnow;
+                if (auth_db_ && wnow - wit->second.last_activity_persisted_at >=
+                                    kActivityPersistGranularity) {
+                    wit->second.last_activity_persisted_at = wnow;
+                    session_copy.last_activity_persisted_at = wnow;
+                    persist = true;
+                }
+            } else {
+                // Raced an evict/invalidate between the two locks → reject.
+                return std::nullopt;
+            }
+        }
+        wlock.unlock();
+
+        // Snapshot-and-release: the AuthDB mirror write happens OUTSIDE mu_
+        // (AuthDB invariant — never call a sibling subsystem under the lock).
+        // Best-effort: touch_session_activity is fail-silent — discard the
+        // [[nodiscard]] std::expected (MSVC /W4 C4834 otherwise).
+        if (persist && auth_db_)
+            (void)auth_db_->touch_session_activity(token);
     }
 
     return session_copy;
@@ -770,41 +960,120 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
     return true;
 }
 
-// ── OIDC session creation ───────────────────────────────────────────────────
+// ── Shared group→role resolution ────────────────────────────────────────────
 
-std::string AuthManager::create_oidc_session(const std::string& display_name,
-                                             const std::string& email, const std::string& oidc_sub,
-                                             const std::vector<std::string>& groups,
-                                             const std::string& admin_group_id,
-                                             std::chrono::steady_clock::time_point mfa_verified_at) {
-    std::unique_lock lock(mu_);
-
-    // Determine role: admin if user is in the configured admin group.
-    // Security (C3 fix): Admin role via OIDC ONLY through explicit group membership.
-    // Do NOT match on email/display_name — these are attacker-controlled values.
+Role resolve_role_from_groups(const std::vector<std::string>& groups,
+                              const std::string& admin_group) {
+    // Determine role: admin if the caller's IdP-attested groups contain the
+    // configured admin group. Security (C3 fix, later mirrored for SAML):
+    // admin role ONLY through explicit group membership. Do NOT match on
+    // email/display_name/NameID — these are attacker-controlled values that
+    // ride in the same claims/assertion.
     Role role = Role::user;
-    if (!admin_group_id.empty()) {
+    if (!admin_group.empty()) {
         for (const auto& gid : groups) {
-            if (gid == admin_group_id) {
+            if (gid == admin_group) {
                 role = Role::admin;
                 break;
             }
         }
     }
+    return role;
+}
+
+// ── OIDC session creation ───────────────────────────────────────────────────
+
+std::string AuthManager::create_oidc_session(const std::string& display_name,
+                                             const std::string& email, const std::string& oidc_sub,
+                                             const std::string& iss,
+                                             const std::vector<std::string>& groups,
+                                             const std::string& admin_group_id,
+                                             std::chrono::steady_clock::time_point mfa_verified_at) {
+    std::unique_lock lock(mu_);
+
+    Role role = resolve_role_from_groups(groups, admin_group_id);
+
+    // #1837 — the STABLE authorization principal is `iss` + `sub`, never a
+    // display name. `sub` is only guaranteed unique per-issuer (RFC 7519),
+    // and a display name is a mutable, IdP-editable label two users can
+    // share — keying on it let two same-named users collide onto one
+    // principal, which #1832's RBAC reconcile then makes destructive
+    // (one user's login can delete the other's group memberships).
+    const std::string stable_username = "oidc:" + iss + "#" + oidc_sub;
+    const std::string resolved_display = display_name.empty() ? email : display_name;
 
     auto token = generate_session_token();
     Session s;
-    s.username = display_name.empty() ? email : display_name;
+    s.username = stable_username;
+    s.display_name = resolved_display;
     s.role = role;
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "oidc";
     s.oidc_sub = oidc_sub;
+    s.last_activity_at = std::chrono::steady_clock::now();
+    s.last_activity_persisted_at = s.last_activity_at;
     s.mfa_verified_at = mfa_verified_at;
     sessions_[token] = std::move(s);
 
-    spdlog::info("OIDC session created for '{}' (email={}, sub={}, role={})",
-                 display_name.empty() ? email : display_name, email, oidc_sub,
-                 role_to_string(role));
+    spdlog::info("OIDC session created for '{}' (display={}, email={}, sub={}, role={})",
+                 stable_username, resolved_display, email, oidc_sub, role_to_string(role));
+    return token;
+}
+
+// #1852 — see the header doc for the fail-soft / lock-ordering contract.
+void AuthManager::provision_sso_identity(const std::string& principal, const std::string& iss,
+                                         const std::string& sub,
+                                         const std::string& display_name) {
+    if (!auth_db_) {
+        // Legacy config-file-only deployment — no durable store to
+        // provision into. Not an error: elevation is unreachable for this
+        // deployment mode regardless (POST /api/v1/elevate 503s without
+        // auth_db_ptr()).
+        return;
+    }
+    auto result = auth_db_->upsert_sso_identity(principal, iss, sub, display_name, "oidc");
+    if (!result) {
+        spdlog::warn("provision_sso_identity failed for '{}': error={} (login proceeds; this "
+                     "principal cannot elevate until a future login provisions it)",
+                     principal, static_cast<int>(result.error()));
+        return;
+    }
+    // governance round (sec-LOW/UP-5) — observable IdP-provisioning volume.
+    // Every successful login re-runs this upsert (it is also the re-login
+    // refresh path, not just first-provision), so a sustained spike is a
+    // signal worth alerting on: either a legitimate onboarding wave or an
+    // IdP-side provisioning flood/credential-stuffing sweep against the SSO
+    // login path.
+    if (metrics_) {
+        metrics_->counter("yuzu_auth_sso_provision_total", {{"source", "oidc"}}).increment();
+    }
+}
+
+// ── SAML session creation ───────────────────────────────────────────────────
+
+std::string AuthManager::create_saml_session(const std::string& name_id,
+                                             const std::vector<std::string>& groups,
+                                             const std::string& admin_group) {
+    std::unique_lock lock(mu_);
+
+    // #1837 fast-follow: key SAML on entity_id#NameID (SAML doesn't sync to
+    // rbac_store yet, so its display-name-collision principal risk is
+    // dormant — see docs/auth-architecture.md "Stable principal vs. display
+    // name"). `username` stays the raw NameID; only `display_name` changes.
+    Role role = resolve_role_from_groups(groups, admin_group);
+
+    auto token = generate_session_token();
+    Session s;
+    s.username                   = name_id;
+    s.display_name               = name_id;
+    s.role                       = role;
+    s.expires_at                 = std::chrono::steady_clock::now() + kSessionDuration;
+    s.auth_source                = "saml";
+    s.last_activity_at           = std::chrono::steady_clock::now();
+    s.last_activity_persisted_at = s.last_activity_at;
+    sessions_[token]             = std::move(s);
+
+    spdlog::info("SAML session created for '{}' (role={})", name_id, role_to_string(role));
     return token;
 }
 

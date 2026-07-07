@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server::auth {
@@ -61,6 +62,39 @@ struct Config {
         90}; // Agents disconnected after this many seconds without heartbeat
     std::size_t max_agents{10'000};
 
+    // JIT admin elevation (SOC 2 CC6.3/CC6.6) — `/auth-and-authz` gap P1 #9.
+    // Maximum lifetime (seconds) of a time-boxed admin elevation granted via
+    // POST /api/v1/elevate; a request asking for longer is clamped to this. The
+    // elevation is in-memory per-session and auto-reverts on lapse. Default
+    // 3600 (1h). Wired via --jit-max-elevation-secs / YUZU_JIT_MAX_ELEVATION_SECS.
+    int jit_max_elevation_secs{3600};
+
+    // JIT elevation via OIDC IdP-MFA assertion (security review
+    // docs/security-reviews/jit-elevation-2026-06-30.md follow-up). When true
+    // (default), an OIDC session whose IdP login attested MFA via the `amr`
+    // claim (a seeded `Session::mfa_verified_at`, set at /auth/callback via
+    // amr_asserts_mfa) satisfies the mandatory-second-factor requirement at
+    // POST /api/v1/elevate WITHOUT local TOTP enrollment — the existing
+    // step-up freshness check still applies. A no-amr (single-factor) OIDC
+    // session is still hard-denied regardless of this flag. Set false to
+    // disable the OIDC-amr path entirely: OIDC sessions then cannot use JIT
+    // elevation at all (an OIDC session can't present a local TOTP step-up —
+    // its step-up is re-SSO), so an operator must elevate from a local session
+    // with local TOTP — an escape hatch for shops that want an elevation factor
+    // distinct from SSO. Wired via --jit-oidc-amr-elevation /
+    // YUZU_JIT_OIDC_AMR_ELEVATION.
+    bool jit_oidc_amr_elevation{true};
+
+    // Operator dashboard idle (inactivity) session timeout — SOC 2 CC6.3.
+    // Seconds of inactivity after which a cookie session is invalidated
+    // server-side (a sliding window UNDER the absolute 8h session lifetime).
+    // 0 (default) disables it — only the absolute lifetime applies; existing
+    // deployments are unaffected. Enabling it (recommended 900 = 15 min)
+    // satisfies the CC6.3 inactivity-timeout control. Wired via
+    // --session-inactivity-secs / YUZU_SESSION_INACTIVITY_SECS into
+    // AuthManager::set_session_inactivity. See docs/auth-architecture.md.
+    int session_inactivity_secs{0};
+
     // Authentication
     std::filesystem::path auth_config_path; // yuzu-server.cfg path
 
@@ -113,6 +147,7 @@ struct Config {
     std::string nvd_proxy;   // HTTP proxy for NVD API (e.g. "http://proxy:8080")
     std::chrono::seconds nvd_sync_interval{4 * 3600}; // Default: 4 hours
     bool nvd_sync_enabled{true};
+    int nvd_backfill_years{8}; // Newest-first backfill depth; <=0 = full history
 
     // OTA agent updates
     std::filesystem::path
@@ -138,6 +173,19 @@ struct Config {
     std::string oidc_admin_group;   // Entra group ID that maps to admin role
     bool oidc_skip_tls_verify{
         false}; // Disable TLS cert verification for OIDC (insecure, for dev only)
+
+    // SAML 2.0 SSO
+    // Enabled when idp_sso_url + idp_cert + sp_entity_id + sp_acs_url are all non-empty
+    // (mirrors OIDC's "gated on issuer && client_id" pattern).
+    // Not supported on Windows builds — is_enabled() returns false (N4), and a startup
+    // ERROR is logged if any flag is set.
+    std::string saml_idp_entity_id; // IdP entityID (must match Issuer in assertions)
+    std::string saml_idp_sso_url;   // IdP SSO URL (HTTP-Redirect binding endpoint)
+    std::string saml_idp_cert;      // Filesystem path to IdP signing cert PEM (pinned key)
+    std::string saml_sp_entity_id;  // SP entityID (used as AudienceRestriction)
+    std::string saml_sp_acs_url;    // SP Assertion Consumer Service URL (POST binding)
+    std::string saml_group_attribute; // <Attribute Name="..."> carrying group values
+    std::string saml_admin_group;     // Group value (from saml_group_attribute) that maps to admin
 
     // Response persistence
     int response_retention_days{90};
@@ -252,6 +300,14 @@ struct Config {
     /// `--allow-unsigned-packs`.
     bool allow_unsigned_definitions{false};
 };
+
+/// Trim leading/trailing ASCII whitespace (space/tab/CR/LF). Used to
+/// normalize operator-supplied config values that are compared for EXACT
+/// string equality against IdP-attested data — a trailing space from a
+/// copy-pasted CLI arg would otherwise silently and permanently prevent any
+/// match (currently: SamlConfig's admin-group flag, UP-4). Pure/free so it is
+/// directly unit-testable without constructing a Server.
+std::string trim_ascii_whitespace(std::string_view s);
 
 /**
  * Server manages inbound agent connections and exposes a management gRPC API.

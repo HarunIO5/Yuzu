@@ -38,6 +38,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
 #include "sync_source_installed_software.hpp" // ADR-0016 source #1
 #include "sync_source_app_perf.hpp"           // DEX app-perf-over-time B1 source
+#include "sync_source_device_ci.hpp"          // ADR-0016 device-CI inventory source
 #include "dex_event.hpp" // SignalObservation -> GuaranteedStateEvent mapping (proto-aware)
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
@@ -257,8 +258,12 @@ struct CommandContextImpl {
     // *truncated with a marker* rather than retained-and-failing. The
     // 2 MiB value matches `FleetTopologyStore::kPushedSnapshotMaxBytes`
     // on the server (in-tree convention: same constant in two places
-    // until typed proto lands and renders both moot).
+    // until typed proto lands and renders both moot). This is the
+    // DEFAULT; a caller that needs a larger bounded payload (the
+    // installed_software sync's v2 rows, blob contract v2) overrides it
+    // per-dispatch via `capture_max_bytes` below — see dispatch_with_capture.
     static constexpr std::size_t kCaptureMaxBytes = 2ull * 1024 * 1024;
+    std::size_t capture_max_bytes{kCaptureMaxBytes};
     bool capture_truncated{false};
 
     void append_output(const char* text) {
@@ -271,7 +276,7 @@ struct CommandContextImpl {
             if (capture_truncated)
                 return;
             std::size_t prospective = capture->size() + (capture->empty() ? 0 : 1) + len;
-            if (prospective > kCaptureMaxBytes) {
+            if (prospective > capture_max_bytes) {
                 // Truncate with a sentinel suffix so the server-side
                 // parser cleanly rejects the payload as malformed JSON
                 // rather than ingesting a half-finished structure. The
@@ -349,14 +354,15 @@ int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* ac
     ctx_impl.command_id = "__local_dispatch__";
     ctx_impl.start_time = std::chrono::steady_clock::now();
     ctx_impl.capture = capture_out;
-    // CommandContextImpl currently bakes the cap into its append_output
-    // (kCaptureMaxBytes constant). LocalDispatcher::kCaptureMaxBytes
-    // tracks the same value so the externally-visible policy lives in
-    // one place; the static_assert below catches divergence at compile
-    // time if either side drifts.
+    // Per-dispatch cap: append_output enforces ctx_impl.capture_max_bytes, not
+    // the class-static kCaptureMaxBytes default. The two DEFAULTS are pinned
+    // equal by the static_assert below so a caller relying on the default
+    // (every caller except the installed_software sync source) is unaffected;
+    // a caller that passes a non-default capture_cap (LocalDispatcher::run's
+    // parameter) actually gets that bound enforced here.
     static_assert(CommandContextImpl::kCaptureMaxBytes ==
                   yuzu::agent::LocalDispatcher::kCaptureMaxBytes);
-    (void)capture_cap;
+    ctx_impl.capture_max_bytes = capture_cap;
 
     auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
     int rc = descriptor->execute(raw_ctx, action, params, param_count);
@@ -1515,24 +1521,40 @@ public:
                 {
                     const YuzuPluginDescriptor* ia_descriptor = nullptr;
                     const YuzuPluginDescriptor* tar_descriptor = nullptr;
+                    // device_ci source plugins (ADR-0016): hardware / device_identity /
+                    // os_info / network_config, reused in-process via LocalDispatcher.
+                    const YuzuPluginDescriptor* hw_descriptor = nullptr;
+                    const YuzuPluginDescriptor* devid_descriptor = nullptr;
+                    const YuzuPluginDescriptor* osinfo_descriptor = nullptr;
+                    const YuzuPluginDescriptor* netcfg_descriptor = nullptr;
                     for (const auto& handle : plugins_) {
                         const std::string_view pname{handle.descriptor()->name};
                         if (pname == "installed_apps")
                             ia_descriptor = handle.descriptor();
                         else if (pname == "tar")
                             tar_descriptor = handle.descriptor();
+                        else if (pname == "hardware")
+                            hw_descriptor = handle.descriptor();
+                        else if (pname == "device_identity")
+                            devid_descriptor = handle.descriptor();
+                        else if (pname == "os_info")
+                            osinfo_descriptor = handle.descriptor();
+                        else if (pname == "network_config")
+                            netcfg_descriptor = handle.descriptor();
                     }
                     if (cfg_.inventory_disable) {
                         // Deploy-time opt-out (ADR-0016 / works-council co-determination
-                        // control): never start the daily-sync thread, collect or push no
-                        // installed-software inventory.
+                        // control): never start the daily-sync thread — NO source collects
+                        // or pushes (installed_software, app_perf, device_ci device identity).
                         spdlog::info("Daily-sync disabled (--inventory-disable / "
-                                     "YUZU_AGENT_INVENTORY_DISABLE) — no installed-software "
-                                     "inventory collected or pushed");
+                                     "YUZU_AGENT_INVENTORY_DISABLE) — no inventory collected or "
+                                     "pushed (sources: installed_software, app_perf, device_ci)");
                     } else {
                     sync_stop_.store(false, std::memory_order_release);
                     auto sync_stub = pb::AgentService::NewStub(channel);
-                    sync_thread_ = std::thread([this, ia_descriptor, tar_descriptor,
+                    sync_thread_ = std::thread([this, ia_descriptor, tar_descriptor, hw_descriptor,
+                                                devid_descriptor, osinfo_descriptor,
+                                                netcfg_descriptor,
                                                 sync_stub = std::move(sync_stub)]() {
                         auto should_stop = [this]() {
                             return stop_requested_.load(std::memory_order_acquire) ||
@@ -1591,8 +1613,13 @@ public:
                         // empty rollup → the source skips the cycle) and the TAR plugin
                         // being loaded (null descriptor → idle).
                         scheduler.add_source(make_app_perf_source(tar_descriptor));
-                        spdlog::info("Daily-sync thread started (sources=2: installed_software, "
-                                     "app_perf)");
+                        // ADR-0016 device-CI inventory: stable hardware/OS identity (CMDB
+                        // CI record). Idles unless all four source plugins are loaded.
+                        scheduler.add_source(make_device_ci_source(hw_descriptor, devid_descriptor,
+                                                                   osinfo_descriptor,
+                                                                   netcfg_descriptor));
+                        spdlog::info("Daily-sync thread started (sources=3: installed_software, "
+                                     "app_perf, device_ci)");
                         while (!should_stop()) {
                             auto now_secs = std::chrono::duration_cast<std::chrono::seconds>(
                                                 std::chrono::system_clock::now().time_since_epoch())
@@ -1853,8 +1880,68 @@ public:
                             heartbeat_ctx_.store(nullptr, std::memory_order_release);
                             if (!status.ok()) {
                                 spdlog::warn("Heartbeat failed: {}", status.error_message());
+                                // Orphan condition (#1894): the Subscribe stream is
+                                // still up but the server rejects our session —
+                                // NOT_FOUND (reaped as stale / forgotten across a
+                                // server restart) or UNAUTHENTICATED (session auth
+                                // expired, e.g. a mid-session cert rotation). The
+                                // stream never breaks for these, so the Read-loop
+                                // reconnect never fires and we would heartbeat a
+                                // dead session forever. Other codes (UNAVAILABLE /
+                                // DEADLINE_EXCEEDED) break the stream naturally and
+                                // are already covered. Force a reconnect by
+                                // cancelling the Subscribe stream.
+                                const auto hb_code = status.error_code();
+                                if (hb_code == grpc::StatusCode::NOT_FOUND ||
+                                    hb_code == grpc::StatusCode::UNAUTHENTICATED) {
+                                    // A successful Register resets reconnect_count
+                                    // (the normal backoff), so without a damper here
+                                    // a server that reaps every fresh session would
+                                    // drive a fleet-wide register→beat→reject→
+                                    // register storm (governance UP-1). Apply an
+                                    // escalating, capped, cancellable cooldown keyed
+                                    // on forced_rereg_streak_ (a member, so it
+                                    // survives the reconnect; reset on a healthy
+                                    // beat below).
+                                    constexpr auto kBase = std::chrono::seconds{2};
+                                    constexpr auto kCap = std::chrono::seconds{300};
+                                    // Cap the counter itself at 8 (not just the
+                                    // shift) so it can never overflow to a negative
+                                    // shift over a very long-lived orphan; streak 8
+                                    // already pins the cooldown at kCap. Serialized
+                                    // heartbeat threads → load/store is race-free.
+                                    const int streak = forced_rereg_streak_.load(
+                                        std::memory_order_acquire);
+                                    forced_rereg_streak_.store(std::min(streak + 1, 8),
+                                                               std::memory_order_release);
+                                    const auto cooldown =
+                                        std::min(kBase * (1 << std::min(streak, 8)), kCap);
+                                    spdlog::warn("Server rejected our session ({}) — "
+                                                 "re-registering after {}s (#1894)",
+                                                 status.error_message(),
+                                                 static_cast<long long>(cooldown.count()));
+                                    for (auto left = cooldown;
+                                         left.count() > 0 && !should_stop();) {
+                                        const auto slice = std::min<std::chrono::seconds>(
+                                            left, std::chrono::seconds{5});
+                                        std::this_thread::sleep_for(slice);
+                                        left -= slice;
+                                    }
+                                    if (!should_stop()) {
+                                        if (auto* sctx = subscribe_ctx_.load(
+                                                std::memory_order_acquire)) {
+                                            sctx->TryCancel();
+                                        }
+                                    }
+                                    break; // this connection is done; a fresh
+                                           // heartbeat thread spawns on reconnect
+                                }
                             } else {
                                 spdlog::debug("Heartbeat acknowledged (uptime={}s)", uptime);
+                                // Healthy beat — session is valid again; clear the
+                                // storm damper so a later isolated rejection starts
+                                // from the base cooldown (#1894).
+                                forced_rereg_streak_.store(0, std::memory_order_release);
                             }
                         }
                         heartbeat_ctx_.store(nullptr, std::memory_order_release);
@@ -2349,6 +2436,12 @@ private:
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> heartbeat_stop_{false};
     std::atomic<bool> sync_stop_{false}; // ADR-0016 daily-sync thread stop flag
+    // Consecutive session-rejection-forced re-registrations (#1894). A successful
+    // Register resets the normal reconnect backoff, so a server that reaps every
+    // fresh session would otherwise drive a fleet-wide re-registration storm; the
+    // heartbeat path applies its own escalating cooldown keyed on this counter,
+    // which survives across re-registrations and resets on a healthy heartbeat.
+    std::atomic<int> forced_rereg_streak_{0};
     // Set when run() returns due to a fatal STARTUP failure (the #1303 fail-closed
     // TLS posture refused to connect, or an unreadable cert/key) — not a normal
     // stop(). main() maps it to a non-zero exit. Single-threaded: written in run()

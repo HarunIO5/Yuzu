@@ -31,6 +31,7 @@
 #include "custom_properties_store.hpp"
 #include "data_export.hpp"
 #include "deployment_store.hpp"
+#include "discover_routes.hpp" // A2 discovery surface: /api/v1/discover/* (roadmap Issue 17.1)
 #include "discovery_store.hpp"
 #include "execution_event_bus.hpp"
 #include "execution_tracker.hpp"
@@ -39,11 +40,13 @@
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
+#include "app_perf_cohort_reader.hpp"
 #include "app_perf_group_reader.hpp"
 #include "app_perf_rollup.hpp"
 #include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
@@ -59,6 +62,7 @@
 #include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
+#include "saml_provider.hpp"
 #include "quarantine_store.hpp"
 #include "result_set_matcher.hpp"
 #include "result_set_store.hpp"
@@ -76,6 +80,7 @@
 #include "dex_routes.hpp"
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
+#include "inventory_ci_join.hpp"
 #include "network_routes.hpp"
 #include "software_catalog_rollup.hpp"
 #include "device_routes.hpp"
@@ -83,10 +88,14 @@
 #include "deployment_routes.hpp"
 #include "deployment_run_store.hpp"
 #include "preflight_routes.hpp"
+#include "verify_routes.hpp"
 #include "preflight_run_store.hpp"
+#include "vuln_finding_store.hpp"
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
+#include "schedule_routes.hpp"
+#include "schedule_runner.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
 #include "fleet_topology_store.hpp"
@@ -166,6 +175,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -223,6 +233,13 @@ extern const std::string_view
 extern const std::vector<std::string>
     kBundledDefinitions;                            // build-time embed of content/definitions/
 extern const std::vector<std::string> kBundledSets; // build-time embed of content/packs/*sets*
+
+std::string trim_ascii_whitespace(std::string_view s) {
+    auto b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string_view::npos) return {};
+    auto e = s.find_last_not_of(" \t\r\n");
+    return std::string(s.substr(b, e - b + 1));
+}
 } // namespace yuzu::server
 
 namespace yuzu::server {
@@ -277,6 +294,20 @@ public:
           api_rate_limiter_(cfg_.rate_limit), login_rate_limiter_(cfg_.login_rate_limit) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
+        metrics_.describe("yuzu_nvd_total_cves", "Distinct CVEs in the local NVD catalog", "gauge");
+        metrics_.describe("yuzu_nvd_backfill_complete",
+                          "1 when the newest-first NVD backfill has reached its floor, else 0",
+                          "gauge");
+        metrics_.describe("yuzu_nvd_sync_failures_total",
+                          "NVD sync window failures by reason (connection/http_429/http_403/"
+                          "http_other/parse)",
+                          "counter");
+        // Initialise every reason series to 0 so the counter (and its HELP/TYPE)
+        // is present in /metrics on a healthy server — otherwise absent()-style
+        // alerts misfire and Grafana shows "No data" until the first failure (sre).
+        for (auto r : kNvdCountedReasons) {
+            metrics_.counter("yuzu_nvd_sync_failures_total", {{"reason", nvd_reason_label(r)}});
+        }
         metrics_.describe("yuzu_server_default_certs_active",
                           "1 when running with built-in per-install default certificates, else 0",
                           "gauge");
@@ -338,8 +369,9 @@ public:
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
-                          "(store_not_open/pool_acquire_timeout/query_error). /readyz stays green "
-                          "under pure pool saturation, so this is the read-path degrade signal",
+                          "(store_not_open/pool_acquire_timeout/query_error) and source "
+                          "(installed_software/device_ci). /readyz stays green under pure pool "
+                          "saturation, so this is the read-path degrade signal",
                           "counter");
         metrics_.describe("yuzu_inventory_stale_agents",
                           "Agents whose installed-software inventory has not synced within the "
@@ -402,6 +434,14 @@ public:
         metrics_.describe("yuzu_app_perf_group_read_degrade_total",
                           "Management-group app-perf trend reads that returned a degrade rather than "
                           "a result, by reason",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_cohort_read_degrade_total",
+                          "/auto VERIFY cohort B1 reads that returned a degrade rather than a "
+                          "result, by reason (pool_acquire_timeout/query_error)",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_cohort_read_cap_hit_total",
+                          "/auto VERIFY cohort reads that hit the row cap and were TRUNCATED (the "
+                          "comparison is incomplete and may mis-pair machines)",
                           "counter");
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
@@ -688,6 +728,14 @@ public:
         // "Sign out everywhere" which also revokes API tokens).
         metrics_.describe("yuzu_auth_sessions_revoked_total",
                           "Total session revocations, by caller, result, and scope", "counter");
+        // Durable SSO identity provisioning observability (#1852 governance
+        // round, sec-LOW/UP-5). Incremented on every successful
+        // upsert_sso_identity call (first-provision AND re-login refresh),
+        // labelled by source so an IdP-side provisioning flood is visible
+        // independently of ordinary login volume.
+        metrics_.describe("yuzu_auth_sso_provision_total",
+                          "Total durable SSO identity provision/refresh upserts, by source",
+                          "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -907,6 +955,15 @@ public:
 
         // Initialize OIDC provider if configured
         if (!cfg_.oidc_issuer.empty() && !cfg_.oidc_client_id.empty()) {
+            // #1830.1: trim leading/trailing ASCII whitespace from the
+            // admin-group config value — same trailing-space silent-lockout
+            // bug fixed for --saml-admin-group (UP-4, see below). Mutate
+            // cfg_ itself (not just the local oidc_cfg copy) so every other
+            // reader of cfg_.oidc_admin_group (the /auth/callback route's
+            // admin_gid lookup, the startup config-audit line) sees the
+            // trimmed value too.
+            cfg_.oidc_admin_group = trim_ascii_whitespace(cfg_.oidc_admin_group);
+
             oidc::OidcConfig oidc_cfg;
             oidc_cfg.issuer = cfg_.oidc_issuer;
             oidc_cfg.client_id = cfg_.oidc_client_id;
@@ -946,6 +1003,128 @@ public:
 
             oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         }
+
+        // Initialize SAML 2.0 SP provider if configured.
+        // SAML is not supported on Windows (N4 — xmlsec1 is not available on the
+        // Windows build): log an ERROR if any SAML flag is set so operators learn
+        // immediately that the feature is disabled (fail-closed, never silently half-on).
+#ifdef _WIN32
+        if (!cfg_.saml_idp_sso_url.empty() || !cfg_.saml_idp_cert.empty() ||
+            !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty()) {
+            spdlog::error("SAML is not supported on Windows builds; SAML login disabled"
+                          " — fail-closed");
+        }
+        // saml_provider_ stays null on Windows — routes 404 via is_enabled() check.
+#else
+        {
+            // UP-4: trim leading/trailing ASCII whitespace from the admin-group
+            // config value once, here — the single load point where cfg_ is
+            // assembled into SamlConfig. Without this, a trailing space in
+            // `--saml-admin-group "Admins "` compares raw against the parsed
+            // (whitespace-trimmed, see saml_provider.cpp get_text) assertion
+            // value and silently never matches — no admin is ever minted, with
+            // no error surfaced. group_attribute (the Name to match, not a
+            // value) is deliberately NOT trimmed here — IdP attribute names are
+            // exact-match XML identifiers, not free-text values susceptible to
+            // this class of operator typo. OIDC's admin_group is trimmed the
+            // same way, above at OIDC provider init (#1830.1).
+            cfg_.saml_admin_group = trim_ascii_whitespace(cfg_.saml_admin_group);
+
+            // sre-S3 / UP-1 / UP-9: half-configured group→role mapping grants
+            // no admin and fails silently otherwise — warn at boot so an
+            // operator who set one flag but not the other (a likely typo/
+            // partial-rollout mistake) finds out before wondering why no SAML
+            // login is ever admin. Both-set and both-empty are legitimate
+            // configurations and do NOT warn.
+            if (cfg_.saml_group_attribute.empty() != cfg_.saml_admin_group.empty()) {
+                spdlog::warn("SAML group→role mapping is half-configured "
+                             "(--saml-group-attribute=\"{}\", --saml-admin-group=\"{}\") — "
+                             "both flags must be set for any SAML login to be promoted to "
+                             "admin; as configured, no SAML session will ever grant admin.",
+                             cfg_.saml_group_attribute, cfg_.saml_admin_group);
+            }
+
+            const bool saml_config_complete = !cfg_.saml_idp_sso_url.empty() &&
+                                              !cfg_.saml_idp_cert.empty() &&
+                                              !cfg_.saml_sp_entity_id.empty() &&
+                                              !cfg_.saml_sp_acs_url.empty() &&
+                                              !cfg_.saml_idp_entity_id.empty();
+            if (saml_config_complete) {
+                // HTTPS gate: SAML ACS is delivered over the browser's back-channel
+                // POST.  The __Host-yuzu_saml_bind binding cookie requires Secure
+                // attribute (baked into the cookie string) which browsers only send
+                // on HTTPS.  Running SAML over plain HTTP would silently strip the
+                // binding cookie on every ACS POST, making the CSRF guard inert —
+                // effectively leaving the server open to forced-login attacks.
+                // Fail-closed: if HTTPS is not enabled, leave saml_provider_ null.
+                if (!cfg_.https_enabled) {
+                    spdlog::error("SAML requires HTTPS (--https-cert / --https-key must be "
+                                  "configured) — SAML login disabled (fail-closed). The "
+                                  "browser-binding cookie is Secure-only and would be "
+                                  "silently dropped over plain HTTP.");
+                } else {
+                // Read the IdP signing cert PEM from disk. Fail closed: if the file
+                // is unreadable or oversized the provider is not constructed (routes 404).
+                // Cap at 64 KiB — a PEM-encoded X.509 cert is at most ~8 KiB; 64 KiB
+                // gives generous headroom while preventing a misconfigured path from
+                // reading an unbounded file into memory at startup.
+                static constexpr std::streamsize kSamlCertMaxBytes = 65536;
+                std::ifstream cert_file(cfg_.saml_idp_cert);
+                if (!cert_file.is_open()) {
+                    spdlog::error("SAML: cannot read IdP cert PEM from '{}' — SAML login"
+                                  " disabled (fail-closed)", cfg_.saml_idp_cert);
+                } else {
+                    // Read one extra byte to detect files that exceed the cap.
+                    std::string cert_pem(static_cast<std::size_t>(kSamlCertMaxBytes) + 1, '\0');
+                    cert_file.read(cert_pem.data(), kSamlCertMaxBytes + 1);
+                    if (!cert_file.eof()) {
+                        spdlog::error("SAML: IdP cert PEM '{}' exceeds {} bytes — SAML login"
+                                      " disabled (fail-closed)",
+                                      cfg_.saml_idp_cert, kSamlCertMaxBytes);
+                    } else {
+                        cert_pem.resize(static_cast<std::size_t>(cert_file.gcount()));
+                        saml::SamlConfig saml_cfg;
+                        saml_cfg.idp_entity_id  = cfg_.saml_idp_entity_id;
+                        saml_cfg.idp_sso_url    = cfg_.saml_idp_sso_url;
+                        saml_cfg.sp_entity_id   = cfg_.saml_sp_entity_id;
+                        saml_cfg.sp_acs_url     = cfg_.saml_sp_acs_url;
+                        saml_cfg.idp_cert_pem   = std::move(cert_pem);
+                        saml_cfg.group_attribute = cfg_.saml_group_attribute;
+                        saml_cfg.enabled        = true;
+                        // Construct in the single-threaded startup phase — xmlsec global init
+                        // is not thread-safe; the std::call_once guard in saml_provider.cpp
+                        // makes repeated construction safe thereafter.
+                        saml_provider_ = std::make_unique<saml::SamlProvider>(std::move(saml_cfg));
+                        if (saml_provider_ && saml_provider_->is_enabled()) {
+                            // sre-S2: log the group→role flags alongside the
+                            // existing endpoint fields. Both values are
+                            // low-sensitivity (an attribute name and a group
+                            // identifier, not a secret), so logging them
+                            // outright — rather than just a configured/not
+                            // boolean — gives an operator a one-line way to
+                            // confirm the deployed config matches intent.
+                            spdlog::info("SAML SP initialized (idp_sso_url={}, sp_entity_id={}, "
+                                         "group_attribute=\"{}\", admin_group=\"{}\")",
+                                         cfg_.saml_idp_sso_url, cfg_.saml_sp_entity_id,
+                                         cfg_.saml_group_attribute, cfg_.saml_admin_group);
+                        } else {
+                            spdlog::error("SAML: provider constructed but is_enabled() returned "
+                                          "false — SAML login disabled (fail-closed)");
+                            saml_provider_.reset();
+                        }
+                    }
+                } // end cert_file.is_open() else
+                } // end cfg_.https_enabled else
+            } else if (!cfg_.saml_idp_sso_url.empty() || !cfg_.saml_idp_cert.empty() ||
+                       !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty() ||
+                       !cfg_.saml_idp_entity_id.empty()) {
+                // Partial config — warn so the operator knows which flags are missing.
+                spdlog::warn("SAML: incomplete configuration (need --saml-idp-sso-url, "
+                             "--saml-idp-cert, --saml-sp-entity-id, --saml-sp-acs-url, "
+                             "--saml-idp-entity-id) — SAML login disabled");
+            }
+        }
+#endif
 
         // Setup file logger.
         //
@@ -999,9 +1178,17 @@ public:
         nvd_db_ = std::make_shared<NvdDatabase>(nvd_path);
 
         if (cfg_.nvd_sync_enabled && nvd_db_->is_open()) {
-            nvd_sync_ = std::make_unique<NvdSyncManager>(nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy,
-                                                         cfg_.nvd_sync_interval);
-            nvd_sync_->start();
+            nvd_sync_ = std::make_unique<NvdSyncManager>(
+                nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy, cfg_.nvd_sync_interval,
+                cfg_.nvd_backfill_years);
+            // Failure counts are surfaced via SyncStatus and emitted from the /metrics
+            // scrape (pull model, #1909) — no sync-thread→metrics_ callback.
+            // #1867: do NOT start the background thread here. Its first action is
+            // an uncancellable NVD fetch; if a LATER ctor step fails closed (e.g.
+            // the Postgres substrate probe below sets startup_failed_), ~ServerImpl
+            // would have to join a thread wedged mid-fetch and hang the process
+            // forever, defeating any restart policy. The thread is started in run()
+            // only after every fail-closed check and the listeners are up.
         }
 
         // Initialize OTA update registry
@@ -1113,6 +1300,19 @@ public:
             if (!deployment_run_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: deployment-run store migration/open failed "
                               "(database reachable but the deployment_run_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            }
+        }
+
+        // VulnFindingStore — born-on-PG CAVM findings + coverage projection.
+        // Same fail-CLOSED construction posture as the run stores (ADR-0012 §1).
+        // DORMANT: no matching engine writes to it yet (PR 4).
+        if (pg_pool_ && !startup_failed_) {
+            vuln_finding_store_ = std::make_unique<VulnFindingStore>(*pg_pool_);
+            if (!vuln_finding_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: vuln-finding store migration/open failed "
+                              "(database reachable but the vuln_finding_store schema could not be "
                               "created/opened)");
                 startup_failed_ = true;
             }
@@ -1445,6 +1645,44 @@ public:
                 ev.detail = "instruction-definition signature enforcement disabled at startup "
                             "(--allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS) "
                             "— unsigned definitions will be accepted at import";
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+
+            // #1829 — same startup-posture audit pattern as the two rows
+            // above: an SSO admin-group mapping (--oidc-admin-group /
+            // --saml-admin-group) is a standing, security-relevant posture
+            // that a cold deployment with no logins yet would otherwise
+            // leave with zero audit evidence. Emit one row per configured
+            // flag so an auditor asking "was group X wired to admin during
+            // window Y?" can answer from the audit store. Values here are
+            // already trimmed (SAML: UP-4 above; OIDC: #1830.1 at OIDC
+            // provider init) and low-sensitivity (a group identifier, not a
+            // secret — matches the SAML admin audit-detail precedent,
+            // comp-S1/UP-5).
+            if (!cfg_.oidc_admin_group.empty() && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "config.admin_group_set";
+                ev.target_type = "AuthConfig";
+                ev.target_id = "oidc";
+                ev.detail = "provider=oidc;admin_group=" + cfg_.oidc_admin_group;
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+            if (!cfg_.saml_admin_group.empty() && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "config.admin_group_set";
+                ev.target_type = "AuthConfig";
+                ev.target_id = "saml";
+                ev.detail = "provider=saml;admin_group=" + cfg_.saml_admin_group;
                 ev.result = "success";
                 (void)audit_store_->log(ev);
             }
@@ -2101,6 +2339,25 @@ public:
             }
         }
 
+        // Typed device-CI projection — born-on-Postgres (ADR-0016 device_ci source).
+        // Stable hardware/OS identity (a CMDB CI record), 1:1 per agent. Independent
+        // of the stores above (its own schema, its own fail-closed). Wires BOTH server
+        // entry points (direct ReportInventory + gateway ProxyInventory).
+        if (pg_pool_ && !startup_failed_) {
+            device_inventory_store_ = std::make_unique<DeviceInventoryStore>(*pg_pool_);
+            if (!device_inventory_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: device inventory store migration/open failed "
+                              "(database reachable but the device_inventory_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else {
+                device_inventory_store_->set_metrics(&metrics_);
+                agent_service_.set_device_inventory_store(device_inventory_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_device_inventory_store(device_inventory_store_.get());
+            }
+        }
+
         // Fleet-aggregate app-perf projection (B2) + its roll-up query owner — the
         // long-retention trend substrate, built from B1 by a daily background job.
         // AppPerfFleetStore owns the schema (fail-closed like every PG store);
@@ -2124,6 +2381,13 @@ public:
                 // own (reads B1's), so no fail-closed gate — it degrades to nullopt.
                 app_perf_group_reader_ = std::make_unique<AppPerfGroupReader>(*pg_pool_);
                 app_perf_group_reader_->set_metrics(&metrics_);
+
+                // Cohort reader (/auto VERIFY): raw B1 rows for a member set ×
+                // app × two versions, agent_id PRESERVED so the compare engine
+                // pairs each machine. Borrows the pool, reads B1's schema, no
+                // fail-closed gate — degrades to nullopt.
+                app_perf_cohort_reader_ = std::make_unique<AppPerfCohortReader>(*pg_pool_);
+                app_perf_cohort_reader_->set_metrics(&metrics_);
             }
         }
 
@@ -2530,11 +2794,19 @@ public:
             spdlog::info("Gateway upstream listening on {}", cfg_.gateway_upstream_address);
         }
 
+        // #1867: start NVD background sync only now — past every fail-closed
+        // check and with the listeners up. A construction failure returns above
+        // without ever starting the thread, so ~ServerImpl never has to join a
+        // thread wedged in an uncancellable fetch.
+        if (nvd_sync_) {
+            nvd_sync_->start();
+        }
+
         // Create AuthRoutes — must precede start_web_server which uses it
         auth_routes_ = std::make_unique<AuthRoutes>(
             cfg_, auth_mgr_, rbac_store_.get(), api_token_store_.get(), audit_store_.get(),
             mgmt_group_store_.get(), tag_store_.get(), analytics_store_.get(), oidc_mu_,
-            oidc_provider_);
+            oidc_provider_, saml_provider_.get());
 
         start_web_server();
 
@@ -2935,6 +3207,15 @@ public:
         }
         preflight_runner_.reset();
 
+        // Join the schedule tick thread (borrows schedule_engine_ + the
+        // instruction/execution/approval/audit stores via schedule_runner_ —
+        // must stop before any of them are torn down), then drop the runner
+        // so its borrowed pointers can't be ticked again.
+        if (schedule_tick_thread_.joinable()) {
+            schedule_tick_thread_.join();
+        }
+        schedule_runner_.reset();
+
         // Join the result-set maintenance thread (borrows result_set_store_,
         // execution_tracker_, response_store_ — must stop before teardown)
         if (result_set_maint_thread_.joinable()) {
@@ -2949,7 +3230,14 @@ public:
         if (schedule_engine_)
             schedule_engine_->stop();
         if (nvd_sync_) {
-            nvd_sync_->stop();
+            if (!nvd_sync_->stop()) {
+                // stop() had to detach a wedged sync thread that still references
+                // the manager (client_, mu_, cv_, status_, and the NvdDatabase).
+                // LEAK the manager so the abandoned thread can't touch freed
+                // memory once it wakes — the process is exiting; the OS reclaims
+                // it. Destroying it here would be a teardown UAF (#1867).
+                (void)nvd_sync_.release();
+            }
         }
         if (analytics_store_)
             analytics_store_->stop_drain();
@@ -3066,6 +3354,10 @@ public:
         // (no background thread in slice 1, but keep the ADR-0012 teardown
         // discipline so a future DeploymentRunner can't UAF).
         deployment_run_store_.reset();
+        // VulnFindingStore borrows pg_pool_ — drop before the pool (no background
+        // thread this PR; keep the ADR-0012 teardown discipline so a future engine
+        // can't UAF).
+        vuln_finding_store_.reset();
         // Same discipline for the software-inventory store (gov cpp-safety): null the
         // borrowed raw pointers in both ingest services, then drop the store, BEFORE
         // the pool — otherwise the store briefly holds a dangling PgPool& after the
@@ -3083,7 +3375,14 @@ public:
         if (gateway_service_)
             gateway_service_->set_app_perf_daily_store(nullptr);
         app_perf_group_reader_.reset(); // reads B1; before the daily store + pool
+        app_perf_cohort_reader_.reset(); // reads B1; before the daily store + pool
         app_perf_daily_store_.reset();
+        // Device-CI store: same discipline — null the borrowed pointers in both ingest
+        // services, then drop the store, BEFORE the pool.
+        agent_service_.set_device_inventory_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_device_inventory_store(nullptr);
+        device_inventory_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
         app_perf_fleet_store_.reset();
@@ -4381,10 +4680,20 @@ private:
             // code against a provisional TOTP secret during enforced
             // enrollment, so it is the same online-guessing surface and
             // must not fall through to the looser bucket.
+            // SAML 2.0 SSO start (GET /auth/saml/start) is the auth-flow entry
+            // point: flooding it fills pending_requests_ (cap 1000, oldest
+            // evicted), which lets an attacker evict legitimate users' in-flight
+            // login requests.  Apply the tighter login bucket — same reasoning
+            // as POST /login (H-C, Hermes round-2 2026-07-01).
+            // POST /saml/acs is also an auth-completion endpoint; include it
+            // for consistency so a flood of fake assertions is rate-limited too.
             bool is_login = (req.path == "/login" || req.path == "/login/mfa" ||
                              req.path == "/login/mfa/stepup" ||
                              req.path == "/login/mfa/enroll") &&
                             req.method == "POST";
+            is_login = is_login ||
+                       (req.path == "/auth/saml/start" && req.method == "GET") ||
+                       (req.path == "/saml/acs"        && req.method == "POST");
             auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
             if (!limiter.allow(req.remote_addr)) {
                 res.status = 429;
@@ -4415,10 +4724,15 @@ private:
             // an enforced login for an un-enrolled user who has only the
             // enrollment-pending token, not a cookie. (`/login/mfa/stepup`
             // is deliberately NOT here — it requires an existing session.)
+            // SAML 2.0 auth-flow routes are pre-session by design (identical
+            // rationale to /auth/oidc/start + /auth/callback).  Without these
+            // exemptions, a non-authenticated user trying to start SSO would be
+            // redirected to /login before the SAML flow handler runs.
             if (req.path == "/login" || req.path == "/login/mfa" ||
                 req.path == "/login/mfa/enroll" || req.path == "/health" ||
                 req.path == "/api/health" || req.path == "/auth/oidc/start" ||
                 req.path == "/auth/callback" || req.path == "/api/v1/openapi.json" ||
+                req.path == "/auth/saml/start" || req.path == "/saml/acs" ||
                 // PKI PR4: the CA root cert + CRL are public by design — clients
                 // and browsers need them to establish trust / check revocation
                 // before they have any session. Exact-match only; /api/v1/ca/issued
@@ -4524,6 +4838,33 @@ private:
                 metrics_.gauge("yuzu_server_group_members_total")
                     .set(static_cast<double>(mgmt_group_store_->count_all_members()));
             }
+            // Refresh NVD backfill gauges (multi-hour background job — needs to be
+            // observable; governance sre BLOCKING).
+            if (nvd_db_ && nvd_db_->is_open()) {
+                metrics_.gauge("yuzu_nvd_total_cves")
+                    .set(static_cast<double>(nvd_db_->total_cve_count()));
+                if (nvd_sync_) {
+                    auto st = nvd_sync_->status();
+                    metrics_.gauge("yuzu_nvd_backfill_complete").set(st.backfill_complete ? 1 : 0);
+                    // Pull model (#1909): the manager holds the authoritative monotonic
+                    // per-reason failure counts; emit them as yuzu_nvd_sync_failures_total by
+                    // incrementing the exported series by the delta since the last scrape
+                    // (Counter has no set()). No sync-thread→metrics_ callback → no teardown race.
+                    // The whole loop is serialized so two CONCURRENT /metrics scrapes (an HA
+                    // Prometheus pair) can't both read the same value(), compute the same delta,
+                    // and double-increment the counter (which would then stall until the real
+                    // tally re-exceeds it).
+                    std::lock_guard<std::mutex> emit_lock{nvd_metrics_scrape_mu_};
+                    for (auto r : kNvdCountedReasons) {
+                        const int i = nvd_reason_index(r);
+                        auto& c = metrics_.counter("yuzu_nvd_sync_failures_total",
+                                                   {{"reason", nvd_reason_label(r)}});
+                        const double delta = static_cast<double>(st.failure_counts[i]) - c.value();
+                        if (delta > 0)
+                            c.increment(delta);
+                    }
+                }
+            }
             res.set_content(metrics_.serialize(), "text/plain; version=0.0.4; charset=utf-8");
         });
 
@@ -4585,14 +4926,20 @@ private:
                 offline_endpoint_store_ && offline_endpoint_store_->is_open();
             bool software_inventory_ok =
                 software_inventory_store_ && software_inventory_store_->is_open();
+            bool vuln_finding_ok = vuln_finding_store_ && vuln_finding_store_->is_open();
             bool app_perf_daily_ok = app_perf_daily_store_ && app_perf_daily_store_->is_open();
             bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
+            bool device_inventory_ok =
+                device_inventory_store_ && device_inventory_store_->is_open();
+            // Load-bearing for the MCP write surface + REST approvals (sre-BLOCKING-1).
+            bool approval_ok = approval_manager_ && approval_manager_->is_open();
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
                                  guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
-                                 offline_endpoint_ok && software_inventory_ok && app_perf_daily_ok &&
-                                 app_perf_fleet_ok;
+                                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
+                                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok &&
+                                 approval_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4610,8 +4957,10 @@ private:
                   {"ca", ca_ok ? "ok" : "error"},
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
                   {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
+                  {"vuln_finding_store", vuln_finding_ok ? "ok" : "error"},
                   {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"},
-                  {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"}}},
+                  {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"},
+                  {"device_inventory_store", device_inventory_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -4708,6 +5057,10 @@ private:
                 {"audit_store", audit_store_ && audit_store_->is_open()},
                 {"instruction_store", instruction_store_ && instruction_store_->is_open()},
                 {"api_token_store", api_token_store_ && api_token_store_->is_open()},
+                // Load-bearing for the MCP write surface + REST /api/approvals/*
+                // (governance sre-BLOCKING-1). is_open() is false after a failed
+                // consumed_at migration, so a broken approval schema fails readyz.
+                {"approval_manager", approval_manager_ && approval_manager_->is_open()},
                 {"policy_store", policy_store_ && policy_store_->is_open()},
                 {"rbac_store", rbac_store_ && rbac_store_->is_open()},
                 {"tag_store", tag_store_ && tag_store_->is_open()},
@@ -4772,10 +5125,19 @@ private:
                 // ingest and no readiness signal — surface it (gov Pattern E).
                 {"software_inventory_store",
                  software_inventory_store_ && software_inventory_store_->is_open()},
+                // CAVM born-on-PG store (ADR-0012). Fail-closed at boot; a
+                // not-open post-boot state means the PR-4 matching engine would
+                // silently no-op findings persistence — surface it (Pattern E).
+                {"vuln_finding_store",
+                 vuln_finding_store_ && vuln_finding_store_->is_open()},
                 {"app_perf_daily_store",
                  app_perf_daily_store_ && app_perf_daily_store_->is_open()},
                 {"app_perf_fleet_store",
                  app_perf_fleet_store_ && app_perf_fleet_store_->is_open()},
+                // ADR-0016 device-CI born-on-Pg store — same rationale as the
+                // software_inventory_store row above (silent no-ingest ack if dead).
+                {"device_inventory_store",
+                 device_inventory_store_ && device_inventory_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
                 // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
                 // that fails to open AND `--allow-unsigned-packs` set produces
@@ -5275,8 +5637,17 @@ private:
             auto session = require_auth(req, res);
             if (!session)
                 return;
+            // #1837: `username` is the STABLE authorization principal (an
+            // opaque `oidc:<iss>#<sub>` id for SSO sessions) — never render
+            // it alone as the nav-bar identity. `display_name` is the
+            // human-readable label consumed by every page's nav/context
+            // bar JS below; falls back to `username` for a legacy session
+            // created before this field existed.
             auto j = nlohmann::json(
-                {{"username", session->username}, {"role", auth::role_to_string(session->role)}});
+                {{"username", session->username},
+                {"display_name",
+                 session->display_name.empty() ? session->username : session->display_name},
+                {"role", auth::role_to_string(session->role)}});
             // Add RBAC role if enabled
             if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
                 j["rbac_enabled"] = true;
@@ -5581,13 +5952,20 @@ private:
                                  return;
                              }
                              nlohmann::json j;
-                             j["enabled"] = true;
+                             // "enabled" reflects whether the sync manager exists, not
+                             // merely whether the DB file is open: under --no-nvd-sync the
+                             // catalog DB is still open (for matching) but sync is off, so
+                             // reporting enabled=true then 503-ing POST /api/nvd/sync was
+                             // contradictory (#1889 review r2).
+                             j["enabled"] = (nvd_sync_ != nullptr);
                              j["total_cves"] = nvd_db_->total_cve_count();
                              if (nvd_sync_) {
                                  auto st = nvd_sync_->status();
                                  j["syncing"] = st.syncing;
                                  j["last_sync_time"] = st.last_sync_time;
                                  j["last_error"] = st.last_error;
+                                 j["backfill_complete"] = st.backfill_complete;
+                                 j["backfill_oldest_published"] = st.backfill_oldest_published;
                              }
                              res.set_content(j.dump(), "application/json");
                          });
@@ -5603,8 +5981,10 @@ private:
                     "application/json");
                 return;
             }
-            // Run sync in a detached thread so we don't block the HTTP response
-            std::thread([this] { nvd_sync_->sync_now(); }).detach();
+            // Ask the background loop to sync at its next wake and return at once.
+            // (A detached thread here could outlive the manager and use-after-free
+            // db_/fetcher_ during the hours-long backfill — governance BLOCKING.)
+            nvd_sync_->request_sync();
             res.set_content(R"({"status":"sync_started"})", "application/json");
         });
 
@@ -5619,7 +5999,7 @@ private:
                     "application/json");
                 return;
             }
-            // Parse inventory: array of {name, version} or pipe-delimited lines
+            // Parse inventory: JSON body with an "inventory" array of {name, version}.
             std::vector<SoftwareItem> inventory;
             try {
                 auto body = nlohmann::json::parse(req.body);
@@ -5675,6 +6055,64 @@ private:
             // All commands require Execution:Execute permission
             if (!require_permission(req, res, "Execution", "Execute"))
                 return;
+
+            // Per-action securable elevation + scope confinement for DESTRUCTIVE
+            // generic-dispatch actions (governance HIGH #2). /api/command otherwise
+            // base-gates only Execution:Execute and applies NO per-device visibility to
+            // explicit agent_ids — a systemic property of this escape hatch tracked
+            // separately (Tr3kkR/Yuzu#1788). An irreversible action (e.g.
+            // tar.purge_source) must NOT inherit that: require its real securable AND
+            // confine the targets to the operator's visible agents, refusing untargeted
+            // broadcast/scope fan-out. The dedicated POST /api/v1/tar/retention-paused/
+            // purge is the first-class structured surface; this keeps the generic path
+            // from being a weaker one on AUTHZ. (Observability is still weaker here: a
+            // purge via /api/command audits under the generic `command.dispatch` verb +
+            // yuzu_commands_dispatched_total, not tar.source.purge / the domain metric —
+            // domain-verb emission on this path is tracked in Tr3kkR/Yuzu#1787.)
+            {
+                static const std::unordered_map<std::string,
+                                                std::pair<std::string, std::string>>
+                    kDestructiveActionSecurable = {
+                        {"tar.purge_source", {"Infrastructure", "Delete"}},
+                    };
+                std::string dkey = plugin + "." + action;
+                std::transform(dkey.begin(), dkey.end(), dkey.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (auto it = kDestructiveActionSecurable.find(dkey);
+                    it != kDestructiveActionSecurable.end()) {
+                    if (!require_permission(req, res, it->second.first, it->second.second))
+                        return;
+                    // Destructive dispatch must be explicitly targeted + in scope.
+                    if (agent_ids.empty() || !extract_json_string(req.body, "scope").empty()) {
+                        res.status = 400;
+                        res.set_content(
+                            R"({"error":{"code":400,"message":"destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"},"meta":{"api_version":"v1"}})",
+                            "application/json");
+                        return;
+                    }
+                    // Confine to the operator's visible agents (fail-closed: an absent
+                    // mgmt-group store filters to empty → 404, same posture as the
+                    // dashboard fragment). Out-of-scope ids are silently dropped.
+                    std::vector<std::string> filtered;
+                    if (mgmt_group_store_) {
+                        auto s = require_auth(req, res);
+                        if (!s) return;
+                        auto vis = mgmt_group_store_->get_visible_agents(s->username);
+                        std::unordered_set<std::string> visible(vis.begin(), vis.end());
+                        for (const auto& aid : agent_ids)
+                            if (visible.count(aid))
+                                filtered.push_back(aid);
+                    }
+                    agent_ids = std::move(filtered);
+                    if (agent_ids.empty()) {
+                        res.status = 404;
+                        res.set_content(
+                            R"({"error":{"code":404,"message":"no reachable in-scope agent"},"meta":{"api_version":"v1"}})",
+                            "application/json");
+                        return;
+                    }
+                }
+            }
 
             if (!registry_.has_any()) {
                 res.status = 503;
@@ -7447,47 +7885,10 @@ private:
 
         web_server_->Post("/api/schedules", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
-            if (!require_permission(req, res, "Schedule", "Write"))
-                return;
-            if (!schedule_engine_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            try {
-                auto j = nlohmann::json::parse(req.body);
-                InstructionSchedule sched;
-                sched.name = j.value("name", "");
-                sched.definition_id = j.value("definition_id", "");
-                sched.frequency_type = j.value("frequency_type", "once");
-                sched.interval_minutes = j.value("interval_minutes", 60);
-                sched.time_of_day = j.value("time_of_day", "00:00");
-                sched.day_of_week = j.value("day_of_week", 0);
-                sched.day_of_month = j.value("day_of_month", 1);
-                sched.scope_expression = j.value("scope_expression", "");
-                sched.requires_approval = j.value("requires_approval", false);
-
-                if (auto session = auth_routes_->resolve_session(req))
-                    sched.created_by = session->username;
-
-                auto result = schedule_engine_->create_schedule(sched);
-                if (!result) {
-                    res.status = 400;
-                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
-                                    "application/json");
-                    return;
-                }
-                (void)audit_log(req, "schedule.create", "success", "schedule", *result, sched.name);
-                res.set_header("HX-Trigger",
-                               R"({"showToast":{"message":"Schedule created","level":"success"}})");
-                res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
-            } catch (const std::exception& e) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
-            }
+            // Extracted to schedule_routes.cpp (H-01, #1806): the
+            // Schedule:Write + Execution:Execute gate ordering needs direct
+            // unit coverage that a bare inline lambda cannot get.
+            handle_create_schedule(*auth_routes_, schedule_engine_.get(), req, res);
         });
 
         web_server_->Delete(R"(/api/schedules/([^/]+))", [this](const httplib::Request& req,
@@ -7503,7 +7904,14 @@ private:
             }
 
             auto id = req.matches[1].str();
-            bool deleted = schedule_engine_->delete_schedule(id);
+            // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
+            // deletes only schedules the caller created, not the whole
+            // fleet's. auth_routes_->resolve_session, not require_permission's
+            // session (already consumed) — this call cannot fail auth since
+            // require_permission above already proved a valid session exists.
+            auto session = auth_routes_->resolve_session(req);
+            auto user = session ? session->username : std::string();
+            bool deleted = schedule_engine_->delete_schedule(id, user);
             if (deleted) {
                 (void)audit_log(req, "schedule.delete", "success", "schedule", id);
                 res.set_header("HX-Trigger",
@@ -7527,7 +7935,24 @@ private:
             auto id = req.matches[1].str();
             auto enabled_str = extract_json_string(req.body, "enabled");
             bool enabled = (enabled_str != "false");
-            schedule_engine_->set_enabled(id, enabled);
+            // H-01 (#1806): re-enabling arms the schedule to fire unattended
+            // through ScheduleRunner — the same fleet-wide-dispatch concern
+            // as create, so it needs the same Execution:Execute gate.
+            // Disabling only ever stops a schedule, so it stays gated on
+            // Schedule:Write alone — an operator must be able to kill a
+            // runaway schedule even without Execution:Execute.
+            if (enabled && !require_permission(req, res, "Execution", "Execute"))
+                return;
+
+            // M-01 (#1806): owner-scoped enable/disable, same as delete above.
+            auto session = auth_routes_->resolve_session(req);
+            auto user = session ? session->username : std::string();
+            bool changed = schedule_engine_->set_enabled(id, enabled, user);
+            if (changed) {
+                // L-04 (#1806): enable/disable had no audit trail at all.
+                (void)audit_log(req, enabled ? "schedule.enable" : "schedule.disable", "success",
+                                "schedule", id);
+            }
             res.set_content(nlohmann::json({{"enabled", enabled}}).dump(), "application/json");
         });
 
@@ -7704,7 +8129,9 @@ private:
                 // PlatformEngineer or Administrator can author definitions.
                 // When RBAC enforcement is fully wired, this will check the
                 // PlatformEngineer role via RbacStore::check_permission().
-                bool can_author = (session->role == auth::Role::admin);
+                // effective_role so an active JIT elevation also reveals the
+                // authoring UI (the POST already gates on effective_role).
+                bool can_author = (auth::effective_role(*session) == auth::Role::admin);
 
                 std::string html;
                 // Toolbar with New button for Platform Engineers
@@ -8436,6 +8863,61 @@ private:
             }
         });
 
+        // ScheduleRunner (#1191) — drives recurring-instruction schedules.
+        // ScheduleEngine::evaluate_due/advance_schedule had no production
+        // caller: schedules persisted and listed but never fired. Fires travel
+        // the same dispatch lambda as operator commands with tracked
+        // create-before-dispatch execution rows; approval-gated fires wait on
+        // the approvals queue (see schedule_runner.hpp). Joined BEFORE the
+        // stores in stop().
+        metrics_.describe("yuzu_schedule_fires_total",
+                          "Scheduled instruction occurrences dispatched successfully", "counter");
+        metrics_.describe("yuzu_schedule_fire_failures_total",
+                          "Scheduled occurrences skipped or failed (unknown/disabled definition, "
+                          "dispatch failure, no agents in scope, approval submit failure)",
+                          "counter");
+        metrics_.describe("yuzu_schedule_approvals_submitted_total",
+                          "Approval tickets submitted by the schedule runner for approval-gated "
+                          "occurrences",
+                          "counter");
+        metrics_.describe("yuzu_schedule_tick_errors_total",
+                          "Schedule runner tick() exceptions caught (alertable on sustained rate)",
+                          "counter");
+        schedule_runner_ = std::make_unique<ScheduleRunner>(ScheduleRunner::Deps{
+            .schedule_engine = schedule_engine_.get(),
+            .instruction_store = instruction_store_.get(),
+            .execution_tracker = execution_tracker_.get(),
+            .approval_manager = approval_manager_.get(),
+            .audit_store = audit_store_.get(),
+            .metrics = &metrics_,
+            .dispatch_fn = command_dispatch_fn,
+        });
+        schedule_tick_thread_ = std::thread([this]() {
+            spdlog::info("Schedule runner thread started (cadence=30s)");
+            while (!stop_requested_.load(std::memory_order_acquire)) {
+                for (int i = 0; i < 6 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
+                if (schedule_runner_) {
+                    // tick() touches SQLite and gRPC dispatch — either can
+                    // throw, and an exception escaping a std::thread entry
+                    // calls std::terminate, so one bad schedule must not take
+                    // the process. Catch, log, keep ticking.
+                    try {
+                        schedule_runner_->tick();
+                    } catch (const std::exception& e) {
+                        metrics_.counter("yuzu_schedule_tick_errors_total").increment();
+                        spdlog::error("schedule_runner: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        metrics_.counter("yuzu_schedule_tick_errors_total").increment();
+                        spdlog::error("schedule_runner: tick threw unknown exception — continuing");
+                    }
+                }
+            }
+        });
+
         // Result-set maintenance thread (capability §30) — materialises pending
         // result sets once their producing execution reaches a terminal state,
         // runs the GC sweep on a ~5-minute cadence, and refreshes the alive
@@ -8763,6 +9245,36 @@ private:
                 agent_ids.push_back(m.agent_id);
             return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
         };
+        app_perf_providers.cohort =
+            [this](std::string_view group_id, std::string_view app, std::string_view baseline,
+                   std::string_view candidate, int window_days) -> std::optional<CohortRead> {
+            if (!app_perf_cohort_reader_ || !mgmt_group_store_)
+                return std::nullopt;
+            // Resolve members (one bounded read, lease released), THEN read their raw
+            // B1 rows (a second bounded read) — never a lease held across the other
+            // (ADR-0012 §1). The /auto VERIFY compare engine pairs these per machine.
+            const auto members = mgmt_group_store_->get_members(std::string(group_id));
+            std::vector<std::string> agent_ids;
+            agent_ids.reserve(members.size());
+            for (const auto& m : members)
+                agent_ids.push_back(m.agent_id);
+            CohortRead out;
+            out.member_count = static_cast<std::int64_t>(agent_ids.size());
+            if (agent_ids.empty())
+                return out; // empty/unknown group → member_count 0, no rows (not a degrade)
+            bool truncated = false;
+            auto rows = app_perf_cohort_reader_->get_cohort_rows(agent_ids, app, baseline, candidate,
+                                                                 window_days, truncated);
+            if (!rows)
+                return std::nullopt; // AUTHORITATIVE degrade (the row read failed)
+            out.rows = std::move(*rows);
+            out.truncated = truncated;
+            return out;
+        };
+        // COPY the cohort provider (std::function is copyable) so the /auto VERIFY
+        // routes keep a live seam even after app_perf_providers is moved into the
+        // REST + MCP registrars below.
+        AppPerfCohortFn verify_cohort_fn = app_perf_providers.cohort;
         // The dashboard scope-selector's group list (id + name only). NO per-group
         // member count: that would be an N+1 get_members() over the store on every
         // render (UP-7); the selector needs names, not counts.
@@ -9102,10 +9614,13 @@ private:
         };
         auto inv_devices_fn = [this, visible_set_fn,
                                inv_human_age](const std::string& username)
-            -> std::vector<InventoryDeviceRow> {
-            std::vector<InventoryDeviceRow> out;
-            if (!offline_endpoint_store_)
-                return out;
+            -> InventoryDevicesResult {
+            InventoryDevicesResult result;
+            auto& out = result.rows;
+            if (!offline_endpoint_store_) {
+                result.ci_degraded = true; // no roster → no CI enrichment attempted either
+                return result;
+            }
             // Persisted endpoints within a 30-day window — OFFLINE-INCLUSIVE (the whole
             // point of the device tab: readable when a device is offline). Aged-out hosts
             // beyond the window are withheld so the list doesn't accrete dead hosts forever.
@@ -9133,7 +9648,50 @@ private:
                 r.last_seen = r.online ? std::string("now") : inv_human_age(age_ms);
                 out.push_back(std::move(r));
             }
-            return out;
+            // Device-CI enrichment (PR2): one list_device_ci(0) read — `0` means "uncapped,
+            // clamped to DeviceInventoryStore's kListRowCap (100k)" per that store's own
+            // limit-clamp contract, not "zero rows" — (symmetric with the full
+            // offline_endpoint_store_ materialize above), joined by agent_id via the pure
+            // attach_device_ci (inventory_ci_join.cpp). `out` is ALREADY the
+            // visible-confined roster (the loop above already dropped out-of-scope
+            // agents) — attach_device_ci only ever looks up by an agent_id already in
+            // `out`, so a CI row for an out-of-scope agent riding along in the same read
+            // is never attached, never rendered. A degrade (nullopt) leaves CI columns
+            // blank — the roster itself is still shown (this list is best-effort, unlike
+            // the Software tab's authoritative reads; see the existing empty-roster note).
+            // KNOWN FOLLOW-UP (#1783 — gov Gate 3 performance + architect + Gate 5 chaos
+            // review): this reads the WHOLE fleet's CI on every render regardless of how
+            // few devices are visible, unlike the Software tab's hourly rollup
+            // (software_catalog_rollup.cpp) which exists specifically to avoid this
+            // read-cadence-vs-write-cadence mismatch for daily-synced data. Deferred rather
+            // than fixed here to keep this PR scoped to dashboard-read enrichment.
+            //
+            // `result.ci_degraded` (#1785 review HIGH-1) tells the route's audit whether
+            // the CI columns above are genuinely enriched or blank because this join
+            // failed/was unwired — an unwired store is treated the same as a live failure
+            // (mirrors AgentCiFn's documented contract for the per-device drill).
+            if (device_inventory_store_) {
+                auto ci_list = device_inventory_store_->list_device_ci(0);
+                if (ci_list) {
+                    std::unordered_map<std::string, DeviceCiRecord> ci_by_agent;
+                    ci_by_agent.reserve(ci_list->size());
+                    for (auto& rec : *ci_list)
+                        // Safe: pair's members initialize in declaration order (`first`
+                        // before `second`), so the key copies from `rec.agent_id` before
+                        // `std::move(rec)` constructs `second` and leaves `rec` (incl. its
+                        // own .agent_id member) moved-from. Don't read the map VALUE's own
+                        // .agent_id after this, though — it's redundant with (and no longer
+                        // matches) the key; attach_device_ci never does (gov Gate 3
+                        // cpp-expert review).
+                        ci_by_agent.emplace(rec.agent_id, std::move(rec));
+                    attach_device_ci(out, ci_by_agent);
+                } else {
+                    result.ci_degraded = true;
+                }
+            } else {
+                result.ci_degraded = true;
+            }
+            return result;
         };
         inventory_routes_ = std::make_unique<InventoryRoutes>();
         inventory_routes_->register_routes(
@@ -9193,7 +9751,20 @@ private:
                                             kWin;
                 return software_inventory_store_->count_stale_agents(cutoff);
             },
-            audit_fn);
+            audit_fn,
+            // Per-device CI record (drill panel, post scoped_perm_fn gate). Mirrors
+            // agent_sw_fn_'s "unwired closure" fallback: not applicable here since this
+            // closure is always wired when device_inventory_store_ exists, and returns a
+            // live kDegraded when it doesn't (the store itself failed to construct/open).
+            // Appended after audit_fn (rather than inserted mid-signature) to match the
+            // DeviceRoutes/DexRoutes convention of growing register_routes by appending
+            // new closures with a `= {}` default (gov Gate 3 architect review).
+            [this](const std::string& id)
+                -> std::expected<std::optional<DeviceCiRecord>, CiReadError> {
+                if (!device_inventory_store_)
+                    return std::unexpected(CiReadError::kDegraded);
+                return device_inventory_store_->get_device_ci(id);
+            });
 
         // PreflightRoutes — /auto pre-flight page. A config section (per-check
         // params + thresholds) runs the live checks (app version / os_version /
@@ -9237,6 +9808,26 @@ private:
                 return preflight::collect_check_responses(*response_store_, run_id, applicable);
             },
             audit_fn, preflight_run_store_.get());
+
+        // VerifyRoutes — /auto Stage 3 VERIFY: the cohort-paired before/after
+        // app-perf evidence (UAT non-functional). Reads the shipped B1 store via the
+        // COPIED cohort provider; the pure compare engine pairs each machine. The
+        // aggregate read is an operational `dex.app_perf.compare` audit (set-and-
+        // proceed — the accountability that stands in for the absent floor); the
+        // per-machine drill is the audited PII surface. EVIDENTIAL only — no verdict,
+        // NO cohort floor (real canaries are 2-3 devices). Shares the /auto auth +
+        // group list with PreflightRoutes.
+        verify_routes_ = std::make_unique<VerifyRoutes>();
+        verify_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn,
+            [this]() -> std::vector<std::pair<std::string, std::string>> {
+                std::vector<std::pair<std::string, std::string>> out;
+                if (mgmt_group_store_)
+                    for (const auto& g : mgmt_group_store_->list_groups())
+                        out.emplace_back(g.id, g.name);
+                return out;
+            },
+            std::move(verify_cohort_fn), audit_fn);
 
         // DeploymentRoutes — the /auto DEPLOY stage. As soon as a pre-flight run has
         // a go-cohort (mid-run, no completion required), stages + executes an
@@ -9500,6 +10091,17 @@ private:
                    const std::string& parent_chain_pem) -> CaRoutes::ImportOutcome {
                 return import_subordinate_chain(intermediate_pem, parent_chain_pem);
             });
+
+        // -- A2 discovery surface (roadmap Issue 17.1): /api/v1/discover/* --------
+        // Agentic-first (A1/A2, docs/agentic-first-principle.md) — RBAC permission
+        // catalog, published instruction definitions, REST route catalog (subset of
+        // the SAME OpenAPI document /api/v1/openapi.json serves), Scope DSL kinds +
+        // operators, and the plugin/action catalog observed across the fleet. No
+        // AuditFn: these are catalog/schema reads, not per-device PII — matches the
+        // GET /guaranteed-state/schemas precedent this module is modeled on.
+        discover_routes_ = std::make_unique<DiscoverRoutes>();
+        discover_routes_->register_routes(*web_server_, auth_fn, perm_fn, rbac_store_.get(),
+                                          instruction_store_.get(), &registry_);
 
         // DEX app-perf-over-time read providers (slice 2). One bundle of B1/B2
         // store seams shared by the REST endpoints and the MCP twins so both read
@@ -9906,7 +10508,38 @@ private:
                 &metrics_,
                 // DEX app-perf-over-time read providers (slice 2) — same bundle the
                 // REST endpoints use, so MCP and REST read the SAME B1/B2 substrate.
-                app_perf_providers);
+                app_perf_providers,
+                // #289 / Issue 13.5: the quarantine store backs the
+                // quarantine_device write tool (record + real isolate), and the
+                // tag-push closure fires the agent tag-push after set_tag exactly
+                // like the REST PUT /api/v1/tags path (D4). Same closure body as
+                // the REST registration above.
+                quarantine_store_.get(),
+                [this](const std::string& agent_id, const std::string& key) {
+                    std::string lower_key = key;
+                    std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                                   [](unsigned char c) { return std::tolower(c); });
+                    for (auto cat_key : kCategoryKeys) {
+                        if (cat_key == lower_key) {
+                            push_asset_tags_to_agent(agent_id);
+                            break;
+                        }
+                    }
+                },
+                // A2 discovery (roadmap Issue 17.1): backs the discover_plugins tool
+                // via the SAME AgentRegistry::help_json() the REST /discover/plugins
+                // route reads (discover_routes_ above).
+                &registry_,
+                // H1 (PR #1796): per-device scope gate for the device-targeted MCP
+                // write tools (set_tag / delete_tag / quarantine_device) — the SAME
+                // require_scoped_permission chokepoint the dashboard device routes
+                // and REST per-device endpoints use, so a management-group-confined
+                // operator cannot tag or isolate devices outside their groups.
+                [this](const httplib::Request& req, httplib::Response& res,
+                       const std::string& type, const std::string& op,
+                       const std::string& agent_id) -> bool {
+                    return require_scoped_permission(req, res, type, op, agent_id);
+                });
         }
 
         // -- Listen -----------------------------------------------------------
@@ -10122,9 +10755,17 @@ private:
     mutable std::shared_mutex oidc_mu_;
     std::unique_ptr<oidc::OidcProvider> oidc_provider_;
 
+    // SAML 2.0 SP — constructed once at startup (xmlsec global init is not
+    // thread-safe); never mutated after construction, so no mutex is needed.
+    // Null when SAML is not configured or on Windows (fail-closed).
+    std::unique_ptr<saml::SamlProvider> saml_provider_;
+
     // NVD CVE feed
     std::shared_ptr<NvdDatabase> nvd_db_;
     std::unique_ptr<NvdSyncManager> nvd_sync_;
+    // Serializes the /metrics emit of yuzu_nvd_sync_failures_total so two concurrent scrapes
+    // can't double-apply the same per-reason delta (#1912 review).
+    mutable std::mutex nvd_metrics_scrape_mu_;
 
     // OTA agent updates
     std::unique_ptr<UpdateRegistry> update_registry_;
@@ -10143,6 +10784,10 @@ private:
     /// declared after it so it destructs before the pool; reset in stop().
     std::unique_ptr<PreflightRunStore> preflight_run_store_;
     std::unique_ptr<DeploymentRunStore> deployment_run_store_;
+    /// Born-on-PG CAVM findings + per-agent coverage projection (ADR-0012).
+    /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
+    /// DORMANT this PR: constructed + wired into /readyz+/healthz, no engine yet.
+    std::unique_ptr<VulnFindingStore> vuln_finding_store_;
     std::unique_ptr<AuditStore> audit_store_;
     std::unique_ptr<TagStore> tag_store_;
 
@@ -10189,6 +10834,7 @@ private:
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;
     std::unique_ptr<PreflightRunner> preflight_runner_; // borrows run+response stores
+    std::unique_ptr<ScheduleRunner> schedule_runner_;   // borrows engine + stores (#1191)
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
     std::unique_ptr<BaselineStore> baseline_store_;
     std::unique_ptr<CaStore> ca_store_;
@@ -10237,6 +10883,7 @@ private:
     std::unique_ptr<DeviceRoutes> device_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;
+    std::unique_ptr<VerifyRoutes> verify_routes_;
     std::unique_ptr<DeploymentRoutes> deployment_routes_;
     std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
@@ -10279,6 +10926,7 @@ private:
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
     std::unique_ptr<CaRoutes> ca_routes_; // PKI PR4: /api/v1/ca/*
+    std::unique_ptr<DiscoverRoutes> discover_routes_; // A2: /api/v1/discover/* (Issue 17.1)
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     std::unique_ptr<FleetTopologyStore> fleet_topology_store_;
@@ -10314,12 +10962,14 @@ private:
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX
     // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;
+    std::unique_ptr<DeviceInventoryStore> device_inventory_store_;
     // Fleet-aggregate app-perf (B2) + its cross-store roll-up query owner (ADR-0012).
     // Declared after pg_pool_ so they destruct before the pool.
     std::unique_ptr<AppPerfFleetStore> app_perf_fleet_store_;
     std::unique_ptr<AppPerfRollup> app_perf_rollup_;
     // Slice-2 group-trend reader (reads B1 by member list; borrows the pool).
     std::unique_ptr<AppPerfGroupReader> app_perf_group_reader_;
+    std::unique_ptr<AppPerfCohortReader> app_perf_cohort_reader_; // /auto VERIFY compare
 
     // Phase 7: Directory Sync (AD/Entra) & Patch Manager
     std::unique_ptr<DirectorySync> directory_sync_;
@@ -10335,6 +10985,7 @@ private:
     std::thread policy_eval_thread_;
     std::thread app_perf_rollup_thread_;
     std::thread preflight_runner_thread_; // joined before stores in stop()
+    std::thread schedule_tick_thread_;    // drives ScheduleRunner (#1191); joined before stores
     std::thread result_set_maint_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)

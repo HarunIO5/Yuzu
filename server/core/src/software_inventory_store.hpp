@@ -31,6 +31,8 @@
 ///     result. Staleness is acceptable (return the last projection); failure-as-empty
 ///     is not.
 
+#include "inventory_ingest_outcome.hpp" // InventoryIngestOutcome
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -49,19 +51,27 @@ namespace yuzu::server {
 
 /// One installed-software entry. **Machine-wide scope only** — no per-user /
 /// username / SID / user-path (ADR-0016: no PII, no works-council trigger).
+///
+/// Blob contract v2: member order == the wire/hash field order (append-only —
+/// the canonical hash and the agent's blob builder walk this exact sequence).
+/// Fields an ecosystem does not store are EMPTY, never synthesised: NEVRA +
+/// signature populate on Linux package managers per their capability (rpm =
+/// full; deb = no signature; apk/pacman = name/EVR only); Windows/macOS rows
+/// are kind=app with name/version/publisher only; distro_id/distro_version are
+/// stamped on every Linux row from /etc/os-release.
 struct SoftwareEntry {
     std::string name;
-    std::string version;
-    std::string publisher;
+    std::string version; // upstream version, release/revision stripped (v2)
+    std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
-};
-
-/// Outcome of a hash-skip ingest for one source (ADR-0016 §4).
-enum class InventoryIngestOutcome {
-    kStored,   ///< full payload accepted; the agent's rows were replaced
-    kTouched,  ///< claimed hash matched the stored hash; last_seen bumped only
-    kNeedFull, ///< cold cache / mismatch with no rows — server asks for a resend
-    kError,    ///< pool/SQL failure (transient; the agent retries next cycle)
+    std::string kind;      // "package" | "app"
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|homebrew
+    std::string epoch;
+    std::string release;   // rpm RELEASE / deb revision / apk pkgrel
+    std::string arch;
+    std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
+    std::string distro_id;        // /etc/os-release ID
+    std::string distro_version;   // /etc/os-release VERSION_ID
 };
 
 /// One fleet-query row: which agent carries which entry.
@@ -130,7 +140,7 @@ public:
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
     /// Wire a metrics registry for the read-degrade counter
-    /// (`yuzu_inventory_read_degrade_total{reason}`, #1675) and any future
+    /// (`yuzu_inventory_read_degrade_total{reason, source="installed_software"}`, #1675) and any future
     /// store-internal metric. Set ONCE during single-threaded startup, before
     /// the gRPC/REST surfaces begin serving — the pointer is read without
     /// synchronisation on the serving threads, so a later swap would race. A
@@ -219,6 +229,17 @@ public:
 
     /// Drop an agent's software inventory (e.g. on agent removal). Best-effort.
     void delete_agent(std::string_view agent_id);
+
+    /// KEYSET-paged enumeration of the agent_ids that have reported a given
+    /// `source` (`inventory_state.source`). Returns up to `limit` ids with
+    /// `agent_id > after_id`, ascending. The PK (agent_id, source) makes agent_id
+    /// unique per source, so NO DISTINCT is needed. The caller loops with
+    /// `after_id = ` the last returned id until it gets a short page. Bounded
+    /// lease; returns an empty vector on a degrade (a caller that must distinguish
+    /// end-of-pages from degrade should check the page length vs `limit`). The
+    /// PR-4 CAVM backfill trigger walks the fleet through this.
+    [[nodiscard]] std::vector<std::string>
+    list_agent_ids(std::string_view source, std::string_view after_id, int limit);
 
     /// Count agents whose `installed_software` inventory has not been refreshed
     /// since `stale_before_secs` (epoch seconds) — i.e. `last_seen <

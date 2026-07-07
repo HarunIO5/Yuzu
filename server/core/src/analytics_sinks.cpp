@@ -71,6 +71,7 @@ public:
         httplib::Client cli(scheme + "://" + host + ":" + std::to_string(port));
         cli.set_connection_timeout(5);
         cli.set_read_timeout(10);
+        cli.set_write_timeout(10);
 
         httplib::Headers headers;
         if (!username_.empty()) {

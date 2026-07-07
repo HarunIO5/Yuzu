@@ -96,6 +96,17 @@ endif
 # depend on `openssl(1)` at runtime or pre-baked .pem files that drift.
 agent_test_openssl_dep = dependency('openssl', required: true, include_type: 'system')
 
+# Test fixtures deliberately partial-aggregate-init wide inventory structs
+# (SwEntry / SoftwareEntry are 12 fields since blob contract v2; a 4-field
+# init IS the contract — "the rest stays empty"). -Wextra's
+# missing-field-initializers would flag every such fixture; suppress it for
+# the TEST targets only — production code stays fully warned.
+if cxx.get_id() == 'msvc'
+  test_partial_init_args = []
+else
+  test_partial_init_args = ['-Wno-missing-field-initializers']
+endif
+
 agent_test_exe = executable(
   'yuzu_agent_tests',
   files(
@@ -133,9 +144,12 @@ agent_test_exe = executable(
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
+    'unit/test_device_ci_sync.cpp',
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
     'unit/test_installed_apps_registry_utf8.cpp',
+    'unit/test_service_binpath.cpp',
+    'unit/test_installed_apps_inventory.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -144,6 +158,7 @@ agent_test_exe = executable(
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
   ],
+  cpp_args: test_partial_init_args,
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
@@ -167,6 +182,10 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('wintrust') # tar_module_etw.cpp WinVerifyTrust
   tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CryptQueryObject
   tar_test_deps += cxx.find_library('version')  # tar_proc_perf.cpp GetFileVersionInfoW
+  tar_test_deps += cxx.find_library('wevtapi')  # tar_netconn_win.cpp EvtQuery/EvtRender
+  tar_test_deps += cxx.find_library('ws2_32')   # winsock2 symbols the iphlpapi/netioapi headers in tar_netqual_boot.cpp pull in
+  tar_test_deps += cxx.find_library('mpr')      # tar_mapdrive_collector.cpp WNet outbound
+  tar_test_deps += cxx.find_library('netapi32') # tar_mapdrive_collector.cpp NetSessionEnum inbound
 elif host_machine.system() == 'darwin'
   # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
   # audit-token helpers, gated on the framework being present (full Xcode SDK).
@@ -186,6 +205,7 @@ tar_test_exe = executable(
   'yuzu_tar_tests',
   files(
     'unit/test_tar_diff.cpp',
+    'unit/test_tar_netconn.cpp',
     'unit/test_tar_software.cpp',
     'unit/test_tar_store.cpp',
     'unit/test_tar_schema_registry.cpp',
@@ -198,6 +218,7 @@ tar_test_exe = executable(
     'unit/test_tar_proc_es.cpp',
     'unit/test_tar_module_stream.cpp',
     'unit/test_tar_module_etw.cpp',
+    'unit/test_tar_mapdrive.cpp',
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
@@ -212,6 +233,9 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_proc_etw.cpp',
     '../agents/plugins/tar/src/tar_proc_es.cpp',
     '../agents/plugins/tar/src/tar_module_etw.cpp',
+    '../agents/plugins/tar/src/tar_netqual_boot.cpp',
+    '../agents/plugins/tar/src/tar_netconn_win.cpp',
+    '../agents/plugins/tar/src/tar_mapdrive_collector.cpp',
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [
@@ -232,6 +256,8 @@ if build_server
       'unit/server/test_auth.cpp',
       'unit/server/test_auth_routes.cpp',
       'unit/server/test_auth_routes_mfa.cpp',
+      'unit/server/test_auth_jit_elevation.cpp',
+      'unit/server/test_auth_sso_identity.cpp',
       'unit/server/test_auth_routes_hardened.cpp',
       'unit/server/test_settings_routes_mfa.cpp',
       'unit/server/test_totp.cpp',
@@ -271,20 +297,28 @@ if build_server
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
       'unit/server/test_schedule_engine.cpp',
+      'unit/server/test_schedule_routes.cpp',
+      'unit/server/test_schedule_runner.cpp',
       'unit/server/test_rbac_store.cpp',
+      'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_provider.cpp',
+      'unit/server/test_oidc_routes.cpp',
+      'unit/server/test_saml_provider.cpp',
+      'unit/server/test_saml_routes.cpp',
       'unit/server/test_error_codes.cpp',
       'unit/server/test_result_envelope.cpp',
       'unit/server/test_concurrency_manager.cpp',
       'unit/server/test_legacy_shim.cpp',
       'unit/server/test_management_group_store.cpp',
       'unit/server/test_dashboard_tar_retention.cpp',
+      'unit/server/test_rest_tar_purge.cpp',
       'unit/server/test_api_token_store.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_result_set_store.cpp',
       'unit/server/test_result_set_matcher.cpp',
       'unit/server/test_rest_result_sets_async.cpp',
+      'unit/server/test_chrome_ir_chain.cpp',
       'unit/server/test_result_sets_ui.cpp',
       'unit/server/test_scope_walking_authz.cpp',
       'unit/server/test_scope_yaml.cpp',
@@ -300,11 +334,13 @@ if build_server
       'unit/server/test_device_ui.cpp',
       'unit/server/test_device_routes.cpp',
       'unit/server/test_inventory_routes.cpp',
+      'unit/server/test_inventory_ci_join.cpp',
       'unit/server/test_software_catalog_rollup.cpp',
       'unit/server/test_tar_process_tree.cpp',
       'unit/server/test_tar_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
       'unit/server/test_dex_app_perf_model.cpp',
+      'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_dex_alert_router.cpp',
@@ -341,6 +377,7 @@ if build_server
       'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_sessions.cpp',
       'unit/server/test_rest_guaranteed_state.cpp',
+      'unit/server/test_discovery_routes.cpp', # A2 discovery surface (Issue 17.1)
       'unit/server/test_security_headers.cpp',
       'unit/server/test_insecure_tls_gate.cpp',
       'unit/server/test_settings_routes_users.cpp',
@@ -364,10 +401,14 @@ if build_server
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_vuln_finding_store.cpp',
+      'unit/server/test_vuln_finding_store_adversarial.cpp',
+      'unit/server/test_device_inventory_store.cpp',
       'unit/server/test_app_perf_daily_store.cpp',
       'unit/server/test_app_perf_ingestion.cpp',
       'unit/server/test_app_perf_rollup.cpp',
       'unit/server/test_app_perf_group_reader.cpp',
+      'unit/server/test_app_perf_cohort_reader.cpp',
       'unit/server/test_pg_array.cpp',
     ),
     include_directories: [
@@ -389,7 +430,8 @@ if build_server
     # YUZU_TEST_ENABLE_PG exposes the PostgresTestDb fixture in
     # test_helpers.hpp — only the server suite links libpq, so the guard
     # keeps the agent/tar suites (which share the header) libpq-free.
-    cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG'],
+    cpp_args: https_cpp_args + test_partial_init_args +
+              ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG'],
     # Server unit tests #include <openssl/...> directly (e.g.
     # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
     # propagate the OpenSSL include path, so declare it explicitly here

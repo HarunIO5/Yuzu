@@ -512,6 +512,18 @@ R"HTM(    <!-- ── Capture sources (ADR-0015) ──────────�
       </div>
     </div>
     <script>
+    // Phase 15.A retention-paused purge: typed-hostname confirmation via a native
+    // prompt() (CSP-safe — no eval/hx-on, mirrors the native confirm() used for
+    // re-enable), then an htmx POST that swaps the row's action cell with the
+    // server's "dispatched" note. Values come from data-* attributes (HTML-escaped
+    // server-side) — never interpolated into this script.
+    function tarPurgeConfirm(btn){
+      var dev=btn.getAttribute('data-device'),host=btn.getAttribute('data-host'),source=btn.getAttribute('data-source');
+      var typed=window.prompt('DESTRUCTIVE: permanently delete all '+source+' data on '+host+'.\nThe source stays paused; this cannot be undone.\n\nType the device hostname to confirm:');
+      if(typed===null)return;
+      if(typed!==host){if(typeof showToast==='function')showToast('Hostname did not match — purge cancelled','error');return;}
+      htmx.ajax('POST','/fragments/tar/retention-paused/purge',{values:{device_id:dev,source:source},target:btn.closest('td'),swap:'innerHTML'});
+    }
     // Capture-sources staged-then-push guardrail + category filter (ADR-0015). Plain
     // onclick/onchange handlers (CSP-safe — no hx-on/eval). A toggle only STAGES a
     // change; nothing is dispatched until Push.
@@ -659,10 +671,10 @@ document.body.addEventListener('htmx:afterSettle', function(e) {
   }
 });
 fetch('/api/me').then(function(r){return r.json()}).then(function(d){
-  document.getElementById('nav-user').textContent = d.username;
+  document.getElementById('nav-user').textContent = (d.display_name || d.username);
   var role = d.rbac_role || d.role;
   document.getElementById('role-badge').textContent = role;
-  document.getElementById('context-user').textContent = d.username;
+  document.getElementById('context-user').textContent = (d.display_name || d.username);
   document.body.setAttribute('data-role', role);
   if(d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
     var sl = document.getElementById('nav-settings-link');

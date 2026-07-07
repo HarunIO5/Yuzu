@@ -9,10 +9,41 @@ cadences.
 
 ## What is collected
 
-- **Machine-wide installed software**: name, version, publisher, install date.
-  Collected by the existing `installed_apps` plugin via its `list` action
-  (Windows: `HKLM` + the agent service account's own `HKCU`; Linux:
-  `dpkg`/`rpm`/`pacman`; macOS: `system_profiler`).
+- **Machine-wide installed software** (blob contract v2): name, version,
+  publisher, install date, plus the package-manager fields below. Collected by
+  the `installed_apps` plugin via its `list_inventory` action (Windows: `HKLM` +
+  the agent service account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`;
+  macOS: `system_profiler`). The operator-facing `list` action keeps its
+  original 4-column output — automation built on it is unaffected.
+- **The honest-empty contract:** a field the ecosystem does not store is the
+  empty string, **never synthesised** (no `-` placeholders, no guessed `0`
+  epoch). Per-ecosystem availability:
+
+  | Field | rpm | deb | apk | pacman | Windows | macOS |
+  |---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | — |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — |
+
+  Notes: rpm `signature_status` reflects the **stored** signature header tags in
+  the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
+  verification. `distro_id`/`distro_version` are host-level (`/etc/os-release`
+  `ID`/`VERSION_ID`), stamped on every Linux row. deb rows include **held**
+  packages (they are installed). `homebrew` is a reserved `ecosystem` value —
+  not collected yet (brew is per-user; the sync is machine-scope).
+- **Changes for rpm fleets vs the v1 (4-field) contract:** `publisher` is now
+  the rpm **PACKAGER** tag (was VENDOR), and `version` is the upstream version
+  only — the release moved to its own `release` column (was fused
+  `VERSION-RELEASE`). Fleet-wide version rollups on Linux change shape
+  accordingly on the first post-upgrade sync.
 - **No end-user profiles / personal data.** We do **not** use the plugin's
   per-user enumeration (`list_per_user`), so no logged-in-user profiles and no
   usernames are collected — no end-user PII. (The only `HKCU` read is the agent's
@@ -47,10 +78,12 @@ cadences.
 
 The data lands in the Postgres schema **`software_inventory_store`**:
 
-- `installed_software(agent_id, name, version, publisher, install_date)` — one
-  row per installed package per device. `version`, `publisher`, and
-  `install_date` may be empty (`''`) — the `installed_apps` plugin does not
-  guarantee them on every platform/package.
+- `installed_software(agent_id, name, version, publisher, install_date, kind,
+  ecosystem, epoch, release, arch, signature_status, distro_id, distro_version)`
+  — one row per installed package per device. Every column except `agent_id`
+  and `name` may be empty (`''`) per the honest-empty contract above; rows
+  synced by a pre-v2 agent carry `''` in all eight v2 columns until that
+  agent's next full resend.
 - `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` — per
   device sync bookkeeping. `first_seen`/`last_seen` are **server receipt times**
   (epoch seconds, stamped when the report is ingested), **not** the agent-supplied
@@ -71,6 +104,19 @@ SELECT name, version, publisher, install_date
 FROM software_inventory_store.installed_software
 WHERE agent_id = '<agent-id>'
 ORDER BY name;
+
+-- Full EVR + provenance for one package across the fleet (rpm/deb hosts)
+SELECT agent_id, ecosystem, epoch, version, release, arch,
+       signature_status, distro_id, distro_version
+FROM software_inventory_store.installed_software
+WHERE name = 'openssl'
+ORDER BY agent_id;
+
+-- Unsigned rpm packages anywhere in the fleet
+SELECT agent_id, name, version, release
+FROM software_inventory_store.installed_software
+WHERE ecosystem = 'rpm' AND signature_status = 'unsigned'
+ORDER BY agent_id, name;
 ```
 
 **Counting the *active* fleet (excluding decommissioned devices).** A device's
@@ -142,7 +188,10 @@ curl -H "Authorization: Bearer $TOKEN" \
   `name` and `agent_id` for a fleet-wide scan.
 - Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, ...},
   "meta": {"api_version": "v1"}}`. Each row is
-  `{agent_id, name, version, publisher, install_date}`.
+  `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
+  release, arch, signature_status, distro_id, distro_version}` — the v2 fields
+  are `""` where the ecosystem does not store them (see the availability matrix
+  above). The MCP tool's rows carry the identical field set.
 - **Carries the same per-agent management-group drop filter as the MCP tool**
   (out-of-scope devices dropped, omission audited, `devices_omitted` reports the
   count) — and the same **ADR-0017 caveat: not yet verified effective** under the
@@ -188,19 +237,30 @@ same data, with three tabs:
   an **"updated N ago"** stamp for the rollup; immediately after a fresh server starts (or
   before the first refresh) the catalogue shows a **"building"** note until the first
   recompute lands. This keeps the default tab fast at any fleet size.
-- **Devices** — a **thin device inventory**: hostname, OS, online/offline/**stale**
-  status, and last-seen, sourced from the server's persisted endpoint state so a device
-  appears here **even when it is offline** (joined to the live registry for the online
-  flag). The **list** is gated on the global `Inventory:Read`, filtered to the
-  operator's visible scope by the device provider, and the roster read is audited
-  (`inventory.devices`). **Clicking a
-  device** loads that device's installed software; that per-device drill is additionally
-  gated by the management-group chokepoint (`Inventory:Read` for the device's group, so
-  an operator only opens a device in their scope) **and is audited**
-  (`inventory.device.software`). An offline device shows its *last daily sync*, clearly
-  labelled. The richer CI columns (serial, model, CPU, RAM, MAC …) are greyed pending
-  the device-CI sync source (a follow-on). A large device list is rendered first-N with
-  the total shown; use the filter to narrow.
+- **Devices** — hostname, OS, online/offline/**stale** status, and last-seen, sourced
+  from the server's persisted endpoint state so a device appears here **even when it is
+  offline** (joined to the live registry for the online flag), **plus a device-CI
+  record** — serial, model, CPU cores/threads, and RAM — sourced from the `device_ci`
+  daily-sync source (ADR-0016 source #3) via `DeviceInventoryStore`. The **list** is
+  gated on the global `Inventory:Read`; management-group confinement of the roster is
+  **designed for, not yet verified effective** (the same inert-list-scoping class as
+  Find software, below — see ADR-0017), and the roster read is audited
+  (`inventory.devices` — the behavioural-PII audit tier, because the list now carries
+  device-persistent identifiers such as serial). **Clicking a device** loads its full CI record plus
+  installed software; that per-device drill is additionally gated by the
+  management-group chokepoint (`Inventory:Read` for the device's group, so an operator
+  only opens a device in their scope) **and is audited** — `inventory.device.software`
+  for the software list, `inventory.device.ci` (also the behavioural-PII tier) for the
+  CI panel (manufacturer, model, serial, system UUID, domain/OU, BIOS, CPU, memory,
+  primary/all MAC addresses, NIC count, OS name/version/build, architecture, and
+  first/last-synced times). An offline device shows its *last daily sync*, clearly
+  labelled; a device that hasn't completed its first `device_ci` sync yet shows an
+  honest "no CI record synced" note rather than blank cells, and an unknown individual
+  field (e.g. a serial-less VM) renders as a placeholder (`—`), never the raw
+  `"unknown"` sentinel. **Disk capacity is deliberately withheld** from the CI panel
+  pending a macOS disk-collection fix, and **owner/location are not shown** — the agent
+  doesn't collect them (a future operator-set CMDB enrichment). A large device list is
+  rendered first-N with the total shown; use the filter to narrow.
 - **Find software** — type an exact title to see **which devices run it** and at which
   versions. Like the REST/MCP siblings, Find is gated on the **global `Inventory:Read`**
   and returns **fleet-wide** results: management-group confinement is **not yet effective**
@@ -211,16 +271,16 @@ same data, with three tabs:
 
 **On store degradation** the **Software**, **Find**, and **per-device-software** views —
 the *authoritative* reads — show an explicit **"unavailable"** banner rather than an
-empty table, because an empty table would read as "installed nowhere", the fail-open the
-authoritative-read contract (ADR-0016 §7) forbids. The **Devices roster** is sourced from
-the deliberately *fail-soft* endpoint-state store (durability-on-top, not authoritative),
-so during a database incident it may render an empty/short roster rather than a banner;
-its empty-state copy says so and points you to the authoritative Software tab.
-
-The full **device CI inventory** (offline-readable hardware/identity records — a
-ServiceNow-style CI record) is a planned follow-on: it adds a device-CI **daily-sync
-source** (the ADR-0016 framework's source #2) feeding a born-on-Postgres
-`DeviceInventoryStore`, at which point the greyed CI columns above become real.
+empty table, because an empty table would read as "installed nowhere", the fail-open
+the authoritative-read contract (ADR-0016 §7) forbids. The **Devices roster** (the
+list's host/OS/last-seen columns, plus the CI columns joined onto it) is sourced from
+the deliberately *fail-soft* endpoint-state store and, for CI, a best-effort
+`DeviceInventoryStore` read layered on top — a `DeviceInventoryStore` degrade during the
+list render is indistinguishable from "not yet synced" (both show the `—` placeholder),
+matching the roster's own already-fail-soft posture rather than claiming a new
+authoritative one. The **per-device CI panel** (the drill), by contrast, IS an
+authoritative three-state read: found / genuinely-not-yet-synced ("no CI record synced
+yet") / degraded (an explicit "CI record unavailable" banner) are never conflated.
 
 ## Access control
 
@@ -255,6 +315,18 @@ restart sends a full list. Note that app *counts* can rise slightly after the
 fix: names that previously collapsed to the same `?`-mangled string (e.g. two
 different non-ASCII apps) now separate into distinct rows.
 
+**A `need_full` spike right after deploying the blob-v2 release is expected.**
+The v2 contract reformats the canonical content hash (12 fields instead of 4),
+so every agent's first post-upgrade report mismatches its stored v1 hash and the
+server nacks `need_full` — one full resend per agent, phase-spread across the
+~24 h sync window, then hash-skip resumes. Watch
+`yuzu_inventory_ingest_total{outcome="need_full"}` fall back to baseline within
+a day. During a mixed-version window the loop is bounded, not broken: an **old
+agent against a new server** (or a new agent against an old server) settles into
+roughly one hash-only nack plus one full resend per day — data stays correct,
+and it ends when the lagging side upgrades. Deploy **server first, then agents**
+(the platform's normal order).
+
 **Observability.** The server emits `yuzu_inventory_ingest_total{source,outcome}`
 (outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped` / `rejected`,
 the last for a whole report rejected at the source-map cap) — watch the
@@ -268,8 +340,9 @@ whose ingest is failing. Four further series sharpen the picture:
   cheap hash-skip compare + `last_seen` bump — split so the steady-state
   hash_only majority doesn't bury the `full` tail, the pool-pressure signal under
   a cold-cache `need_full` herd.
-- `yuzu_inventory_read_degrade_total{reason}` (counter, reason ∈ `store_not_open` /
-  `pool_acquire_timeout` / `query_error`) — an **authoritative read** that returned
+- `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
+  `pool_acquire_timeout` / `query_error`; source ∈ `installed_software` / `device_ci`) — an
+  **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
   pool saturation, so without this counter a degraded fleet software query is
   otherwise invisible. The per-degrade WARN is sampled per site — the leading edge
@@ -339,6 +412,40 @@ explicit `on()/group_left()` matching with a denominator caveat. **Enable it** o
 you have observed your fleet's normal stale-count baseline and set the threshold to
 ~5–10% of your expected active fleet; correlate with `yuzu_fleet_agents_healthy` to
 separate "agents offline" from "sync source broken / disabled".
+
+## Device-identity inventory (`device_ci`)
+
+A second daily-sync source, **`device_ci`** (ADR-0016 source #3), is live on the
+agent and server. It collects the machine's stable hardware/OS identity — a
+ServiceNow-CMDB-style configuration item — and persists one row per device in the
+Postgres schema **`device_inventory_store`** (table `device_ci`): manufacturer,
+model, **serial number**, **system UUID**, BIOS vendor/version/date, CPU
+model/cores/threads, RAM, a disk summary, **primary MAC** + MAC summary + NIC
+count, OS name/version/build, and architecture. Serial number and system UUID are
+the CMDB correlation key.
+
+It is collected via the existing `hardware` (incl. a new `system` action for
+serial + UUID), `device_identity`, `os_info`, and `network_config` plugins. It
+**excludes volatile telemetry** — free disk space, uptime, IP addresses —
+deliberately: those change between cycles and would flip the content hash every
+sync, defeating the hash-skip protocol.
+
+- **Scope / privacy.** Machine-scope only (no per-user data), but serial/UUID/MAC
+  are device-persistent identifiers — treat as potentially personal data where a
+  device is person-assigned. The same **`--inventory-disable`** flag suppresses
+  `device_ci` along with the other sources (it gates the whole daily-sync thread).
+- **Observability.** Ingest shares
+  `yuzu_inventory_ingest_total{source="device_ci"}` +
+  `yuzu_inventory_ingest_duration_seconds{source="device_ci"}`; read degrades use
+  `yuzu_inventory_read_degrade_total{source="device_ci"}`. The store joins
+  `/readyz` + `/healthz`.
+- **VMs / serial-less hosts.** A device with no SMBIOS serial (many VMs) reports
+  `serial`/`system_uuid` as the literal `"unknown"` — use `manufacturer`/`model`
+  (e.g. "VMware, Inc."/"VMware7,1") to recognise it.
+
+The operator-facing read surface — the `/inventory` **Devices** tab CI columns and
+the per-device CI panel — is live; see the **Devices** bullet above for its columns,
+fields, and audit/degrade posture.
 
 ## See also
 

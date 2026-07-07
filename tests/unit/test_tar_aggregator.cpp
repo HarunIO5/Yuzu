@@ -213,6 +213,40 @@ TEST_CASE("TAR paused_at: recovering an errored source via =true clears the time
     CHECK(db.get_config("process_paused_at", "0") == "0");
 }
 
+TEST_CASE("TAR source_enabled: the destructive-purge paused-guard predicate (15.A)",
+          "[tar][source-enabled][purge]") {
+    // source_enabled is the authoritative guard for tar.purge_source: the action
+    // refuses unless this returns false (source is paused). Pin the exact predicate
+    // the plugin branches on so a regression that mis-reads the enabled-state — and
+    // would let a purge hit an actively-collecting source, or wrongly refuse a
+    // paused one — is caught here even though do_purge_source itself lives in the
+    // (test-unlinked) plugin TU. Governance B1.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-15a-guard-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    // Never configured: a purge-whitelisted source defaults ENABLED → guard refuses
+    // (you cannot purge a source you never deliberately paused).
+    REQUIRE(source_default_enabled("process"));
+    CHECK(source_enabled(db, "process")); // → tar.purge_source REFUSES
+
+    // Paused: enabled=false → guard allows the purge.
+    db.set_config("process_enabled", "false");
+    CHECK_FALSE(source_enabled(db, "process")); // → tar.purge_source ALLOWED
+
+    // Re-enabled between scan and purge (the TOCTOU the guard closes): true → refuse.
+    db.set_config("process_enabled", "true");
+    CHECK(source_enabled(db, "process")); // → tar.purge_source REFUSES
+
+    // #560 fail-closed: a tampered/corrupt flag canonicalises to "errored", which
+    // is NOT "true", so the source reads disabled — a purge is allowed (operator-
+    // targeted, and the flag is already invalid), never wrongly treated as enabled.
+    db.set_config("process_enabled", "maybe");
+    CHECK_FALSE(source_enabled(db, "process")); // → tar.purge_source ALLOWED (fail-closed)
+}
+
 TEST_CASE("TAR paused_at: idempotent re-set leaves the timestamp untouched",
           "[tar][paused_at][pr-a]") {
     // If the operator submits configure with the same value the source
@@ -427,6 +461,7 @@ TEST_CASE("TAR #538: diff_state_key mapping is the single source of truth", "[ta
     CHECK(diff_state_key("software") == "software");
     CHECK(diff_state_key("arp") == "arp"); // ADR-0015
     CHECK(diff_state_key("dns") == "dns"); // ADR-0015
+    CHECK(diff_state_key("mapdrive") == "mapdrive"); // §3.8
     // No snapshot-diff baseline: disabling these is a state no-op.
     CHECK(diff_state_key("perf").empty());
     CHECK(diff_state_key("procperf").empty());
@@ -441,12 +476,17 @@ TEST_CASE("TAR #538: every registered capture source is classified by diff_state
     // map it here, diff_state_key would return empty → the disable-clear becomes
     // a silent no-op and #538 silently regresses for the new source. Pin every
     // registered source to an explicit classification so a new one fails loudly.
-    const std::set<std::string_view> diff_sources = {"process", "tcp", "service", "user",
-                                                      "software", "arp", "dns"};
+    const std::set<std::string_view> diff_sources = {"process", "tcp",  "service",  "user",
+                                                      "software", "arp", "dns", "mapdrive"};
     // module is a stream-drained source (EventRing, like the process ETW/ES
     // stream) with no snapshot-diff baseline, so diff_state_key("module") is
     // empty and disabling it is a state no-op — non-diff, same as perf/netqual.
-    const std::set<std::string_view> non_diff_sources = {"perf", "procperf", "netqual", "module"};
+    // netconn (ADR-0020) is high-water-mark based: its only state is the
+    // netconn_backfill_hwm config key, and keeping it across a disable is the
+    // FEATURE (the OS event log retains the paused window, so a re-enable
+    // recovers it losslessly — no ghost events possible, nothing to clear).
+    const std::set<std::string_view> non_diff_sources = {"perf", "procperf", "netqual", "module",
+                                                          "netconn"};
 
     for (const auto& src : capture_sources()) {
         const bool is_diff = diff_sources.contains(src.name);

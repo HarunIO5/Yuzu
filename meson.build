@@ -1,7 +1,7 @@
 project(
   'yuzu',
   'cpp',
-  version: '0.12.0',
+  version: '0.13.0',
   license: 'AGPL-3.0-or-later',
   meson_version: '>=1.3.0',
   default_options: [
@@ -412,6 +412,11 @@ endif
 # ── Tests ─────────────────────────────────────────────────────────────────────
 if build_tests
   subdir('tests')
+endif
+
+# ── Fuzzers (libFuzzer harnesses; clang-only, see tests/fuzz/meson.build) ────
+if get_option('build_fuzzers')
+  subdir('tests/fuzz')
 endif
 
 # ── Erlang Gateway (optional — requires rebar3 + Erlang/OTP) ─────────────

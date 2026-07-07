@@ -74,6 +74,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Offload Targets](#offload-targets)
   - [Workflows](#workflows)
   - [OpenAPI Spec](#openapi-spec)
+  - [Discovery (A2)](#discovery-a2)
   - [Inventory](#inventory)
   - [Execution Statistics](#execution-statistics)
   - [Live-Query Bundles](#live-query-bundles)
@@ -151,21 +152,36 @@ All REST API v1 responses use a standard JSON envelope.
 }
 ```
 
-**Error:**
+**Error (A4 envelope):**
 
 ```json
 {
   "error": {
-    "code": 503,
-    "message": "human-readable message"
+    "code": 403,
+    "message": "human-readable message",
+    "correlation_id": "req-18f2a1c3d-2a",
+    "retry_after_ms": null,
+    "permission": "GuaranteedState:Read"
   },
   "meta": { "api_version": "v1" }
 }
 ```
 
-HTTP status codes follow standard conventions: `200` for success, `201` for resource creation, `400` for bad requests, `401` for unauthenticated, `403` for forbidden, `404` for not found, `503` for service unavailable. All error responses include the structured error envelope shown above, with the `code` field matching the HTTP status.
+HTTP status codes follow standard conventions: `200` for success, `201` for resource creation, `400` for bad requests, `401` for unauthenticated, `403` for forbidden, `404` for not found, `503` for service unavailable. Every `/api/v1/*` error response uses the structured **A4 error envelope** (per [`docs/agentic-first-principle.md`](../agentic-first-principle.md) §A4), with the `code` field matching the HTTP status. The envelope's fields:
 
-Newer agentic-first surfaces enrich `error` with two optional fields: `correlation_id` (a `req-<hex>` token also echoed on the `X-Correlation-Id` response header, for joining the response to server logs/audit rows) and, on `401`/`403` denials from per-device scoped-permission gates, `permission` — the `"SecurableType:Operation"` the caller was denied (e.g. `"GuaranteedState:Read"`). These fields are **additive**; clients parsing only `code`/`message` are unaffected. They are not yet emitted on every denial path (the admin-only / unscoped gates still return the bare envelope — a tracked follow-up), so automation must treat `correlation_id`/`permission` as present-when-available, not guaranteed.
+| Field | Always present | Meaning |
+|---|---|---|
+| `code` | yes | HTTP status echoed into the body for self-describing frames. |
+| `message` | yes | One-sentence human-readable summary. |
+| `correlation_id` | yes | A `req-<hex-ms>-<hex-seq>` token, also echoed on the `X-Correlation-Id` response header — join the response to server logs / audit rows by grepping this token. |
+| `retry_after_ms` | yes (nullable) | `null` unless the condition is retryable, in which case it advises how many milliseconds to back off (e.g. a `503` warm-up returns `5000`). |
+| `remediation` | when a hint exists | Natural-language self-recovery hint. Key is **omitted** when there is no hint (absence carries the same "no recovery available" meaning). |
+| `permission` | on permission denials | The `"SecurableType:Operation"` the caller was denied (e.g. `"Tag:Write"`) — the §A4 *kPermissionDenied* specialisation. Absent on whole-route admin gates that are not tied to a single securable. |
+| `approval_id` + `status_url` | reserved | The §A4 *kApprovalRequired* specialisation. Reserved for the Phase-2 approval re-dispatch flow; not populated by current denials (an approval-gated operation is denied with `permission` + `remediation` today, because no pollable approval exists yet). `status_url` points at `GET /api/v1/approvals/{id}`. |
+
+The R2 A4 completion (2026-07) routed the RBAC/tier denial gates (`require_admin`, `require_permission`, and the service-scope denials in the auth layer) and the ~156 legacy `error_json` sites in `rest_api_v1.cpp` through this one envelope. It does **not** yet cover literally every path — `compliance_routes.cpp` and several `auth_routes.cpp` MFA-flow branches still emit legacy shapes (tracked as #1552) — so automation crossing surfaces should treat the enrichment fields as present-when-available.
+
+> **⚠ Breaking wire-shape change (upgrade note).** Many of those legacy `/api/v1` errors were previously emitted as **`{"error":"<string>"}`** (the single-arg `error_json`) or the older nested `{"error":{"code","message"}}`. They are now uniformly the nested A4 object above. A client that read `error` as a *string* (`String(body.error)`, `body.error.startsWith(...)`) will break — `error` is always an **object** on these paths now. Migrate to `body.error.code` / `body.error.message`. See `docs/user-manual/upgrading.md`.
 
 ---
 
@@ -623,6 +639,16 @@ Create a new API token. The raw token is returned in the response and is never s
 | `expires_at` | integer | No | Unix epoch seconds. `0` or omitted = never expires. **Required** for MCP tokens (max 90 days). |
 | `mcp_tier` | string | No | MCP authorization tier: `"readonly"`, `"operator"`, or `"supervised"`. Omit for standard API tokens. When set, `expires_at` is mandatory. |
 
+`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at` within the 90-day cap.
+
+**Validation errors (`400`):**
+
+| Condition | Response |
+|---|---|
+| `mcp_tier` is not one of `readonly` / `operator` / `supervised` | `400` — `invalid mcp_tier: must be one of readonly, operator, supervised (or omitted)` |
+| `mcp_tier` set (or `scope_service` set) but `expires_at` omitted / `≤ 0` | `400` — `expires_at is required for an MCP-tier or service-scoped token` |
+| `mcp_tier` set and `expires_at` is more than 90 days out | `400` — `MCP token TTL cannot exceed 90 days` |
+
 **Response (201):**
 
 ```json
@@ -734,7 +760,9 @@ The admin route emits two distinct 400 bodies — operators scripting the endpoi
 }
 ```
 
-The `username` parameter is validated with the same character set used at user creation (`is_valid_username`). NUL bytes, control characters, and newlines are rejected — passing them through to the SQL bind would silently truncate at the NUL while the audit log records the full string, producing a target/effect mismatch (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
+The `username` parameter accepts either a strict local username OR a durable SSO principal (`is_valid_principal`, #1852) — in practice this means an **OIDC** principal (`oidc:<iss>#<sub>`), so an admin can force-log-out an SSO operator authenticated via OIDC today. Local usernames stay on the strict alphanumeric/`._-` charset; an SSO principal permits the `: # / . _ - @ ~ % |` alphabet a real IdP issuer URL and opaque subject need. NUL bytes, control characters, newlines, and shell/SQL metacharacters (`;`, `=`, `\`, quotes, backtick, space) are rejected in both cases — passing them through to the SQL bind would silently truncate/diverge from the audited target string (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
+
+**SAML is NOT force-loggable today.** A SAML session's `Session::username` is the raw IdP-supplied NameID (`create_saml_session` sets it verbatim, never a `saml:<idp>#<nameid>` shape) — a NameID is commonly an email address, and `@` fails `is_valid_principal` (it lacks the `saml:` reserved prefix that would unlock the wider SSO charset). A SAML operator's NameID therefore typically 400s against this endpoint, and there is no other revocation lever for a SAML session. This is a tracked gap, not an intentional restriction — see #1859/#1860.
 
 **Error (403) -- caller lacks `UserManagement:Write`:**
 
@@ -834,6 +862,42 @@ curl -s -X POST \
 
 ---
 
+#### `POST /api/v1/users/{username}/elevation-eligibility`
+
+Grant or revoke a user's **JIT-admin-elevation eligibility** — who may activate a time-boxed admin elevation via `POST /api/v1/elevate` (SOC 2 CC6.3/CC6.6). This is the per-user `users.elevation_eligible` flag, distinct from holding standing admin and enumerable for access reviews. See [JIT Admin Elevation](#jit-admin-elevation) below and `docs/auth-architecture.md` "JIT admin elevation".
+
+**Permission:** admin (or an active elevation) **+ MFA step-up**. **Self-grant is blocked** — an operator cannot set their own eligibility (another admin must).
+
+**Body:** `{"eligible": <bool>}`.
+
+**Side effect:** setting `eligible=false` immediately terminates any in-flight elevation for that user.
+
+Two route forms, same handler:
+
+- **Path form** — `POST /api/v1/users/{username}/elevation-eligibility` — **local usernames only** in practice: both forms validate the target with `is_valid_principal` (#1852), but a path segment cannot carry the `/` and `#` an SSO principal contains, so only a local username reaches the handler this way.
+- **Query form** — `POST /api/v1/users/elevation-eligibility?username=<principal>` — **required for a durable SSO principal** (`oidc:<iss>#<sub>`). A path segment cannot carry the `/` (in the issuer URL) and `#` an SSO principal contains — the server percent-decodes the path and strips the URL fragment before route matching, so the path form 404s for every real IdP identity. The query form accepts the same shapes as `DELETE /api/v1/sessions` above (`is_valid_principal`, #1852): a strict local username, or an SSO principal (URL-encode the `#` as `%23`; `/` does not need escaping in a query value).
+
+This is an `UPDATE`-only operation against an existing `users` row, never an `INSERT` — an SSO principal only has a row once the operator has **logged in at least once** (first login auto-provisions it). Granting eligibility against a principal with no row yet returns `404`, which for an SSO principal specifically means "this operator has never signed in" rather than "no such user was ever created".
+
+```bash
+curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Content-Type: application/json" -d '{"eligible":true}' \
+  "https://yuzu.example.com/api/v1/users/alice/elevation-eligibility"
+
+# SSO principal — MUST use the query form; note the URL-encoded '#' (%23):
+curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+  -H "Content-Type: application/json" -d '{"eligible":true}' \
+  'https://yuzu.example.com/api/v1/users/elevation-eligibility?username=oidc:https://idp.example.com/%23sub-4821'
+```
+
+**Response (200):** `{"status":"ok"}`.
+
+**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found (for an SSO principal: the operator has never logged in); `503` — no `auth.db` (`--data-dir` unset).
+
+**Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` on a 403).
+
+---
+
 ### Quarantine
 
 Quarantine isolates a device from receiving commands or participating in normal operations. Quarantined devices remain connected but are blocked from instruction execution.
@@ -870,6 +934,13 @@ List all currently quarantined devices.
 Quarantine a device.
 
 **Permission:** `Security:Execute`
+
+> **Supervised MCP tokens are approval-gated here too.** A bearer token minted
+> with `mcp_tier: "supervised"` gets `403` on this route (and on the `DELETE`
+> release below): supervised `Security:Execute` requires an approval ticket,
+> and the ticket-then-recall flow exists only on the MCP transport
+> (`quarantine_device`). The REST route mirrors the denial so switching
+> transports cannot bypass the approval gate (#520).
 
 **Request body:**
 
@@ -2516,6 +2587,150 @@ Returns the OpenAPI/Swagger specification for the v1 API as JSON.
 
 ---
 
+### Discovery (A2)
+
+Agentic-first discovery family (roadmap Issue 17.1, `docs/agentic-first-principle.md` §A2): "an agentic worker should be able to learn what is possible from the live server alone, without a side-channel doc fetch." Unlike `GET /api/v1/openapi.json` above, every endpoint here is **authenticated** and gates `Infrastructure:Read` (`/discover/instructions` gates `InstructionDefinition:Read` instead). Each response body IS the catalog object directly — no `data`/`meta` envelope wrapper, matching the `GET /api/v1/guaranteed-state/schemas` discovery precedent this family is modeled on.
+
+All five share the same caching contract: a content-derived `ETag` header + `Cache-Control: public, max-age=300`; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. Each is also mirrored as a read-only MCP tool of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`) — REST and MCP share the same builder functions internally, so they cannot drift from each other.
+
+#### `GET /api/v1/discover/permissions`
+
+RBAC permission catalog: every `securable_type` × `operation` pair the RBAC store recognizes, plus the full role → allowed-operations grid.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:**
+```json
+{
+  "version": 1,
+  "description": "RBAC permission catalog: ...",
+  "securable_types": ["Infrastructure", "InstructionDefinition", "Execution", "..."],
+  "operations": ["Read", "Write", "Execute", "Delete", "Push"],
+  "roles": [
+    {
+      "name": "Administrator",
+      "description": "...",
+      "is_system": true,
+      "permissions": [
+        {"securable_type": "Infrastructure", "operation": "Read", "effect": "allow"}
+      ]
+    }
+  ]
+}
+```
+
+503 (`{"error":"service unavailable"}`) when the RBAC store is unavailable.
+
+#### `GET /api/v1/discover/instructions`
+
+Published (`enabled_only=true`) `InstructionDefinition` catalog — the commands an agentic worker may dispatch via `execute_instruction` (MCP) or `POST /api/v1/instructions/execute` (REST). A disabled definition is excluded; there is no flag distinguishing "excluded because disabled" from "never existed."
+
+**Permission:** `InstructionDefinition:Read`
+
+**Response:**
+```json
+{
+  "version": 1,
+  "description": "Published (enabled) InstructionDefinition catalog: ...",
+  "count": 42,
+  "truncated": false,
+  "instructions": [
+    {
+      "id": "def-abc123",
+      "name": "Get Hostname",
+      "plugin": "system_info",
+      "action": "query",
+      "description": "...",
+      "parameter_schema": {"type": "object", "properties": {}},
+      "platforms": "windows,linux,darwin",
+      "approval_mode": "auto"
+    }
+  ]
+}
+```
+
+`parameter_schema` is a nested JSON Schema **object** (not a string) when the stored value parses as JSON; `null` on a stored value that fails to parse (a defensive branch — the authoring path always stores at least `{}`).
+
+#### `GET /api/v1/discover/routes`
+
+REST route catalog — a subset of the SAME OpenAPI document `GET /api/v1/openapi.json` serves (they read the identical compiled-in spec, so they cannot disagree), reshaped to `{method, path, summary, tags, description}` rows.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:**
+```json
+{
+  "version": 1,
+  "source": "openapi",
+  "description": "REST route catalog, subset of the SAME document GET /api/v1/openapi.json serves...",
+  "caveat": "This catalog is derived from the hand-maintained OpenAPI document, NOT generated from the live route table. A route that exists but was never documented in the OpenAPI spec will be under-reported here too. ...",
+  "count": 210,
+  "routes": [
+    {"method": "GET", "path": "/api/v1/discover/routes", "summary": "REST route catalog (A2 discovery)", "tags": ["Discovery"], "description": "..."}
+  ]
+}
+```
+
+Read the `caveat` field: this is a snapshot of a hand-maintained document, not a generated live route table — treat it as informative, not exhaustive.
+
+#### `GET /api/v1/discover/scope-kinds`
+
+Scope DSL kinds, operators, and syntax the Scope Engine (`server/core/src/scope_engine.hpp`) and `AgentRegistry::evaluate_scope` accept when building a `scope` expression for a dispatch, policy, or Baseline. Fully static — answers even when every store is unavailable.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:**
+```json
+{
+  "version": 1,
+  "description": "Scope DSL kinds and operators recognized by ...",
+  "ground_kinds": [
+    {"kind": "__all__", "syntax": "__all__", "example": "__all__", "description": "Every enrolled agent."},
+    {"kind": "group:<name>", "syntax": "group:<name>", "example": "group:finance-laptops", "description": "..."}
+  ],
+  "attribute_kinds": [
+    {"kind": "tag:<key>", "syntax": "tag:<key> <op> <value>", "example": "tag:department == \"finance\"", "description": "..."}
+  ],
+  "operators": [
+    {"token": "==", "name": "Eq", "description": "Case-insensitive equality."}
+  ],
+  "extended_forms": [
+    {"form": "LEN(<attr>) <op> <value>", "example": "LEN(hostname) > 5", "description": "..."}
+  ],
+  "combinators": ["AND", "OR", "NOT"]
+}
+```
+
+See also `docs/scope-walking-design.md` and `docs/asset-tagging-guide.md` for the fuller narrative treatment of the DSL.
+
+#### `GET /api/v1/discover/plugins`
+
+Plugin/action catalog observed across currently-connected agents (deduplicated by plugin name; the richest reported action list wins). **Not** a build-time manifest of every plugin that could ever load — a plugin no currently-connected agent reports is absent.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:**
+```json
+{
+  "version": 2,
+  "description": "Plugin/action catalog observed across currently-connected agents ...",
+  "limitation": "An action carries an inline parameter_schema only when it has a published InstructionDefinition (matched on plugin+action) AND the caller holds InstructionDefinition:Read; otherwise name+description only. GET /api/v1/discover/instructions is the full schema-bearing catalog.",
+  "actions_enriched_with_schema": 1,
+  "plugins": [
+    {"name": "processes", "version": "1.0", "description": "...", "actions": [
+      {"name": "list", "description": "...", "parameter_schema": {"type": "object", "properties": {}}}
+    ]}
+  ],
+  "commands": ["processes", "processes list", "..."]
+}
+```
+
+An action carries an inline `parameter_schema` **only** when it has a published `InstructionDefinition` (matched on plugin + action) **and** the caller holds `InstructionDefinition:Read`; a caller with only `Infrastructure:Read` gets each action's `name` + `description` and no schema. The top-level `actions_enriched_with_schema` counts how many actions were enriched. For the complete schema-bearing catalog, use [`GET /api/v1/discover/instructions`](#get-apiv1discoverinstructions).
+
+> **Consumer note:** this catalog is now `"version": 2` (was `1` — v2 adds the inline `parameter_schema` and top-level `actions_enriched_with_schema` fields). The revision is additive; treat `version` as a **minimum** (`>= 1`), not `== 1`, so future additive revisions do not break your client.
+
+---
+
 ### Inventory
 
 Inventory data is structured per-plugin telemetry collected from agents and stored server-side.
@@ -2644,15 +2859,23 @@ Omit both `name` and `agent_id` for a fleet-wide scan.
 {
   "data": {
     "software": [
-      {"agent_id": "agent-001", "name": "Google Chrome", "version": "124.0", "publisher": "Google LLC", "install_date": "2024-01-15"}
+      {"agent_id": "agent-001", "name": "bash", "version": "5.2.21", "publisher": "Fedora Project",
+       "install_date": "2026-01-15", "kind": "package", "ecosystem": "rpm", "epoch": "0",
+       "release": "3.fc40", "arch": "x86_64", "signature_status": "signed",
+       "distro_id": "fedora", "distro_version": "40"},
+      {"agent_id": "agent-002", "name": "Google Chrome", "version": "124.0", "publisher": "Google LLC",
+       "install_date": "2026-01-15", "kind": "app", "ecosystem": "windows", "epoch": "",
+       "release": "", "arch": "", "signature_status": "", "distro_id": "", "distro_version": ""}
     ],
-    "count": 1,
+    "count": 2,
     "devices_omitted": 0,
     "result_truncated_by_cap": true
   },
   "meta": { "api_version": "v1" }
 }
 ```
+
+Every row carries the **blob-v2 package fields** (`kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`) alongside the original four. A field the source ecosystem does not store is `""` — **never synthesised** (a Windows/macOS app row is honestly empty on every NEVRA/signature/distro field, as in the second example above). These 8 keys are **always present in every row** (never absent) — integration code should test for an empty-string value, not key absence. See `docs/user-manual/inventory.md` for the full per-ecosystem availability matrix.
 
 `devices_omitted` is always present (0 when no scope filtering occurred). `result_truncated_by_cap` is present only when `count == limit` and more rows may exist past the cap (keyset pagination is a follow-up, #1634). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
 
@@ -3790,7 +4013,7 @@ One signal type's drill-down.
 Fleet device-performance now-stats — the same numbers as the `yuzu_fleet_perf_*` Prometheus gauges and the `/dex` Performance tab, computed at request time.
 
 - **Permission:** `GuaranteedState:Read`
-- **Response:** an object `{cpu_pct, commit_pct, disk_lat_ms, reporting, windows_online}` where each metric is `{avg, p50, p90, max, n}` **or `null`** when no device reported it this cycle (absent, never 0). `reporting` counts devices contributing at least one metric; `windows_online` is the coverage-honest denominator (perf collectors are Windows-only today). Not audited.
+- **Response:** an object `{cpu_pct, commit_pct, disk_lat_ms, reporting, windows_online}` where each metric is `{avg, p50, p90, max, n}` **or `null`** when no device reported it this cycle (absent, never 0). `reporting` counts devices contributing at least one metric; `windows_online` counts online Windows devices — historically the coverage-honest denominator when perf collectors were Windows-only. **Known limitation:** the TAR perf collector now also runs on Linux, so `reporting` can legitimately exceed `windows_online` on mixed fleets; an OS-aware denominator is a tracked follow-up. Not audited.
 
 #### `GET /api/v1/dex/perf/cohorts`
 
@@ -3813,7 +4036,7 @@ The direct **A-vs-B** cohort comparison (e.g. `image_type` vanilla vs layered, o
 The one device list behind every Performance drill: worst devices by a metric (default), the not-reporting complement, or one cohort's members.
 
 - **Permission:** `GuaranteedState:Read`
-- **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
+- **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle. **Known limitation:** Linux perf devices are excluded from this complement list — same OS-aware-denominator follow-up as `/dex/perf/fleet` above — so a Linux non-reporter does not appear here); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
 - **Response:** `data[]` of `{agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?}`, worst-first by the sort metric (`fleet_pctile` is the device's nearest-rank position among all reported values; omitted when the device did not report the metric). `400` on an invalid `cohort_key` or `limit`. Machine-health telemetry (device state, not behavioral data) — not audited.
 
 ### Application performance over time
@@ -3844,6 +4067,18 @@ The same trend shape, aggregated **on-the-fly over one management group's member
 - **Permission:** `GuaranteedState:Read`. Gated on the **global** permission (like the cohort surface), not the per-device scope gate: the global check excludes management-group-scoped-only principals, so only a fleet-wide-Read caller — who can already compute every fleet/cohort aggregate — reaches it. No cross-operator exposure.
 - **Query parameters:** `group_id` — **required**, ≤ 512 bytes, no control characters. `app` — **required**, same rule. `version` — optional, same rule.
 - **Response:** `{group_id, app, version, floor, points[]}` where `floor` is the suppression threshold (10). Each point: `{version, day, device_count, suppressed}` plus the full stat fields **only when `suppressed` is false**. An empty/unknown group returns `200` with `points: []` (not a `503`). `400` on a missing/invalid parameter; `503` on store degrade. Not audited.
+
+#### `GET /api/v1/dex/perf/compare`
+
+The **`/auto` VERIFY** before/after comparison: did upgrading `app` from `baseline` to `candidate` change how the **same machines** in `group` perform? For each machine that ran *both* versions in the window, a per-machine CPU and working-set delta is computed (each device's own baseline-version window vs its own candidate-version window, the window anchored to that machine's transition, not to "today"), then the per-machine deltas are aggregated. A machine that ran only one version in-window is excluded and counted. **Evidential only** — no verdict, no threshold, no pass/fail. The same pure engine backs this endpoint, the `compare_app_perf_versions` MCP tool, and the dashboard VERIFY stage, so the numbers cannot disagree.
+
+- **Permission:** `GuaranteedState:Read`, gated on the **global** permission (same posture as `/dex/perf/group`).
+- **Query parameters:** `group` — **required**, ≤ 512 bytes, no control characters; the management group whose members are the cohort. `app`, `baseline`, `candidate` — **required**, same validation; `baseline` and `candidate` must differ (`400` if equal after canonicalization). `window` — optional integer days, default `7`, clamped `1`–`31`.
+- **Response (`200`):** `{app, group_id, baseline_version, candidate_version, window_days, cohort_size, paired, baseline_only, candidate_only, no_data, small_cohort, insufficient, truncated, cpu{before_mean, after_mean, delta_median, before_p95, after_p95}, ws{…}, distribution{up, flat, down}}`. `truncated:true` means the cohort exceeded the 100,000-row read cap — the counts are **incomplete and may mis-pair** machines (a device that ran both versions can be mis-reported as one-version-only); treat the result as unreliable and narrow the group or shorten the window. A zero-sample machine (one that measured nothing in-window) is excluded from pairing rather than counted as a 0%-CPU pair. `cohort_size` = group members; `paired` = ran both (the comparison population); `baseline_only`/`candidate_only` = excluded (one version only); `no_data` = `cohort_size − paired − baseline_only − candidate_only`. `small_cohort:true` = `paired` non-zero but below the 10-device floor — **not** suppressed (canaries are deliberately small; the surface marks it *indicative*). `insufficient:true` = `paired == 0` (no machine ran both — the `cpu`/`ws`/`distribution` values are zero and should not be displayed). `cpu.*` are percent (float); `ws.*` are bytes (int64); `delta_median` is the median per-machine delta (positive = candidate heavier). `distribution.{up,flat,down}` count machines whose per-machine CPU delta exceeded / stayed within / fell below ±0.3 pp.
+- **No per-machine identity in the response** — the aggregate carries no `agent_id`. The per-machine pairs are a **dashboard-only** drill (`/fragments/auto/verify/drill`, audited `dex.app_perf.compare.drill`); there is **no REST or MCP per-machine surface** in this slice (a REST audited-fail-closed per-machine drill is a deferred follow-up).
+- **Error paths:** `400` on a missing/invalid required parameter or `baseline == candidate`; `503` on store degrade or startup warmup (the A4 body's `retry_after_ms` carries the suggested delay).
+- **Headers:** `X-Correlation-Id` on every response path; `Sec-Audit-Failed: true` when the audit row could not persist (the read still proceeds — operational set-and-proceed).
+- **Audit:** emits **`dex.app_perf.compare`** (`target_id=<group_id>`, `detail` carries `app=<name> base=<v> cand=<v> cohort=<N> paired=<N> view=aggregate cid=<cid>` — `paired=` so a singleton (paired=1) aggregate, which is effectively per-machine, is distinguishable in the log). Because VERIFY has no cohort floor, this recorded read is the accountability that replaces suppression (operational set-and-proceed, not fail-closed — the aggregate carries no per-machine identity, so a lost row leaks no PII). The MCP twin is recorded under the generic `mcp.compare_app_perf_versions` tool-call audit, which carries the same subject in its detail (group/app/versions/cohort/paired) and sets `audit_persisted:false` in the result body on a dropped row (MCP has no `Sec-Audit-Failed` header channel).
 
 #### `GET /api/v1/dex/devices/{id}`
 
@@ -4456,25 +4691,65 @@ Cancel a running execution.
 
 ### Schedules
 
+A schedule fires unattended through the background `ScheduleRunner` poller with no
+further permission check at fire time — so schedule creation, and re-enabling a
+disabled schedule, are the only gates against a Schedule:Write-only principal reaching
+fleet-wide command dispatch. Delete and enable/disable are owner-scoped: they only
+affect a schedule whose `created_by` matches the caller.
+
 #### `GET /api/schedules`
 
-List schedules. Accepts `definition_id` and `enabled_only` as query parameters.
+List schedules. Accepts `definition_id` and `enabled_only` as query parameters. Requires `Schedule:Read`.
 
 #### `POST /api/schedules`
 
-Create a recurring schedule for an instruction definition. Supports cron expressions.
+Create a recurring schedule for an instruction definition. Requires **both**
+`Schedule:Write` and `Execution:Execute` — a schedule is a fleet-wide command-dispatch
+primitive (empty `scope_expression` targets every agent; `requires_approval` defaults to
+`false`).
 
 #### `DELETE /api/schedules/{id}`
 
-Delete a schedule.
+Delete a schedule you created. Requires `Schedule:Delete`; a schedule created by another
+principal is left untouched (reports `deleted: false`, same as a nonexistent id).
 
 #### `POST /api/schedules/{id}/enable`
 
-Enable or disable a schedule.
+Enable or disable a schedule you created. Requires `Schedule:Write`; enabling (but not
+disabling) additionally requires `Execution:Execute`, since enabling arms the schedule to
+fire — an operator can always disable a schedule to stop it even without
+`Execution:Execute`.
 
 ---
 
 ### Approvals
+
+#### `GET /api/v1/approvals/{id}`
+
+Fetch a single approval by id. This is the **A4 `status_url` target**: when an operation is denied with an approval-required envelope, a worker polls this endpoint for the current status rather than re-issuing the gated request. Requires `Approval:Read`. Read-only — it never mutates the approval lifecycle.
+
+**Response (200):** the standard v1 envelope wrapping an `Approval` object:
+
+```json
+{
+  "data": {
+    "id": "…",
+    "definition_id": "…",
+    "status": "pending",
+    "submitted_by": "alice",
+    "submitted_at": 1735689600,
+    "reviewed_by": "",
+    "reviewed_at": 0,
+    "review_comment": "",
+    "scope_expression": "tag:prod"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`status` is one of `pending` | `approved` | `rejected` | `expired`. The response always carries an `X-Correlation-Id` header.
+
+**Errors:** `404` (no approval matches the id — A4 envelope), `503` (approval store not initialised — A4 envelope with `retry_after_ms: 5000`).
 
 #### `GET /api/approvals`
 
@@ -4596,13 +4871,76 @@ Returns recent analytics events. Accepts `limit` as a query parameter (default 5
 
 Returns the status of the NVD (National Vulnerability Database) sync.
 
+Response fields: `enabled`, `syncing`, `last_sync_time`, `last_error`,
+`total_cves`, `backfill_complete`, and `backfill_oldest_published`.
+`enabled` reflects whether NVD **sync** is configured on (i.e. `--no-nvd-sync` was
+*not* passed) — not merely whether the local mirror DB is open. Under `--no-nvd-sync`
+the mirror stays queryable (`/api/nvd/match` still works against seeded/previously-synced
+data) but `enabled` is `false` and `POST /api/nvd/sync` returns an error. Only `enabled`
+and `total_cves` are guaranteed present; the sync-progress fields (`syncing`,
+`last_sync_time`, `last_error`, `backfill_complete`, `backfill_oldest_published`) are
+omitted when sync is disabled, and the whole body is `{"enabled":false}` when the mirror
+DB is closed.
+**`total_cves` is a count of distinct CVEs** in the local store.
+(Prior to the CPE-range-matching change it counted one row per affected
+product, so a multi-product CVE inflated the figure — after upgrade the number
+reads lower even once fully synced, and reads near-zero briefly after the
+one-time schema migration until the next sync repopulates the mirror. This is
+expected, not data loss.)
+
+`backfill_complete` (boolean) reports whether the newest-first catalog backfill
+has reached its configured floor **and the catalog holds real NVD-sourced CVEs** —
+the built-in fallback rules seeded at startup do **not** count, so `total_cves` can
+be non-zero while `backfill_complete` is still `false`. A mirror with no NVD CVEs is
+never reported complete, so a fresh or rate-limited deployment (or one whose upstream
+NVD fetches have not yet returned data) shows `false` with the cursor at the floor
+until real NVD data lands. That is expected, not a stall.
+`backfill_oldest_published` (ISO 8601 string)
+is the progress cursor — the `published` date of the oldest CVE fetched so far,
+walking backwards. During the initial backfill `total_cves` climbs continuously
+and `last_sync_time` advances after **every** successful fetch window — so a
+non-empty `last_sync_time` does **not** mean the mirror is complete. Use
+`backfill_complete` (with the `backfill_oldest_published` cursor for progress) as
+the authoritative "initial mirror built" signal, not `last_sync_time`.
+
+`last_error` (string, present only while sync is enabled) surfaces the most recent
+sync-health problem and is cleared at the start of the next sync tick — a non-empty
+value is a transient, self-healing condition, not a product bug. Values you may see:
+a transient fetch failure (`NVD backfill fetch failed (<reason>) — retrying (mirror
+incomplete)` or `NVD freshness fetch failed (<reason>) — retrying`, where `<reason>` is
+one of `connection`/`http_429`/`http_403`/`http_other`/`parse` — cleared once a fetch
+succeeds; a persistent `http_403` means a bad/revoked `--nvd-api-key`, so rotate it, and
+`http_429` is expected rate-limiting that self-heals via backoff); a local persist failure
+(`NVD backfill window persist failed — mirror
+incomplete` / `NVD freshness window persist failed` — a disk/DB issue; the mirror holds
+its cursor and stays `backfill_complete: false` rather than dropping the fetched CVEs);
+a prolonged upstream outage (`NVD returning empty responses — mirror not populated`); and
+re-confirmation of a suspicious empty window (`re-confirming a suspicious empty NVD window
+(n/N)` — an older published-date window returned empty *after* real data had already
+landed; the backfill holds, staying `backfill_complete: false`, and re-checks it before
+trusting it, so a stale cache/proxy serving an empty page can't make it skip a populated
+range and falsely report complete).
+These are operational states, not product bugs — the mirror recovers automatically
+once the underlying condition clears.
+
 #### `POST /api/nvd/sync`
 
 Trigger a manual NVD database sync. Admin only. Runs asynchronously and returns immediately.
 
 #### `POST /api/nvd/match`
 
-Match installed software against known CVEs in the NVD database.
+Match installed software against known CVEs in the NVD database. Matching
+evaluates full CPE version ranges (`versionStartIncluding/Excluding`,
+`versionEndIncluding/Excluding`, exact and wildcard). Product identity is
+matched by name (case-insensitive); vendor-precise CPE identity is a planned
+enhancement (ADR-0018), so name-collision false positives are possible.
+In each match, `fixed_in` carries the range's **exclusive upper bound**
+(`versionEndExcluding`) when present; it is empty for inclusive-end, exact,
+or wildcard matches — empty means "no fix boundary derivable from the range
+shape", not "no fix available". Distro revision markers (e.g. Debian `~` in
+`1.0.0~deb1`) are compared as plain separators rather than pre-release
+markers, so distro-backported versions can produce false negatives until
+backport-aware matching (M1b/OVAL) lands.
 
 ---
 
@@ -4916,6 +5254,57 @@ Dispatch a single-device `tar.configure` with `<source>_enabled=true`. Per-sourc
 
 **Audit:** Emits `tar.source.reenable` with `result=success` and `detail` carrying `device=<id> source=<src>` on success, or `result=failure` with the real rejection reason on rejected attempts.
 
+#### `POST /fragments/tar/retention-paused/purge`
+
+Dispatch a single-device `tar.purge_source` that **permanently drops every warehouse row** for a source (`<source>_{live,hourly,daily,monthly}`) while leaving the collector **paused** — the "we have what we need; drop the rows but keep collection off" case (Phase 15.A). This is a **destructive, irreversible** operation.
+
+**Permission:** `Infrastructure:Delete` (a higher tier than re-enable's `Execution:Execute`). Per-device RBAC visibility is verified before dispatch; out-of-scope `device_id` values collapse to the same 404 response as not-connected agents (no enumeration oracle).
+
+**Confirmation:** the dashboard requires the operator to type the device hostname before this POST fires (a native `prompt()`, CSP-safe). The confirmation is **client-side** — scripted callers that POST directly are still gated by the permission, the per-device visibility check, and the agent-side paused-guard.
+
+**Paused-guard (authoritative, agent-side):** the agent refuses the purge (`source_not_paused`) unless the source currently reports disabled. This closes the scan→purge TOCTOU (a source re-enabled between the operator's scan and the purge is not dropped). The server does **not** enforce a `SOURCE_NOT_PAUSED` check — the retention-paused list is an ephemeral live scan with no persisted paused-state.
+
+**Request body (form-encoded):**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `device_id` | string | Yes | The agent ID. Must be in the operator's visible-agent set; otherwise rejected with 404 (same body as not-connected). |
+| `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Other values rejected with 400 to prevent forged form submissions. |
+
+**Response:**
+- 200 OK with a `Purge dispatched — Scan to refresh.` fragment and an `HX-Trigger` toast on success. The source row remains (purge does not re-enable); a subsequent **Scan** reconciles the now-zero counts.
+- 400 with explanatory body for missing/invalid params.
+- 404 with body `Agent not reachable.` for both out-of-scope `device_id` and not-connected agent. Audit detail records the real reason (`scope_violation` vs `agent_not_connected`) server-side.
+- 503 if command dispatch is unavailable.
+
+**Audit:** Emits `tar.source.purge` with `result=success` and `detail` carrying `device=<id> source=<src>` on success (`rbac_denied` on the permission gate; `result=failure` with `scope_violation`/`agent_not_connected` on rejected attempts). Dispatch is fire-and-forget: `rows_deleted` is computed agent-side and appears in the command's **response record** (keyed by `command_id`), not in this dispatch audit row.
+
+**Metric:** `yuzu_tar_source_purge_total{result}` (counter) — counts dispatch outcomes.
+
+**Agent version:** requires an agent that implements the `tar.purge_source` action (v0.14.0+). An older agent returns `error|unknown action: purge_source` in its response record (no crash); because dispatch is fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome via **Scan**.
+
+#### `POST /api/v1/tar/retention-paused/purge`
+
+The **agentic-first (A1) structured surface** for the same destructive purge — for automation / MCP workers / scripted callers that need a JSON contract and a `command_id` rather than the HTML fragment above. Same effect: permanently drop a paused source's warehouse rows on one device, leaving the collector paused. **Irreversible.**
+
+**Permission:** `Infrastructure:Delete`, enforced **per-device and management-group-scoped** (the scoped gate; an out-of-scope or unauthorized device is refused, not enumerated). Fail-closed if the scope gate is unwired.
+
+**Request body (JSON):**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `device_id` | string | Yes | The target agent. Must be within the caller's management scope. |
+| `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Others → 400. |
+
+**Responses:**
+- **202 Accepted** — `{"data":{"command_id","device_id","source","agents_reached"},"meta":{"api_version":"v1"}}`. Async: the agent computes `rows_deleted` (and the agent-side `source_not_paused` refusal if the source was re-enabled) into the command's **response record** — poll it by `command_id`; it is not in the 202 body. `X-Correlation-Id` header on every response.
+- **400** — invalid JSON / missing `device_id`/`source` / source not in the allowlist (A4 error envelope).
+- **403 / 404** — permission denied or device out of scope (scoped gate; A4 envelope).
+- **404** — dispatch reached zero agents (device offline).
+- **503** — command dispatch unavailable, or the audit row could not be persisted (`Sec-Audit-Failed` header; the purge is **not** dispatched without durable evidence).
+
+**Audit:** `tar.source.purge` `result=requested` is written **before** dispatch (fail-closed). **Metric:** `yuzu_tar_source_purge_total{result}`. **Agent version:** same `tar.purge_source` (v0.14.0+) requirement as the fragment.
+
 #### `GET /fragments/tar/capture-sources`
 
 Render the **Capture sources** frame body for `/tar` (ADR-0015): an operator-scoped device picker plus a target the per-source toggle table loads into on host change.
@@ -5101,8 +5490,9 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `list_dex_perf_apps` | Applications with retained fleet app-perf data (the picker) |
 | `get_dex_app_perf` | Fleet trend for one application, by version, over time |
 | `get_dex_group_app_perf` | One management group's app trend (sub-floor-suppressed at 10 devices) |
+| `compare_app_perf_versions` | Cohort-paired before/after comparison (the `/auto` VERIFY stage). Parameters `group`, `app`, `baseline`, `candidate` (all required) + `window` (integer days, default 7). Returns the same identity-free aggregate shape as `GET /api/v1/dex/perf/compare`. **Recorded under the generic `mcp.compare_app_perf_versions` tool-call audit** (not the REST `dex.app_perf.compare` verb). |
 
-All three gate `GuaranteedState:Read` and are not audited (cohort posture). The per-device app-perf drill (`GET /api/v1/dex/devices/{id}/app-perf`) is reachable via REST **and** the `/device` dashboard DEX drill (the *Application performance over time* panel), but has **no MCP twin** — its fail-closed audit contract cannot be expressed on MCP's set-and-proceed posture. See the *Application performance over time* REST section above for the shared percentile/suppression semantics.
+The first three gate `GuaranteedState:Read` and are not audited (cohort posture). `compare_app_perf_versions` also gates `GuaranteedState:Read`; because it has no cohort floor it **is** accountable — but over MCP that accountability is the generic `mcp.<tool>` tool-call audit, and the tool exposes only the identity-free aggregate (no per-machine drill — that is dashboard-only, see `GET /api/v1/dex/perf/compare`). The per-device app-perf drill (`GET /api/v1/dex/devices/{id}/app-perf`) is reachable via REST **and** the `/device` dashboard DEX drill (the *Application performance over time* panel), but has **no MCP twin** — its fail-closed audit contract cannot be expressed on MCP's set-and-proceed posture. See the *Application performance over time* REST section above for the shared percentile/suppression semantics.
 
 **Resources:**
 
@@ -5281,6 +5671,38 @@ Envelope shape:
 
 `meta.mfa_step_up_required` is the boolean discriminator that distinguishes this 401 from an "unauthenticated" 401; `meta.challenge_url` tells the client where to re-prove — `/login/mfa/stepup` for local sessions, `/auth/oidc/start` for OIDC sessions. API token / MCP token principals **never see this 401** — the gate skips them entirely (the bearer credential was issued as part of an authenticated session and is itself the step-up).
 
+### JIT Admin Elevation
+
+Activate a time-boxed admin elevation (SOC 2 CC6.3/CC6.6) — see `docs/auth-architecture.md` "JIT admin elevation". Eligibility is granted separately by an admin via [`POST /api/v1/users/{username}/elevation-eligibility`](#post-apiv1usersusernameelevation-eligibility).
+
+#### `POST /api/v1/elevate`
+
+Promote the **current cookie session** to admin for a bounded window. The session's effective role becomes `admin` until the window lapses, then auto-reverts.
+
+**Permission:** an authenticated **cookie** session only (a Bearer/MCP-token caller gets `401` — automation credentials can never elevate); the caller must be `elevation_eligible` (eligibility is keyed on a `users` table row — an OIDC identity with no such row is denied here, not later; provision it first via `POST /api/v1/users`). A second factor is mandatory, branched strictly on the session's identity source (never a local namesake's enrollment for an OIDC caller):
+
+- **Local session:** MFA must be enrolled (unconditionally, not gated on `--mfa-enforcement`) and a fresh MFA step-up (TOTP) is required.
+- **OIDC session:** ⚠️ **temporarily unavailable** — since the `oidc:<iss>#<sub>` identity re-key (#1837/#1857), an OIDC session has no local `users` row and is denied at the eligibility gate (`403`, `"eligibility read failed"`); restoration is tracked in #1852. *The `amr` behaviour described here is the intended path #1852 restores:* a seeded `amr`-asserted MFA proof from the *current* IdP login satisfies the second-factor requirement — no local TOTP enrollment is consulted (default `--jit-oidc-amr-elevation=true`). A single-factor (no-`amr`) OIDC session is denied (`"no MFA in SSO login"`), and a seeded-but-stale proof still triggers the step-up challenge rather than a silent grant. With `--no-jit-oidc-amr-elevation`, OIDC sessions cannot elevate at all (`"OIDC-amr elevation is disabled"`) — they cannot present a local TOTP step-up (their step-up challenge is re-SSO), so the operator must switch to a local-authenticated session with local TOTP.
+
+**Body:** `{"justification": "<string, required>", "duration_secs": <int, optional>}`. `justification` must be non-empty (control bytes are sanitised to space; capped to 1 KiB). `duration_secs` defaults to `--jit-max-elevation-secs` when absent or `0`; a value above the cap is clamped; a negative value is a `400`.
+
+```bash
+curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Content-Type: application/json" \
+  -d '{"justification":"prod incident #42","duration_secs":600}' \
+  "https://yuzu.example.com/api/v1/elevate"
+```
+
+**Response (200):** `{"status":"ok","expires_in":<seconds>,"expires_at":"<RFC3339 UTC>"}`. `expires_in` is the TRUE remaining time computed after the grant (not an echo of the requested `duration_secs`) — the window is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute expiry (an elevation can never outlive the cookie session that carries it), so `expires_in` is always `<=` the requested duration. `expires_at` is the wall-clock projection of that same window.
+
+**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"); `403` — not eligible, eligibility read failed (fail-closed), **no MFA enrolled** (local session), **no MFA in the SSO login** (OIDC session with no `amr` proof), or **OIDC-amr elevation is disabled** (`--jit-oidc-amr-elevation` off); the MFA step-up itself returns the standard step-up `401` challenge envelope (see `/login/mfa/stepup`); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — no `auth.db`.
+
+**Audit:** `role.elevation.granted` (`detail=duration_secs=<N> mfa=<oidc_amr|local_totp> expires_at=<RFC3339 UTC> justification=<sanitised>` — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the free-text `justification=` field so a crafted justification can't forge either) on success; `role.elevation.denied` on a `403`, with a distinct `detail` reason per cause (not eligible / no MFA enrolled / no MFA in SSO login / OIDC-amr elevation disabled / mfa_step_up_refused). A window that later lapses PASSIVELY (no manual revoke) is audited lazily as `role.elevation.expired` on the operator's next authenticated request — see `docs/user-manual/audit-log.md`.
+
+#### `POST /api/v1/elevate/revoke`
+
+Step an active elevation down early (reduces privilege; no MFA step-up required). Body: none. Always `200 {"status":"ok"}`; whether a window was actually active is recorded as `was_elevated=<bool>` in the `role.elevation.revoked` audit detail, not the response body.
+
 #### `POST /logout`
 
 Destroy the current session. Clears the `yuzu_session` cookie.
@@ -5292,6 +5714,14 @@ Begin the OIDC SSO login flow. Redirects to the configured identity provider.
 #### `GET /auth/callback`
 
 OIDC callback endpoint. The identity provider redirects here after authentication. Exchanges the authorization code for tokens and creates a local session.
+
+#### `GET /auth/saml/start`
+
+Begin the SAML 2.0 SP-initiated login flow. Builds an `<samlp:AuthnRequest>` and redirects the browser to the configured IdP via HTTP-Redirect binding. Available only when all five `--saml-*` flags are set and the server is running on Linux or macOS.
+
+#### `POST /saml/acs`
+
+SAML Assertion Consumer Service endpoint. The IdP POSTs the `<samlp:Response>` here after authentication (HTTP-POST binding). The server validates the signed assertion (signature, audience, recipient, expiry, `InResponseTo` single-use) and mints a session cookie on success. On validation failure, the browser is redirected to `/login` with an error. Available only when SAML is enabled (see `GET /auth/saml/start`).
 
 ---
 
