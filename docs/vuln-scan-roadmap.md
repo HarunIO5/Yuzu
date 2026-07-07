@@ -15,7 +15,10 @@ KEV-pre-filter strike, Lane 1/2/3 routing) and ADR-0019 (tri-state findings + co
 > M1a/M1b (M2 enrichment onward, M3–M6 graph/CAVM scoring) face ADR-0022 Decision 2's boundary
 > test fresh before implementation. Milestone vocabularies collide: this ladder's M1a/M1b + M2–M6
 > ≠ the execution plan's UCE M1–M4 — always qualify which ladder a bare "M-number" means.
-> Details: execution plan § "Relationship to ADR-0023"; ADR-0023's own placement note.
+> Sequencing within M1a/M1b remains this roadmap's call; beyond it, scheduling is contingent on
+> the ADR-0022 Decision-2 boundary test, adjudicated by the maintainer through governance — not
+> by either document. Details: execution plan § "Relationship to ADR-0023"; ADR-0023's own
+> placement note.
 
 This roadmap is the **canonical sequencing** for the workstream. It reconciles three views into
 one ordered plan:
