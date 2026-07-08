@@ -638,6 +638,62 @@ TEST_CASE("ScimRoutes: deprovision refused once an operator elevates the SCIM ac
     CHECK(f.scim_store->get_by_scim_id(id).has_value());
 }
 
+TEST_CASE("ScimRoutes: revive-on-reprovision refuses an operator-elevated account — 404, and "
+         "the remove_user() undo leaves the account INACTIVE, not reactivated-at-elevated-role "
+         "(UP-N5/FIX-5, Gate-8 round-2)",
+         "[scim][routes][revive][role_refusal]") {
+    // Gate-8 round-2 MEDIUM (privilege fail-open): the revive path
+    // (POST re-provisioning a tombstoned SCIM account) reactivates the
+    // underlying auth row FIRST, then refuses if the role isn't 'user',
+    // undoing the reactivation via remove_user(). Previously that undo's
+    // bool return was discarded — a failure there would leave the account
+    // ACTIVE at its elevated role behind a 404 the IdP never retries. This
+    // exercises the happy-path undo (remove_user() succeeds) end-to-end:
+    // the account must land INACTIVE, never reactivated.
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "frank"}})->body);
+    auto old_id = created["id"].get<std::string>();
+
+    // An operator elevates the account while it is still active...
+    REQUIRE(f.auth_mgr.update_role("frank", auth::Role::admin));
+    // ...then it is torn down through a path OTHER than SCIM's own DELETE
+    // (which would itself have refused via deprovision_role_ok — see the
+    // M-DEPROV-ROLE test above, e.g. an admin-console deactivation).
+    // remove_user() never touches the role column, so this reproduces
+    // exactly the state the revive-refusal guard defends against: a
+    // tombstoned SCIM account whose role is still 'admin'.
+    REQUIRE(f.auth_mgr.remove_user("frank"));
+    auto mapping_deleted = f.scim_store->delete_by_scim_id(old_id);
+    REQUIRE(mapping_deleted.has_value());
+    CHECK(*mapping_deleted);
+    REQUIRE(f.auth_db->get_provisioning_source("frank").value() == "scim");
+
+    // Re-POST: hits the REVIVE branch, reactivate_user() succeeds (role
+    // column untouched by it), the role check sees 'admin' != 'user' and
+    // refuses — remove_user()'s undo is exercised here.
+    auto revive_res = f.post("/scim/v2/Users", {{"userName", "frank"}});
+    REQUIRE(revive_res);
+    CHECK(revive_res->status == 404);
+
+    // The account must be left INACTIVE — not reactivated-at-elevated-role
+    // behind the 404. get_user_role() misses an inactive account's
+    // in-memory cache entry the same way the other deactivation assertions
+    // in this file do (see e.g. the revive/deprovision tests above).
+    CHECK_FALSE(f.auth_mgr.get_user_role("frank").has_value());
+
+    // NOTE (injection gap): this test exercises the SUCCESS path of the
+    // remove_user() undo (matches the deactivate() sibling's checked-return
+    // pattern). Forcing remove_user()'s own DB write to fail at exactly
+    // that point — without also failing the earlier reactivate_user() call
+    // on the same connection (which would hit a different, already-tested
+    // 500 branch) — needs either a multi-second SQLITE_BUSY wait on
+    // AuthDB's fixed 5s busy_timeout or corrupting the shared auth.db file
+    // mid-request, neither of which is a clean/fast unit-test injection.
+    // The code path itself (`if (!auth_mgr->remove_user(...)) { ... 500
+    // ... }`) is exercised by inspection and mirrors deactivate()'s
+    // identical, already-tested contract.
+}
+
 // ── M-OPTDEREF ───────────────────────────────────────────────────────────
 
 TEST_CASE("ScimRoutes: PATCH after DELETE on the same id — 404, no crash",

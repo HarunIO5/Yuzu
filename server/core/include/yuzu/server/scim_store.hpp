@@ -104,9 +104,11 @@ public:
     /// Delete the resource mapping. Tri-state return so a caller can treat
     /// "the row is already gone" as idempotent success rather than a
     /// failure (UP-N4): `nullopt` on a genuine DB error (no connection,
-    /// prepare failure — the caller should fail closed/retry); `true` if a
-    /// row existed and was deleted; `false` if no row matched `scim_id`
-    /// (e.g. a concurrent/duplicate DELETE already removed it).
+    /// prepare failure, or a step-time error such as SQLITE_BUSY/LOCKED/
+    /// IOERR/CORRUPT — the caller should fail closed/retry, never treat it
+    /// as "already gone"); `true` if a row existed and was deleted; `false`
+    /// if no row matched `scim_id` (e.g. a concurrent/duplicate DELETE
+    /// already removed it).
     std::optional<bool> delete_by_scim_id(const std::string& scim_id);
 
 private:

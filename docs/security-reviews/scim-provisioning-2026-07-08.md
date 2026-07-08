@@ -69,15 +69,19 @@ follow-up).
   collision against a currently-**active** account. This closes a usability
   gap (a `409` on rejoin would have forced manual admin intervention) without
   weakening the uniqueness guarantee against active accounts.
-- **Audit posture: fail-closed on the state-changing path.** Deactivate/
-  reactivate audit writes are now fail-closed — if the audit write itself
-  fails, the request returns `500` (the IdP retries) rather than mutating
-  the account with no record. Provision/update remain set-and-proceed
-  (account change succeeds even if the audit write fails), tracked via
-  `yuzu_scim_audit_write_failures_total` — a missed *creation* audit row is a
-  materially lower integrity risk than a missed *termination* one, so the
-  stricter posture is reserved for the path where losing the record matters
-  most.
+- **Audit posture: set-and-proceed, evidence integrity enforced by an
+  alert on the failure metric.** All lifecycle actions (provision, update,
+  deactivate, reactivate, delete) complete even if their audit write fails,
+  and every failure unconditionally bumps `yuzu_scim_audit_write_failures_total`.
+  A fail-closed `500` on a *termination* audit-write failure was evaluated
+  and deliberately **rejected**: the IdP's retry re-reads the now-terminated
+  post-state, takes the non-termination (no-op/`404`) branch, and so never
+  re-attempts the missing audit — the `500` cannot re-land the evidence row it
+  was meant to guarantee, it only fails the request. The correct control for
+  CC6.8 evidence integrity is therefore an **alert on
+  `yuzu_scim_audit_write_failures_total > 0`** (same-day human follow-up on a
+  missed termination record), not a fail-closed request path. Deploy that
+  alert rule alongside enabling SCIM.
 - **New metrics close an observability gap.** `yuzu_scim_requests_total{op,
   status}`, `yuzu_scim_auth_failures_total`, `yuzu_scim_audit_write_failures_total`,
   and `yuzu_scim_provenance_denied_total` give an operator a Prometheus-native

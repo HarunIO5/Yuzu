@@ -1171,7 +1171,7 @@ PatchOp forms are accepted). **`PUT /scim/v2/Users/{id}` triggers the
 identical deactivate/reactivate semantics** whenever its body's `active`
 value differs from the account's current state — some IdP connectors issue a
 full `PUT` rather than a `PATCH` for lifecycle changes, and that path gets
-the same fail-closed/audit behavior described below, not a silent no-op:
+the same audit behavior described below, not a silent no-op:
 
 - **`active:false` deprovisions** — soft-deletes the underlying auth account
   and **cascades session revocation** (an in-flight session for a
@@ -1186,15 +1186,19 @@ the same fail-closed/audit behavior described below, not a silent no-op:
 `DELETE /scim/v2/Users/{id}` is the equivalent one-shot deprovision (`204`),
 for IdPs that issue a hard delete rather than a PATCH/PUT-to-inactive.
 
-**Deactivate/reactivate audit writes are fail-closed; provision/update are
-set-and-proceed.** A `PATCH`/`PUT`/`DELETE` that flips `active` writes its
-audit row **before** the response is returned; if that audit write itself
-fails, the request fails `500` (so the IdP retries) rather than silently
-mutating the account with no record. `POST`/identity-only `PUT` use the
-opposite, set-and-proceed posture (the account change succeeds even if the
-audit write fails) — bumping `yuzu_scim_audit_write_failures_total` instead
-of blocking the IdP call, since a missed *creation* audit row is a lower
-integrity risk than a missed *termination* one.
+**All lifecycle audit writes are set-and-proceed; evidence integrity is
+enforced by an alert on the failure metric.** Every action (provision,
+update, deactivate, reactivate, delete) completes even if its audit write
+fails, and each failure unconditionally bumps
+`yuzu_scim_audit_write_failures_total`. A fail-closed `500` on a
+*termination* audit-write failure was considered and **rejected**: because
+the account is already mutated, the IdP's retry re-reads the terminated
+post-state, takes the non-termination (no-op / `404`) branch, and never
+re-attempts the missing audit — the `500` fails the request without ever
+re-landing the evidence row it was meant to guarantee. The correct CC6.8
+control is therefore an **alert on `yuzu_scim_audit_write_failures_total`**
+(same-day follow-up on a missed termination record); deploy that rule when
+you enable SCIM.
 
 ### 🔴 Provenance guard (the load-bearing security invariant)
 
@@ -1244,8 +1248,8 @@ that triggers a `500`).
 | `scim.user.provisioned` | `denied` | `POST` rejected `409` — `userName` collision against a currently-active account |
 | `scim.user.provisioned` | `failure` | `POST` rolls back after a `500` (e.g. the account-creation transaction fails) |
 | `scim.user.updated` | `success` / `failure` | `PUT /scim/v2/Users/{id}` succeeds / fails `500` |
-| `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` on an audit-write error under the fail-closed posture (the request itself then also returns `500`) |
-| `scim.user.reactivated` | `success` / `failure` | `PATCH` or `PUT` sets `active:true`; same fail-closed `failure` posture as deactivation |
+| `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write could not persist |
+| `scim.user.reactivated` | `success` / `failure` | `PATCH` or `PUT` sets `active:true`; `failure` (set-and-proceed) on an audit-write error |
 | `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (`500`) |
 | `scim.user.provenance_denied` | `denied` | A deactivate/reactivate/delete/update targets an account whose `provisioning_source != "scim"`, **or** whose current `role != "user"` |
 | `scim.auth.denied` | `denied` | Bearer-auth validation fails (missing/malformed/wrong token) on any `/scim/v2/*` route, including discovery |

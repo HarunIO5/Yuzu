@@ -216,6 +216,28 @@ TEST_CASE("ScimStore: delete_by_scim_id removes the row", "[scim][resource]") {
     CHECK_FALSE(*second);
 }
 
+TEST_CASE("ScimStore: delete_by_scim_id surfaces a genuine step-time error as nullopt, "
+         "never false",
+         "[scim][resource]") {
+    // Gate-8 round-2 MEDIUM (CC6.8): a step-time failure (SQLITE_BUSY/
+    // LOCKED/IOERR/CORRUPT/...) must NOT collapse to `false` ("already
+    // gone") — that would make the DELETE handler 204 a failed teardown
+    // instead of 500ing it. Cheaply induce a genuine step() error by
+    // truncating the backing file out from under the already-open
+    // connection: `sqlite3_prepare_v2` still succeeds (SQL text parses
+    // against the cached schema), but `sqlite3_step` fails when it tries to
+    // read/write a page that is no longer there — never SQLITE_ROW or
+    // SQLITE_DONE.
+    ScimFixture f;
+    auto created = f.store.create_resource("erin");
+    REQUIRE(created.has_value());
+
+    std::filesystem::resize_file(f.db_file.path, 0);
+
+    auto result = f.store.delete_by_scim_id(created->scim_id);
+    CHECK_FALSE(result.has_value());
+}
+
 TEST_CASE("ScimStore: list paginates with 1-based startIndex and reports total",
          "[scim][resource][list]") {
     ScimFixture f;

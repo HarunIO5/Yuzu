@@ -524,7 +524,28 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                             "'user' (an operator elevated this account before it was "
                             "tombstoned)",
                             input.user_name);
-                auth_mgr->remove_user(input.user_name);
+                if (!auth_mgr->remove_user(input.user_name)) {
+                    // remove_user() writes the DB first and returns false if
+                    // that write failed (same contract as deactivate()'s
+                    // check, above). Unchecked, a failure here would leave
+                    // the account ACTIVE at its elevated role while this
+                    // handler still claims 404 "resource not found" — and
+                    // since 404 isn't retried by the IdP, the elevated
+                    // account would stay reactivated indefinitely
+                    // (privilege fail-open). Fail closed (500) instead so
+                    // the IdP retries the whole POST.
+                    spdlog::error("ScimRoutes: remove_user failed undoing the revive-role-"
+                                 "refusal for '{}' — account remains ACTIVE at an elevated "
+                                 "role",
+                                 input.user_name);
+                    send_scim_error(res, 500, "failed to revive the underlying account");
+                    audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure",
+                         input.user_name,
+                         "role-refusal undo (remove_user) failed — account left active at "
+                         "an elevated role");
+                    record_request(auth_mgr, "create", 500);
+                    return;
+                }
                 send_scim_error(res, 404, "resource not found");
                 audit(auth_mgr, audit_store, req, "scim.user.provenance_denied", "denied",
                      input.user_name, "role is not 'user' for username=" + input.user_name);

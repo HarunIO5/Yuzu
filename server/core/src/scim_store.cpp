@@ -394,8 +394,16 @@ std::optional<bool> ScimStore::delete_by_scim_id(const std::string& scim_id) {
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     // true = a row matched and was deleted; false = no row matched (already
-    // gone) — a real, idempotent-success outcome, not an error.
-    return rc == SQLITE_ROW;
+    // gone) — a real, idempotent-success outcome, not an error; nullopt =
+    // a genuine step-time error (SQLITE_BUSY/LOCKED/IOERR/CORRUPT/...) —
+    // must NOT be collapsed into "already gone", or the caller 204s a
+    // failed teardown instead of 500ing it.
+    if (rc == SQLITE_ROW)
+        return true;
+    if (rc == SQLITE_DONE)
+        return false;
+    spdlog::error("ScimStore::delete_by_scim_id: step failed: {}", sqlite3_errmsg(db_));
+    return std::nullopt;
 }
 
 } // namespace yuzu::server
