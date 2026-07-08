@@ -14,18 +14,24 @@
 | **Plain-language version** | [`vulnerability-graph-explained.md`](vulnerability-graph-explained.md) — a non-technical intro to *why a graph*, for curious readers |
 | **Related** | `docs/capability-map.md` §9, `docs/fleet-viz-invariants.md`, `docs/scope-walking-design.md`, `docs/agent-privilege-model.md`, `docs/data-architecture.md` |
 
-> **ADR-0022 reconciliation (2026-07).** This document's **server-side placement**
-> is superseded: vulnerability interpretation (feed ingest, matching, findings,
-> scoring) is a **use-case engine module**, not a server capability — the shipped
-> server-side NVD sync/matching is ADR-0022 grandfathered surface #2 and re-homes
-> via the strangler migration in `docs/adr-0022-execution-plan.md` (milestones
-> M1–M4; M4's surpass-parity criterion mirrors this doc's quality bar, and the
-> plan's pilot-readiness note cites this doc as the north-star). The
-> **domain content stands**: the matcher quality bar (§ floor — parity scanner,
-> low false positives on a patched fleet), the phased matcher roadmap, and the
-> attack-path/graph differentiator remain the north star for what the module
-> builds — the graph layer's own core-vs-engine boundary analysis is deferred to
-> its own scoping.
+> **ADR-0022 reconciliation (2026-07, updated 2026-07-08).** This document's
+> **server-side placement is interim**: vulnerability interpretation (feed ingest,
+> matching, findings, scoring) is long-term a **use-case engine module**, not a
+> server capability. The in-server vuln stack — the shipped NVD sync/matching,
+> the ADR-0023 correlation engine + `VulnFindingStore`, and the ADR-4001 `/vuln`
+> dashboard lens — is **absorbed into ADR-0022 grandfathered surface #2**
+> (placement-only, bounded to those ADRs' designed scope, outside-by-default
+> beyond it) and re-homes via the strangler migration in
+> `docs/adr-0022-execution-plan.md` § "Relationship to ADR-0023 and ADR-4001"
+> (that plan's **UCE milestones M1–M4** — distinct from `docs/vuln-scan-roadmap.md`'s
+> in-server M1a/M1b + M2–M6 ladder, always qualify which — where UCE M4's
+> surpass-parity criterion mirrors this doc's quality bar, and the plan's
+> pilot-readiness note cites this doc as the north-star). The **domain content
+> stands**: the matcher quality bar (§ floor — parity scanner, low false positives
+> on a patched fleet), the phased matcher roadmap, and the attack-path/graph
+> differentiator remain the north star for what the module builds — the graph
+> layer's core-vs-engine boundary analysis remains owed at ADR-4002's own merge
+> (4001's surface is absorbed; 4002's scoring substrate is not).
 
 ---
 
