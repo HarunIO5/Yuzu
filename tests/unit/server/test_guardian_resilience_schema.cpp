@@ -447,6 +447,14 @@ TEST_CASE("H1: dangerous_enforce_in_spec inspects the stored spec_json",
     CHECK(dangerous_enforce_in_spec("").empty());
     CHECK(dangerous_enforce_in_spec("not json").empty());
     CHECK(dangerous_enforce_in_spec("{}").empty());
+
+    // Fuzzer-found (fuzz_guardian_rule_spec, PR #1927 CI run 2026-07-08):
+    // "assertion.type" wrong-typed as an object rather than a string used to
+    // throw nlohmann::json::type_error uncaught out of this chokepoint.
+    CHECK(dangerous_enforce_in_spec(
+              R"({"spark":{"type":"service-status","service":"Spooler"},)"
+              R"("assertion":{"type":{"max_attempts":1}}})")
+              .empty());
 }
 
 TEST_CASE("PR5: enforce service-stopped on a security service is denied at every promote path",

@@ -265,6 +265,8 @@ std::string dangerous_enforce_in_spec(const std::string& spec_json) {
     if (!spec.is_object() || !spec.contains("assertion") || !spec["assertion"].is_object())
         return {};
     const auto& assertion = spec["assertion"];
+    if (assertion.contains("type") && !assertion["type"].is_string())
+        return {};
     const std::string atype = assertion.value("type", std::string{});
     if (!assertion.contains("params") || !assertion["params"].is_object())
         return {};
