@@ -17,6 +17,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -106,6 +107,10 @@ TEST_CASE("Register carrying a reserved on-behalf-of key is CANCELLED and commit
     req.mutable_info()->set_hostname("test-host");
 
     grpc::ClientContext ctx;
+    // A regression in the guard would hang this call rather than fail it
+    // fast (see cpp-safety/unhappy-path Gate 4) — bound it so CI reports an
+    // attributable failure, not a whole-suite timeout.
+    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
     ctx.AddMetadata("x-yuzu-on-behalf-of", "alice");
     apb::RegisterResponse resp;
 
@@ -120,6 +125,37 @@ TEST_CASE("Register carrying a reserved on-behalf-of key is CANCELLED and commit
     CHECK(h.registry.agent_count() == 0);
 }
 
+TEST_CASE("every reserved on-behalf-of key is rejected over the real wire, not just one",
+          "[grpc][onbehalf][adr0022]") {
+    // Unhappy-path Gate 4 (UP-4): the interceptor and onbehalf::enforce() are
+    // coupled only by both calling the same find_reserved_key() — sound
+    // today, but nothing stops a future edit from forking one path. This is
+    // the strongest coupling proof available: since grpc::ServerContext's
+    // client_metadata() can't be constructed outside a live call,
+    // demonstrating agreement means exercising the REAL wire path (both the
+    // interceptor's TryCancel and the handler's enforce()) for every key in
+    // kReservedKeys, not just the one key the tests above happen to use —
+    // test_on_behalf_guard.cpp already pins the parsing half in isolation.
+    for (auto key : yuzu::server::onbehalf::kReservedKeys) {
+        LiveInterceptorHarness h;
+
+        apb::RegisterRequest req;
+        req.mutable_info()->set_agent_id("test-agent-onbehalf-" + std::string(key));
+        req.mutable_info()->set_hostname("test-host");
+
+        grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+        ctx.AddMetadata(std::string(key), "alice");
+        apb::RegisterResponse resp;
+
+        auto status = h.stub_->Register(&ctx, req, &resp);
+
+        INFO("reserved key under test: " << key);
+        CHECK(status.error_code() == grpc::StatusCode::CANCELLED);
+        CHECK(h.registry.agent_count() == 0);
+    }
+}
+
 TEST_CASE("Register with no reserved key proceeds normally through the same interceptor",
           "[grpc][onbehalf][adr0022]") {
     LiveInterceptorHarness h;
@@ -129,6 +165,7 @@ TEST_CASE("Register with no reserved key proceeds normally through the same inte
     req.mutable_info()->set_hostname("test-host");
 
     grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
     ctx.AddMetadata("authorization", "Bearer irrelevant-here");
     apb::RegisterResponse resp;
 
@@ -150,6 +187,10 @@ TEST_CASE("Subscribe (bidi stream) carrying a reserved on-behalf-of key is rejec
     LiveInterceptorHarness h;
 
     grpc::ClientContext ctx;
+    // Unhappy-path Gate 4: a regression here would hang Read()/Finish()
+    // rather than fail fast — this is the streaming case where that risk is
+    // highest (an unbounded blocking read on an open stream).
+    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
     ctx.AddMetadata("x-yuzu-on-behalf-of", "alice");
 
     auto stream = h.stub_->Subscribe(&ctx);

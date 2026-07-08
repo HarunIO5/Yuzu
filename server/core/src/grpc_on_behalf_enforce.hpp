@@ -47,10 +47,11 @@
 // like the interceptor's single registration — a future RPC method (on any
 // service registered on the same ServerBuilder, including a future
 // ManagementServiceImpl handler) must remember to call this first; nothing
-// currently fails CI if it doesn't (tracked as a follow-up: at least a
-// second end-to-end regression test covering a streaming handler, beyond
-// the Register coverage in test_grpc_on_behalf_enforce.cpp — added
-// alongside this comment for Subscribe, the "command-result handler").
+// currently fails CI if it doesn't (tracked as issue #2005: a per-handler
+// zero-side-effect test or a static CI lint). test_grpc_on_behalf_enforce.cpp
+// covers Register (unary), Subscribe (streaming — the "command-result
+// handler"), and iterates every kReservedKeys entry over the real wire; it
+// does not yet cover all 11 sites individually.
 //
 // `context == nullptr` returns OK (not rejected) rather than failing closed.
 // This is NOT a production fail-open path — gRPC always supplies a real

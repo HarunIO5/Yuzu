@@ -1091,7 +1091,15 @@ note:** the Erlang gateway's
 own agent-facing listener reads only its known metadata keys and mints fresh
 upstream calls, so a reserved key sent to the gateway is dropped rather than
 rejected — tracked as a follow-up (Erlang-side reject, #1974) rather than an
-exception. Rejections are counted in
+exception. **Consequence for `GatewayUpstreamServiceImpl`'s own enforcement:**
+today's gateway never forwards the agent's original gRPC metadata onward, so
+an agent cannot smuggle a reserved key through it — the `ProxyRegister`/etc.
+handlers' `onbehalf::enforce()` guard is currently defense-in-depth against
+the gateway's own client, not a proven end-to-end control against relayed
+agent metadata. If a future change adds metadata passthrough (e.g. for
+tracing), it must re-derive the reserved-key check against the forwarded
+metadata explicitly — the guard does not do this automatically. Rejections
+are counted in
 `yuzu_onbehalf_rejected_total{surface,event="security"}`; there is
 deliberately **no audit row** (the rejection fires pre-auth, so there is no
 resolved principal to attribute — the metric is the signal). **Accepted

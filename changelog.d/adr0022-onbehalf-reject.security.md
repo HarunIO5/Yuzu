@@ -6,9 +6,11 @@
   receives `403` with the A4 error envelope before authentication (sole
   recorded exception: the four health-probe paths ignore the header, so a
   header-stamping proxy cannot crash-loop the server); a gRPC call
-  carrying one as a metadata key is cancelled at a server interceptor
-  (best-effort cancel — see `docs/auth-architecture.md` for the semantics). Nothing
-  previously consumed these headers, so no legitimate integration breaks — but
+  carrying one as a metadata key is cancelled at a server interceptor and
+  independently rejected again at every RPC handler's own entry point
+  before any side effect can commit — see `docs/auth-architecture.md` for
+  the enforcement seam. Nothing previously consumed these headers, so no
+  legitimate integration breaks — but
   an integration *testing* a delegation header will now see the rejection.
   Server-verifiable delegation arrives with the ADR-0022 auth follow-up;
   client-asserted delegation stays rejected permanently. Rejections are
