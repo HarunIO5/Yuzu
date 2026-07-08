@@ -378,10 +378,33 @@ private:
         }
     }
 
+    /// If `t0` (the caller's entry time) to now exceeds 100ms, bump slow_op_
+    /// and warn (#1980). Both arm_dir() and arm_ancestor() run under mu_ (the
+    /// mechanism's only lock) and can block on a slow/unresponsive filesystem
+    /// path — this is an early warning sign of a stalled watcher, not a hard
+    /// fault, so it never changes behavior, only observability.
+    void note_if_slow(std::chrono::steady_clock::time_point t0, const char* what,
+                      const std::wstring& dir) {
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        if (elapsed <= std::chrono::milliseconds(100))
+            return;
+        slow_op_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::warn("spark_file: {} for '{}' took {}ms — possible stalled/unresponsive path",
+                     what, fs::path(dir).string(),
+                     std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+    }
+
     /// Issue (or re-issue) the overlapped ReadDirectoryChangesW for `w`. Opens
     /// the directory handle + associates it with the IOCP on first arm. Returns
     /// false if the directory can't be opened (caller falls back to ancestor).
     bool arm_dir(DirWatch& w) {
+        const auto t0 = std::chrono::steady_clock::now();
+        struct Guard {
+            WindowsFileMechanism* self;
+            std::chrono::steady_clock::time_point t0;
+            const std::wstring* dir;
+            ~Guard() { self->note_if_slow(t0, "arm_dir", *dir); }
+        } guard{this, t0, &w.dir};
         if (!w.handle) {
             std::error_code ec;
             if (!fs::is_directory(w.dir, ec))
@@ -413,6 +436,14 @@ private:
     /// Refcounts the shared ancestor watch (S1). Returns true if an ancestor is
     /// being watched for it. Idempotent when the ancestor is unchanged.
     bool arm_ancestor(DirWatch& dependent) {
+        const auto t0 = std::chrono::steady_clock::now();
+        struct Guard {
+            WindowsFileMechanism* self;
+            std::chrono::steady_clock::time_point t0;
+            const std::wstring* dir;
+            ~Guard() { self->note_if_slow(t0, "arm_ancestor", *dir); }
+        } guard{this, t0, &dependent.dir};
+
         fs::path anc = fs::path(dependent.dir);
         std::error_code ec;
         // parent_path() of a root (drive root, UNC share root) returns itself —
@@ -427,7 +458,23 @@ private:
         // its "guard on emptiness" shape would NOT have fixed this hang — a
         // rooted fs::path's parent is itself, never empty (governance Gate-4
         // consistency finding, PR #1927 review).
+        //
+        // #1980: each fs::is_directory probe can itself block for the OS's
+        // network timeout on a dead/unresponsive UNC path — the fixed-point
+        // guard above stops an INFINITE loop, but not a SLOW one. A deadline,
+        // checked every iteration, caps the walk at one-probe-past-500ms
+        // instead of depth × per-probe-timeout, so a single bad path can no
+        // longer stall the whole mechanism (every other watch needs this same
+        // mu_) for an unbounded time.
         for (fs::path prev; !anc.empty() && anc != prev && !fs::is_directory(anc, ec);) {
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(500)) {
+                slow_op_.fetch_add(1, std::memory_order_relaxed);
+                spdlog::warn("spark_file: ancestor walk from '{}' exceeded 500ms — abandoning "
+                             "(a path on this chain may be an unresponsive network share)",
+                             fs::path(dependent.dir).string());
+                release_ancestor(dependent);
+                return false;
+            }
             prev = anc;
             anc = anc.parent_path();
         }
