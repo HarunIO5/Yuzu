@@ -148,6 +148,42 @@ private:
     int start_calls_{0};
 };
 
+/// A mechanism whose stop() blocks until released — for #1934 UP-1/F4, a
+/// regression test that stop()'s mechanism-teardown step runs with no engine
+/// lock held.
+class BlockingStopMechanism final : public ISparkMechanism {
+public:
+    void start(SparkEmitFn emit, SparkFaultFn) override { emit_ = std::move(emit); }
+    std::expected<void, std::string> watch(const std::string&, const SparkParams&) override {
+        return {};
+    }
+    void unwatch(const std::string&) override {}
+    void stop() override {
+        stopping_now_.store(true, std::memory_order_release);
+        std::unique_lock lk(gate_mu_);
+        gate_cv_.wait(lk, [&] { return release_; });
+    }
+    void fire(const std::string& key) {
+        if (emit_)
+            emit_(key, SparkData{std::monostate{}});
+    }
+    bool stopping_now() const { return stopping_now_.load(std::memory_order_acquire); }
+    void release() {
+        {
+            std::lock_guard lk(gate_mu_);
+            release_ = true;
+        }
+        gate_cv_.notify_all();
+    }
+
+private:
+    SparkEmitFn emit_;
+    std::atomic<bool> stopping_now_{false};
+    std::mutex gate_mu_;
+    std::condition_variable gate_cv_;
+    bool release_{false};
+};
+
 SparkSpec file_spec(const std::string& path) {
     return SparkSpec{SparkType::File, FileSparkParams{path}};
 }
@@ -724,6 +760,76 @@ TEST_CASE("Service spark emit path does not deadlock an inline re-arm (TRAP 2 tw
     fake->fire(key, SparkData{ServiceSparkData{ServiceRunState::Stopped}});
     CHECK(eventually([&] { return rearmed.load(); }));
     engine.stop();
+}
+
+TEST_CASE("SparkEngine: a queued handler re-entering the engine while stop() is inside "
+          "mechanism teardown does not deadlock (#1934 UP-1/F4)",
+          "[spark][mechanism]") {
+    // Pins the property this whole mechanism-call seam depends on:
+    // SparkEngine::stop() calls a mechanism's stop() with NO engine lock held
+    // (mu_ / consumers_mu_ / mech_ops_mu_ all released — see stop()'s step 2).
+    // A QUEUED handler already dispatched before stop() began may therefore
+    // safely call back into the engine (arm/disarm) WHILE stop() is stuck
+    // inside a slow mechanism teardown: the re-entrant call must fail cleanly
+    // (the engine is stopping) rather than deadlock waiting for a lock stop()
+    // is (incorrectly, in a regression) still holding.
+    SparkEngine engine;
+    auto mech = std::make_unique<BlockingStopMechanism>();
+    BlockingStopMechanism* bm = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+
+    struct Sync {
+        std::mutex m;
+        std::condition_variable cv;
+        bool handler_fired{false};
+        bool reentry_done{false};
+        std::atomic<bool> reentrant_arm_rejected{false};
+    };
+    auto sync = std::make_shared<Sync>();
+
+    const auto spec = file_spec("/etc/hosts");
+    const std::string key = spark_key(spec);
+    auto consumer = engine.register_consumer("c", [&engine, bm, sync](const SparkEvent&) {
+        {
+            std::lock_guard lk(sync->m);
+            sync->handler_fired = true;
+        }
+        sync->cv.notify_all();
+        // Wait until stop() is actually inside the mechanism teardown before
+        // re-entering — otherwise this races stop()'s own step 1 instead of
+        // exercising step 2's no-lock-held property.
+        while (!bm->stopping_now())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        auto sub2 = engine.arm_inline(SparkSpec{SparkType::Interval, IntervalSparkParams{60'000}},
+                                       [](const SparkEvent&) {});
+        sync->reentrant_arm_rejected.store(!sub2.has_value());
+        {
+            std::lock_guard lk(sync->m);
+            sync->reentry_done = true;
+        }
+        sync->cv.notify_all();
+        bm->release(); // let stop()'s mechanism teardown — and stop() itself — finish
+    });
+    REQUIRE(consumer.has_value());
+    REQUIRE(engine.arm(*consumer, spec).has_value());
+    engine.start();
+
+    bm->fire(key);
+    {
+        std::unique_lock lk(sync->m);
+        sync->cv.wait(lk, [&] { return sync->handler_fired; });
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    engine.stop(); // must return once the handler releases the gate, not hang
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    CHECK(elapsed < 5000ms);
+    {
+        std::lock_guard lk(sync->m);
+        CHECK(sync->reentry_done);
+    }
+    CHECK(sync->reentrant_arm_rejected.load()); // failed cleanly, never hung
 }
 
 TEST_CASE("platform factories honor the mechanism-or-null contract", "[spark][mechanism]") {
