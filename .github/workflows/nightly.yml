@@ -485,10 +485,21 @@ jobs:
   # between an ASan-compiled app and non-ASan-compiled static libs (spiked
   # 2026-07-08 on DGRHP: full agent suite green, zero ASan reports, both
   # with and without this flag pair changing anything except making the
-  # link succeed). Cost: no ASan coverage INSIDE vendored deps' own
-  # std::string/std::vector usage — Yuzu's own code (spark_file.cpp et al.)
-  # is fully covered. Revisit if a from-source Windows ASan triplet ever
-  # gets built for another reason.
+  # link succeed).
+  #
+  # WHAT THIS LEG CATCHES vs NOT — the annotation-disable flags are global,
+  # so they turn off MSVC's STL container-overflow annotations for OUR
+  # translation units too, not just the vendored libs. So this leg DOES
+  # catch, in Yuzu's own spark code, heap-buffer-overflow (raw allocations),
+  # stack-buffer-overflow, the DirWatch fixed-array IOCP buffer, and
+  # use-after-free (the whole UAF class this batch targets). It does NOT
+  # catch out-of-bounds into a std::vector/std::string/std::deque's
+  # reserved-but-unused capacity — that specific check rides on the
+  # container annotations, which are disabled globally by the workaround.
+  # Building a from-source Windows ASan triplet (instrumenting the vendored
+  # deps so annotations can stay on) would restore container coverage; it's
+  # a materially larger, separate undertaking, revisit if built for another
+  # reason.
   windows-asan:
     name: "Sanitizer (Windows ASan)"
     needs: [preflight]

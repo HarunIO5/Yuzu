@@ -337,7 +337,18 @@ private:
     /// cycle. Coarsened to per-engine (not per-key): arm/disarm are rare
     /// control-plane operations, so a mechanism call briefly blocking another
     /// unrelated key's arm/disarm is an acceptable trade for not needing
-    /// per-key generation tokens.
+    /// per-key generation tokens. KNOWN COUPLING (accepted, tracked): because
+    /// this is ONE engine-wide lock rather than per-mechanism, a slow
+    /// watch() on one mechanism (e.g. a File watch stalling on an
+    /// unresponsive UNC path — itself now bounded to ~500ms by spark_file's
+    /// arm_ancestor deadline, #1980) blocks a concurrent unwatch() on a
+    /// DIFFERENT mechanism (e.g. Registry) that was fully independent before.
+    /// Only same-mechanism watch/unwatch were serialised previously (by each
+    /// mechanism's own internal lock); this adds cross-mechanism serialisation
+    /// that Stage 2's simultaneous File+Registry+Service guards will exercise.
+    /// Correctness needs only same-KEY ordering; per-mechanism-type granularity
+    /// would drop the cross-mechanism coupling for modest extra bookkeeping —
+    /// deferred follow-up before Stage 2's real multi-mechanism load.
     mutable std::mutex mech_ops_mu_;
     std::condition_variable wheel_cv_;
     std::map<std::string, Armed> armed_; ///< by spark_key
