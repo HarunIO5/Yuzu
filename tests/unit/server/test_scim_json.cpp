@@ -40,7 +40,7 @@ TEST_CASE("scim_json: user_to_json shape", "[scim][json]") {
     auto j = user_to_json(r, "https://host/scim/v2/Users");
 
     REQUIRE(j["schemas"].is_array());
-    CHECK(j["schemas"][0] == kSchemaUser);
+    CHECK(j["schemas"][0] == std::string(kSchemaUser));
     CHECK(j["id"] == "abc123");
     CHECK(j["userName"] == "jdoe");
     CHECK(j["active"] == true);
@@ -230,7 +230,7 @@ TEST_CASE("scim_json: parse_username_filter unsupported operator errors", "[scim
 
 TEST_CASE("scim_json: error envelope shape", "[scim][json]") {
     auto j = error(404, "resource not found");
-    CHECK(j["schemas"][0] == kSchemaError);
+    CHECK(j["schemas"][0] == std::string(kSchemaError));
     CHECK(j["status"] == "404");
     CHECK(j["detail"] == "resource not found");
     CHECK_FALSE(j.contains("scimType"));
@@ -254,7 +254,7 @@ TEST_CASE("scim_json: list_response shape", "[scim][json]") {
     nlohmann::json u1 = {{"id", "1"}};
     nlohmann::json u2 = {{"id", "2"}};
     auto j = list_response({u1, u2}, 2, 1, 2);
-    CHECK(j["schemas"][0] == kSchemaListResponse);
+    CHECK(j["schemas"][0] == std::string(kSchemaListResponse));
     CHECK(j["totalResults"] == 2);
     CHECK(j["startIndex"] == 1);
     CHECK(j["itemsPerPage"] == 2);
@@ -266,7 +266,7 @@ TEST_CASE("scim_json: list_response shape", "[scim][json]") {
 
 TEST_CASE("scim_json: service_provider_config shape", "[scim][json]") {
     auto j = service_provider_config();
-    CHECK(j["schemas"][0] == kSchemaServiceProviderConfig);
+    CHECK(j["schemas"][0] == std::string(kSchemaServiceProviderConfig));
     CHECK(j["patch"]["supported"] == true);
     CHECK(j["bulk"]["supported"] == false);
     CHECK(j["filter"]["supported"] == true);
@@ -281,19 +281,19 @@ TEST_CASE("scim_json: service_provider_config shape", "[scim][json]") {
 
 TEST_CASE("scim_json: resource_types shape", "[scim][json]") {
     auto j = resource_types();
-    CHECK(j["schemas"][0] == kSchemaListResponse);
+    CHECK(j["schemas"][0] == std::string(kSchemaListResponse));
     REQUIRE(j["Resources"].is_array());
     REQUIRE(j["Resources"].size() == 1);
     CHECK(j["Resources"][0]["id"] == "User");
     CHECK(j["Resources"][0]["endpoint"] == "/Users");
-    CHECK(j["Resources"][0]["schema"] == kSchemaUser);
+    CHECK(j["Resources"][0]["schema"] == std::string(kSchemaUser));
 }
 
 TEST_CASE("scim_json: schemas shape", "[scim][json]") {
     auto j = schemas();
-    CHECK(j["schemas"][0] == kSchemaListResponse);
+    CHECK(j["schemas"][0] == std::string(kSchemaListResponse));
     REQUIRE(j["Resources"].is_array());
     REQUIRE(j["Resources"].size() == 1);
-    CHECK(j["Resources"][0]["id"] == kSchemaUser);
+    CHECK(j["Resources"][0]["id"] == std::string(kSchemaUser));
     REQUIRE(j["Resources"][0]["attributes"].is_array());
 }
