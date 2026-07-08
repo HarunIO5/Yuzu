@@ -200,11 +200,20 @@ TEST_CASE("ScimStore: delete_by_scim_id removes the row", "[scim][resource]") {
     auto created = f.store.create_resource("dave");
     REQUIRE(created.has_value());
 
-    REQUIRE(f.store.delete_by_scim_id(created->scim_id));
+    // Tri-state return (UP-N4/FIX-4): nullopt = DB error, true = a row was
+    // deleted, false = no row matched (already gone) — a real success, not
+    // an error, so it must NOT collapse to the same falsy shape as nullopt.
+    auto first = f.store.delete_by_scim_id(created->scim_id);
+    REQUIRE(first.has_value());
+    CHECK(*first);
     CHECK_FALSE(f.store.get_by_scim_id(created->scim_id).has_value());
 
-    // Deleting again reports no match.
-    CHECK_FALSE(f.store.delete_by_scim_id(created->scim_id));
+    // Deleting again reports "no match" (false), not a DB error (nullopt) —
+    // this is the idempotent-DELETE case the routes layer relies on to
+    // return 204 rather than 500 on a concurrent/duplicate DELETE.
+    auto second = f.store.delete_by_scim_id(created->scim_id);
+    REQUIRE(second.has_value());
+    CHECK_FALSE(*second);
 }
 
 TEST_CASE("ScimStore: list paginates with 1-based startIndex and reports total",

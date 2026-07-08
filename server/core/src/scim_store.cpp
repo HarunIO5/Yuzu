@@ -379,20 +379,22 @@ bool ScimStore::update_resource(const std::string& scim_id, const std::string& u
     return rc == SQLITE_ROW;
 }
 
-bool ScimStore::delete_by_scim_id(const std::string& scim_id) {
+std::optional<bool> ScimStore::delete_by_scim_id(const std::string& scim_id) {
     if (!db_ || scim_id.empty())
-        return false;
+        return std::nullopt;
 
     std::lock_guard lock(db_mtx_);
     static const char* sql = "DELETE FROM scim_resources WHERE scim_id = ?1 RETURNING scim_id";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         spdlog::error("ScimStore::delete_by_scim_id: prepare failed: {}", sqlite3_errmsg(db_));
-        return false;
+        return std::nullopt;
     }
     sqlite3_bind_text(stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+    // true = a row matched and was deleted; false = no row matched (already
+    // gone) — a real, idempotent-success outcome, not an error.
     return rc == SQLITE_ROW;
 }
 

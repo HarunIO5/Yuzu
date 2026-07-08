@@ -350,6 +350,55 @@ TEST_CASE("ScimRoutes: DELETE — 204 + account soft-deleted", "[scim][routes][d
     CHECK_FALSE(f.scim_store->get_by_scim_id(id).has_value());
 }
 
+TEST_CASE("ScimRoutes: concurrent DELETE on the same id never 500s on an already-gone mapping "
+         "row (UP-N4)",
+         "[scim][routes][delete][race]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "wren"}})->body);
+    auto id = created["id"].get<std::string>();
+
+    // Deactivate first so both racing DELETEs land in the already-inactive
+    // branch (no remove_user() call there) — isolates the delete_by_scim_id
+    // idempotency this test targets from the separate, pre-existing
+    // remove_user()-return-value residual on the active branch (see
+    // deactivate()'s M-ATOMICITY comment; out of scope here).
+    json deactivate_body{{"Operations", json::array({{{"op", "replace"},
+                                                      {"value", {{"active", false}}}}})}};
+    REQUIRE(f.patch("/scim/v2/Users/" + id, deactivate_body)->status == 200);
+
+    std::atomic<int> status_204{0};
+    std::atomic<int> status_404{0};
+    std::atomic<int> unexpected{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 2; ++i) {
+        threads.emplace_back([&f, &id, &status_204, &status_404, &unexpected] {
+            auto res = f.del("/scim/v2/Users/" + id);
+            if (!res) {
+                unexpected.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            if (res->status == 204)
+                status_204.fetch_add(1, std::memory_order_relaxed);
+            else if (res->status == 404)
+                status_404.fetch_add(1, std::memory_order_relaxed);
+            else
+                unexpected.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    for (auto& t : threads)
+        t.join();
+
+    // The regression this guards: a race where one thread's own
+    // delete_by_scim_id() call finds the mapping row already removed by
+    // the other thread used to 500 (treated as a DB error). It must now be
+    // idempotent success (204) — or, if a thread's OWN initial
+    // get_by_scim_id already observed the row gone (a legitimately later,
+    // fully-sequential DELETE), a plain 404 — but NEVER a spurious 500.
+    CHECK(unexpected.load() == 0);
+    CHECK(status_204.load() >= 1);
+    CHECK(status_204.load() + status_404.load() == 2);
+}
+
 // ── Provenance guard (LOAD-BEARING) ────────────────────────────────────────
 
 TEST_CASE("ScimRoutes: provenance guard — SCIM cannot touch a locally-created account",
@@ -463,6 +512,67 @@ TEST_CASE("ScimRoutes: DELETE then re-POST the same userName revives the account
     CHECK_FALSE(f.auth_mgr.get_user_role("olga").has_value());
 }
 
+TEST_CASE("ScimRoutes: concurrent revive race — the create_resource-conflict rollback must not "
+         "deactivate the winner (UP-N1)",
+         "[scim][routes][revive][race]") {
+    Fixture f;
+    // Leave "vic" as a tombstoned SCIM account: auth row soft-deleted,
+    // provisioning_source == "scim", no scim_resource row — exactly the
+    // state two concurrent re-POSTs for a returning employee would race
+    // over (both pass Step 1's "no live mapping" check and enter the
+    // REVIVE branch; they can only serialize on create_resource's
+    // UNIQUE(username) constraint).
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "vic"}})->body);
+    auto del_res = f.del("/scim/v2/Users/" + created["id"].get<std::string>());
+    REQUIRE(del_res);
+    REQUIRE(del_res->status == 204);
+    REQUIRE_FALSE(f.auth_mgr.get_user_role("vic").has_value());
+
+    std::atomic<int> created_count{0};
+    std::atomic<int> conflicted_count{0};
+    std::atomic<int> other{0};
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 2; ++i) {
+        threads.emplace_back([&f, &created_count, &conflicted_count, &other] {
+            auto res = f.post("/scim/v2/Users", {{"userName", "vic"}});
+            if (!res) {
+                other.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            if (res->status == 201)
+                created_count.fetch_add(1, std::memory_order_relaxed);
+            else if (res->status == 409)
+                conflicted_count.fetch_add(1, std::memory_order_relaxed);
+            else
+                other.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    for (auto& t : threads)
+        t.join();
+
+    // Exactly one winner (201), one loser (409 uniqueness) — same shape as
+    // the fresh-create race below, but this one exercises the REVIVE
+    // branch's create_resource-failure handler.
+    CHECK(created_count.load() == 1);
+    CHECK(conflicted_count.load() == 1);
+    CHECK(other.load() == 0);
+
+    // UP-N1 (the actual regression): the loser's rollback must NEVER have
+    // called remove_user() against the winner's freshly-revived account —
+    // it must still resolve and still be active, not silently deactivated
+    // behind a 201 no one retries.
+    auto role = f.auth_mgr.get_user_role("vic");
+    REQUIRE(role.has_value());
+    CHECK(*role == auth::Role::user);
+
+    int total = -1;
+    auto page = f.scim_store->list(1, 100, total);
+    CHECK(total == 1);
+    REQUIRE_FALSE(page.empty());
+    CHECK(page.front().active);
+}
+
 TEST_CASE("ScimRoutes: concurrent duplicate POST for a brand-new userName — exactly one 201, "
          "one 409 (UP-9, store layer race)",
          "[scim][routes][post][race]") {
@@ -551,7 +661,16 @@ TEST_CASE("ScimRoutes: PATCH after DELETE on the same id — 404, no crash",
     CHECK(put_res->status == 404);
 }
 
-// ── M-AUDIT-FAILCLOSED / set-and-proceed split ──────────────────────────
+// ── Set-and-proceed audit posture (UP-N2) ───────────────────────────────
+//
+// A lost audit write NEVER fails the request on this surface — including
+// the termination actions (deactivate/delete/reactivate). Fail-closed here
+// used to 500 the IdP's request, but the mutation had already committed and
+// the IdP's retry would observe post-state and never re-attempt the lost
+// audit write anyway — the evidence gap was permanent either way, at the
+// cost of a spurious 500. CC6.8 evidence integrity is instead enforced by
+// alerting on yuzu_scim_audit_write_failures_total (bumped inside audit()
+// on every failure, independent of the caller's response).
 
 TEST_CASE("ScimRoutes: audit write failure on a non-termination action — set-and-proceed (201)",
          "[scim][routes][audit]") {
@@ -562,7 +681,7 @@ TEST_CASE("ScimRoutes: audit write failure on a non-termination action — set-a
     CHECK(f.auth_mgr.get_user_role("sam").has_value());
 }
 
-TEST_CASE("ScimRoutes: audit write failure on a termination action — fails CLOSED (500)",
+TEST_CASE("ScimRoutes: audit write failure on a termination action — set-and-proceed (200)",
          "[scim][routes][audit]") {
     Fixture f{/*broken_audit=*/true};
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "tara"}})->body);
@@ -572,16 +691,16 @@ TEST_CASE("ScimRoutes: audit write failure on a termination action — fails CLO
                                                       {"value", {{"active", false}}}}})}};
     auto res = f.patch("/scim/v2/Users/" + id, deactivate_body);
     REQUIRE(res);
-    CHECK(res->status == 500);
-    // The mutation ALREADY happened — fail-closed only withholds success
-    // reporting so the IdP retries; the retry is idempotent.
+    // The mutation committed AND is reported — a lost audit row no longer
+    // costs the caller a spurious 500 (see the file comment above).
+    CHECK(res->status == 200);
     CHECK_FALSE(f.auth_mgr.get_user_role("tara").has_value());
     auto stored = f.scim_store->get_by_scim_id(id);
     REQUIRE(stored.has_value());
     CHECK_FALSE(stored->active);
 }
 
-TEST_CASE("ScimRoutes: audit write failure on DELETE — fails CLOSED (500)",
+TEST_CASE("ScimRoutes: audit write failure on DELETE — set-and-proceed (204)",
          "[scim][routes][audit]") {
     Fixture f{/*broken_audit=*/true};
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "uri"}})->body);
@@ -589,7 +708,7 @@ TEST_CASE("ScimRoutes: audit write failure on DELETE — fails CLOSED (500)",
 
     auto res = f.del("/scim/v2/Users/" + id);
     REQUIRE(res);
-    CHECK(res->status == 500);
+    CHECK(res->status == 204);
     CHECK_FALSE(f.auth_mgr.get_user_role("uri").has_value());
 }
 

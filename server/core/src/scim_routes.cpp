@@ -115,16 +115,18 @@ void bump_provenance_denied(auth::AuthManager* auth_mgr) {
 // ── Audit ────────────────────────────────────────────────────────────────
 
 /// Emit a SCIM audit row. AuditStore::log is [[nodiscard]] bool; per the
-/// evidence-integrity contract (audit_store.hpp) most callers on this
-/// surface "set-and-proceed" rather than fail the IdP's request over an
-/// audit-store hiccup — the caller decides whether to inspect the return.
-/// M-AUDIT-FAILCLOSED: the three termination actions
-/// (deactivated/deleted/reactivated) DO check it and fail closed (500) on a
-/// false return — see `deactivate`/`reactivate`/the DELETE handler below.
-/// Every failure (including `audit_store == nullptr`, an equally real
-/// evidence gap) bumps `yuzu_scim_audit_write_failures_total` — the
-/// companion metric that makes set-and-proceed defensible for the actions
-/// that keep using it.
+/// evidence-integrity contract (audit_store.hpp) EVERY caller on this
+/// surface — including the three termination actions (deactivated/deleted/
+/// reactivated) — "set-and-proceed" rather than fail the IdP's request over
+/// an audit-store hiccup: the mutation already committed, and a fail-closed
+/// 500 here does not help, because the IdP's retry observes post-state
+/// (e.g. the account is already inactive) and takes the non-termination
+/// branch on the next request — it never re-attempts the lost audit write,
+/// so failing closed only costs the caller a spurious 500 without
+/// recovering the evidence row. CC6.8 evidence integrity is instead
+/// enforced by an alert on `yuzu_scim_audit_write_failures_total`, which
+/// every failure (including `audit_store == nullptr`, an equally real
+/// evidence gap) bumps regardless of the caller's response.
 bool audit(auth::AuthManager* auth_mgr, AuditStore* audit_store, const httplib::Request& req,
           const std::string& action, const std::string& result, const std::string& target_id,
           const std::string& detail = {}) {
@@ -267,8 +269,9 @@ bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
 /// guarded) and mark the SCIM resource inactive. Shared by PATCH
 /// active=false, PUT active=false, and DELETE. Returns false (and has
 /// already sent a response) on provenance/role refusal, an AuthManager
-/// failure, a ScimStore mirror-write failure (M-ATOMICITY, UP-5), or a
-/// failed termination audit (M-AUDIT-FAILCLOSED).
+/// failure, or a ScimStore mirror-write failure (M-ATOMICITY, UP-5). A
+/// failed termination audit does NOT fail the call — see `audit()`'s doc
+/// comment (set-and-proceed, CC6.8 enforced via the failure-counter alert).
 bool deactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* audit_store,
                 const httplib::Request& req, httplib::Response& res, const ScimResource& resource,
                 const std::string& audit_action) {
@@ -287,11 +290,18 @@ bool deactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* 
     // succeeded; now persist the SCIM-side mirror on ScimStore's SEPARATE
     // connection. If THIS write fails, the auth account is already
     // deactivated but the SCIM resource still reports active=true — fail
-    // closed (500) so the IdP retries. The retry is safe/idempotent:
-    // remove_user() no-ops on an already-inactive row, set_active()
-    // unconditionally re-applies. The irreducible window between the two
-    // writes (a crash/kill exactly between them) is a documented residual —
-    // reconciled by the IdP's next full sync.
+    // closed (500) so the IdP retries. The DB-level write inside
+    // remove_user() is idempotent (its `UPDATE ... is_active = 0` re-applies
+    // cleanly against an already-inactive row); remove_user()'s bool
+    // *return value* is NOT — it reflects the in-memory `users_.erase()`
+    // result, which is false on a second call against an already-evicted
+    // entry, not "no-op success". The actual retry safety comes from the
+    // handler's re-fetch-and-skip at every call site (`deactivate()` is only
+    // invoked when the freshly-fetched `resource->active` is still true —
+    // see the PATCH/PUT/DELETE call sites), not from remove_user() itself
+    // being a true no-op. The irreducible window between the two writes (a
+    // crash/kill exactly between them) is a documented residual — reconciled
+    // by the IdP's next full sync.
     if (!scim_store->set_active(resource.scim_id, false)) {
         spdlog::error("ScimRoutes: ScimStore::set_active(false) failed for scim_id={} after the "
                      "underlying account was already deactivated — inconsistent state, failing "
@@ -302,14 +312,15 @@ bool deactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* 
              "auth account deactivated but scim_resource mirror write failed");
         return false;
     }
-    // M-AUDIT-FAILCLOSED: a lost termination audit breaks CC6.8 evidence —
-    // fail closed rather than report success with no evidence row. The
-    // mutation already committed either way; the IdP's retry above is
-    // idempotent, so failing here costs nothing but a retry.
-    if (!audit(auth_mgr, audit_store, req, audit_action, "success", resource.scim_id)) {
-        send_scim_error(res, 500, "state changed but the audit record failed to persist");
-        return false;
-    }
+    // Set-and-proceed (UP-N2): the mutation above already committed — a lost
+    // audit row does not change that, and a fail-closed 500 here cannot
+    // re-land it (the IdP's retry would observe active=false and take the
+    // non-termination branch, never re-attempting this audit write). CC6.8
+    // evidence integrity is enforced by an alert on
+    // `yuzu_scim_audit_write_failures_total` (bumped inside `audit()` on
+    // every failure), not by refusing to report the 2xx that already
+    // happened.
+    audit(auth_mgr, audit_store, req, audit_action, "success", resource.scim_id);
     return true;
 }
 
@@ -319,10 +330,10 @@ bool deactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* 
 /// guard applies here too: reactivation is itself a mutation of the auth
 /// account, so it must be refused (404) if the account isn't SCIM-owned —
 /// same reasoning as deactivate/delete. Returns false (and has already sent
-/// a response) on provenance refusal, an AuthManager failure, a ScimStore
-/// mirror-write failure (M-ATOMICITY), or a failed termination-class audit
-/// (M-AUDIT-FAILCLOSED — reactivation is as evidentially significant as
-/// deactivation/delete: it restores access).
+/// a response) on provenance refusal, an AuthManager failure, or a ScimStore
+/// mirror-write failure (M-ATOMICITY). A failed termination-class audit does
+/// NOT fail the call — see `audit()`'s doc comment (set-and-proceed, CC6.8
+/// enforced via the failure-counter alert).
 bool reactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* audit_store,
                 const httplib::Request& req, httplib::Response& res, const ScimResource& resource) {
     if (!provenance_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id, res))
@@ -344,10 +355,8 @@ bool reactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* 
              "auth account reactivated but scim_resource mirror write failed");
         return false;
     }
-    if (!audit(auth_mgr, audit_store, req, "scim.user.reactivated", "success", resource.scim_id)) {
-        send_scim_error(res, 500, "state changed but the audit record failed to persist");
-        return false;
-    }
+    // Set-and-proceed (UP-N2) — see the matching comment in `deactivate()`.
+    audit(auth_mgr, audit_store, req, "scim.user.reactivated", "success", resource.scim_id);
     return true;
 }
 
@@ -471,6 +480,13 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             return;
         }
 
+        // UP-N1 (FIX-1): tracks whether THIS call is the one that created the
+        // auth row (the fresh-create branch below) vs. revived a pre-existing
+        // one — gates the create_resource-failure rollback further down so a
+        // concurrent revive's rollback can never deactivate a DIFFERENT
+        // call's winning account.
+        bool created_auth_row_this_call = false;
+
         if (source_result.has_value()) {
             // REVIVE: a tombstoned or half-created SCIM account this IdP
             // previously provisioned. Reactivate the EXISTING auth row —
@@ -485,6 +501,35 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure",
                      input.user_name);
                 record_request(auth_mgr, "create", 500);
+                return;
+            }
+
+            // UP-N5 (FIX-5, defensive): reactivate_user() leaves `role`
+            // untouched. If an operator elevated this account before it was
+            // tombstoned, its role is still whatever they set it to —
+            // SCIM's model owns only read-only 'user' accounts, so do not
+            // resurrect an out-of-band-elevated account through the revive
+            // path. Checked AFTER reactivate_user() (not before): the
+            // tombstoned row is soft-deleted, so get_user_role's in-memory
+            // cache has no entry for it until reactivate_user() loads it —
+            // same reasoning as deprovision_role_ok's doc comment. On
+            // refusal, undo the reactivation (remove_user) so "refuse"
+            // actually means the account stays down, not just that this
+            // response says 404. Same posture as the deprovision role guard:
+            // 404 (never 403 — no existence oracle), scim.user.
+            // provenance_denied.
+            if (auto role = auth_mgr->get_user_role(input.user_name);
+                role.has_value() && *role != auth::Role::user) {
+                spdlog::warn("ScimRoutes: refusing to revive '{}' via POST — role is not "
+                            "'user' (an operator elevated this account before it was "
+                            "tombstoned)",
+                            input.user_name);
+                auth_mgr->remove_user(input.user_name);
+                send_scim_error(res, 404, "resource not found");
+                audit(auth_mgr, audit_store, req, "scim.user.provenance_denied", "denied",
+                     input.user_name, "role is not 'user' for username=" + input.user_name);
+                bump_provenance_denied(auth_mgr);
+                record_request(auth_mgr, "create", 404);
                 return;
             }
         } else {
@@ -527,6 +572,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 record_request(auth_mgr, "create", 500);
                 return;
             }
+            created_auth_row_this_call = true;
 
             // S-IDENTITY-SRC: SCIM is its own login surface (IdP-driven SSO,
             // no usable local password) — distinct from the v6 'local'
@@ -563,12 +609,36 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
         auto resource = scim_store->create_resource(input.user_name, input.external_id);
         if (!resource) {
-            // Half-create orphan (whether this POST just freshly created the
-            // auth row, or revived one): roll back to a deactivated
-            // tombstone rather than leaving an ACTIVE, SCIM-untracked
-            // account. The next POST for the same userName retries this
-            // exact step (provisioning_source == "scim" still holds).
-            auth_mgr->remove_user(input.user_name);
+            // UP-N1 (FIX-1): create_resource() returns nullopt on a
+            // UNIQUE(username) conflict OR a genuine CSPRNG/db failure — the
+            // two demand opposite responses, so distinguish them by
+            // re-reading. If a live scim_resource mapping now exists, a
+            // CONCURRENT re-POST for the same identity already won the race
+            // between Step 1's uniqueness check and this write and has
+            // already created/revived its own account — that is the winner;
+            // touch nothing here (in particular, do NOT remove_user, which
+            // would silently deactivate the winner's freshly-provisioned
+            // account: 201 to them, no error, no retry, but is_active=0).
+            if (scim_store->get_by_username(input.user_name).has_value()) {
+                send_scim_error(res, 409, "userName already exists", "uniqueness");
+                audit(auth_mgr, audit_store, req, "scim.user.provisioned", "denied",
+                     input.user_name, "userName already exists (concurrent revive/create)");
+                record_request(auth_mgr, "create", 409);
+                return;
+            }
+            // No mapping — a genuine create failure. Roll back to a
+            // deactivated tombstone ONLY if THIS call created the auth row
+            // (the fresh-create branch): the next POST for the same
+            // userName retries this exact step (provisioning_source ==
+            // "scim" still holds). In the REVIVE branch the account
+            // pre-existed before this call — do NOT remove_user; leave the
+            // just-reactivated row as-is so the IdP's retry re-enters the
+            // revive branch above and adopts it (rolling it back here would
+            // just re-tombstone an account the retry has to re-revive for no
+            // benefit, and risks racing a DIFFERENT concurrent caller that
+            // is also reviving the same identity).
+            if (created_auth_row_this_call)
+                auth_mgr->remove_user(input.user_name);
             send_scim_error(res, 500, "failed to create the SCIM resource mapping");
             audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure",
                  input.user_name);
@@ -585,7 +655,24 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                              "for '{}' — the account remains active",
                              input.user_name);
             }
-            scim_store->set_active(resource->scim_id, false);
+            // UP-N3 (FIX-3): check the ScimStore mirror write — previously
+            // unchecked, so a failure here silently shipped a 201 body
+            // claiming active:true while the underlying account was already
+            // deactivated. Fail closed (500); the IdP retries the whole
+            // POST, which now sees the live mapping at Step 1 (409) or, if
+            // the account genuinely ends up torn down first, the revive
+            // path — either way the retry reconciles it.
+            if (!scim_store->set_active(resource->scim_id, false)) {
+                spdlog::error("ScimRoutes: ScimStore::set_active(false) failed honouring "
+                             "active:false on create for scim_id={} — inconsistent state, "
+                             "failing closed so the IdP retries",
+                             resource->scim_id);
+                send_scim_error(res, 500, "failed to persist the deactivated state");
+                audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure",
+                     input.user_name);
+                record_request(auth_mgr, "create", 500);
+                return;
+            }
             // S-POST-REFETCH: re-fetch so the 201 body's ETag/meta.version/
             // lastModified reflect the bump set_active just made — PUT/PATCH
             // already re-fetch after their own mutations; mirror that here
@@ -601,9 +688,9 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         res.set_header("Location", base + "/" + resource->scim_id);
         res.set_header("ETag", "W/\"" + std::to_string(resource->etag_version) + "\"");
         res.set_content(scim::user_to_json(*resource, base).dump(), kScimJson);
-        // "provisioned" is NOT a termination action — set-and-proceed per
-        // the class distinction in M-AUDIT-FAILCLOSED; the 201 above already
-        // committed regardless of whether this row persists.
+        // set-and-proceed (every SCIM audit call is, per `audit()`'s doc
+        // comment) — the 201 above already committed regardless of whether
+        // this row persists.
         audit(auth_mgr, audit_store, req, "scim.user.provisioned", "success", resource->scim_id);
         record_request(auth_mgr, "create", 201);
     });
@@ -958,12 +1045,21 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                    // M-ATOMICITY (UP-5): check the ScimStore write too. On
                    // the resource->active branch above, the AuthManager
                    // write already succeeded — a failure here leaves the
-                   // account deactivated but the mapping row still present;
-                   // fail closed so the IdP retries (idempotent:
-                   // remove_user no-ops on an already-inactive row,
-                   // delete_by_scim_id re-applies against the still-present
-                   // row).
-                   if (!scim_store->delete_by_scim_id(id)) {
+                   // account deactivated but the mapping row still present.
+                   // delete_by_scim_id's tri-state return distinguishes a
+                   // real DB error (nullopt — fail closed below so the IdP
+                   // retries) from "the mapping row is already gone" (false
+                   // — a concurrent/duplicate DELETE beat us to it; UP-N4/
+                   // FIX-4: that is idempotent SUCCESS, not a failure — the
+                   // account is deleted either way). Retry safety for the
+                   // resource->active branch above comes from the handler's
+                   // own re-fetch-and-skip (a retry sees resource->active ==
+                   // false and takes the already-deactivated branch instead
+                   // of re-calling remove_user), not from remove_user()
+                   // itself being a true no-op — see deactivate()'s
+                   // M-ATOMICITY comment for why that distinction matters.
+                   auto delete_result = scim_store->delete_by_scim_id(id);
+                   if (!delete_result.has_value()) {
                        spdlog::error("ScimRoutes: ScimStore::delete_by_scim_id failed for "
                                     "scim_id={}",
                                     id);
@@ -972,15 +1068,15 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                        record_request(auth_mgr, "delete", 500);
                        return;
                    }
-                   // M-AUDIT-FAILCLOSED: a lost termination audit breaks
-                   // CC6.8 evidence — fail closed rather than report 204
-                   // with no evidence row.
-                   if (!audit(auth_mgr, audit_store, req, "scim.user.deleted", "success", id)) {
-                       send_scim_error(res, 500,
-                                      "state changed but the audit record failed to persist");
-                       record_request(auth_mgr, "delete", 500);
-                       return;
+                   if (!*delete_result) {
+                       spdlog::info("ScimRoutes: DELETE scim_id={} — mapping row already gone "
+                                   "(concurrent/duplicate DELETE); treating as idempotent "
+                                   "success",
+                                   id);
                    }
+                   // Set-and-proceed (UP-N2) — see the matching comment in
+                   // `deactivate()`.
+                   audit(auth_mgr, audit_store, req, "scim.user.deleted", "success", id);
                    res.status = 204;
                    record_request(auth_mgr, "delete", 204);
                });
