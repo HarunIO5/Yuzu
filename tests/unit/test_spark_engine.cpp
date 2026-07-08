@@ -563,6 +563,39 @@ TEST_CASE("SparkEngine: register_consumer racing stop() never strands an unjoine
     // (std::terminate), not just fails an assertion.
 }
 
+TEST_CASE("SparkEngine: register_consumer vs stop() under REAL concurrent scheduling "
+          "never crashes (stress, governance quality-engineer finding, PR #1927)",
+          "[spark][engine][stress]") {
+    // The deterministic hook-based test above proves the re-check-then-branch
+    // LOGIC is correct, but runs entirely on one thread — it would pass
+    // identically even if stopped_ were reverted to a plain (non-atomic)
+    // bool, since nothing there needs a second thread's write to become
+    // visible. This test exercises the actual cross-thread memory-ordering
+    // half of the fix with real concurrent scheduling and no seam, so a
+    // future regression back to a non-atomic stopped_ has a real chance of
+    // being caught here — and under the nightly TSan leg, which this test
+    // is written for.
+    for (int trial = 0; trial < 500; ++trial) {
+        SparkEngine engine;
+        engine.start();
+        std::atomic<bool> go{false};
+        std::thread registrar([&] {
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            // Result intentionally unchecked: either outcome (won or lost the
+            // race) is valid. A no-op handler captures nothing, so even a
+            // detached-but-never-armed consumer thread (see the sibling
+            // deterministic test's own reasoning) can never touch freed test
+            // state.
+            (void)engine.register_consumer("racer", [](const SparkEvent&) {});
+        });
+        go.store(true, std::memory_order_release);
+        engine.stop();
+        registrar.join();
+    }
+    SUCCEED("500 concurrent register_consumer()/stop() trials completed without a crash or hang");
+}
+
 TEST_CASE("SparkEngine: stop is prompt and idempotent; engine is single-shot",
           "[spark][engine]") {
     SparkEngine engine;

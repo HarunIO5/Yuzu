@@ -106,6 +106,7 @@ SparkEngine::register_consumer(std::string name, QueuedHandler handler, std::siz
     // exists to close — instead of relying on a flaky multi-threaded race.
     if (register_race_hook_for_test_)
         register_race_hook_for_test_();
+    bool inserted = false;
     {
         std::lock_guard lk(consumers_mu_);
         // Re-check: stop() can land between the stopped_ check above and this
@@ -116,13 +117,23 @@ SparkEngine::register_consumer(std::string name, QueuedHandler handler, std::siz
         // terminates the process at destruction. That breaks this header's own
         // "register safe from any thread" contract (governance Tr3kkR finding,
         // PR #1927 review).
-        if (stopped_) {
-            // Lost the race: quiesce the just-started thread ourselves, exactly
-            // as stop() would have, before reporting failure.
-            quiesce_consumer(consumer);
-            return std::unexpected("engine is stopped");
+        if (!stopped_) {
+            consumers_.emplace(id, consumer);
+            inserted = true;
         }
-        consumers_.emplace(id, std::move(consumer));
+    }
+    if (!inserted) {
+        // Lost the race: quiesce the just-started thread ourselves, exactly as
+        // stop() would have, before reporting failure — OUTSIDE consumers_mu_.
+        // quiesce_consumer's bounded join may block up to
+        // consumer_join_budget_ms_; every other consumers_mu_ site (arm,
+        // unregister_consumer, emit_event's dispatch, stats, and a
+        // concurrently running real stop()'s own swap) must never stall
+        // behind it — mirrors disarm()'s and stop()'s own "release the lock
+        // before anything that may block" discipline (governance cpp-expert /
+        // cpp-safety finding, PR #1927 review).
+        quiesce_consumer(consumer);
+        return std::unexpected("engine is stopped");
     }
     return id;
 }
