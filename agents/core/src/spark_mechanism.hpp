@@ -70,6 +70,29 @@ using SparkEmitFn = std::function<void(const std::string& key, SparkData data)>;
 using SparkFaultFn =
     std::function<void(const std::string& key, bool faulted, std::string_view reason)>;
 
+/// Point-in-time mechanism-internal counters (#1979), folded into
+/// SparkEngineStats' mech_* fields by SparkEngine::stats() and surfaced the
+/// same way (agent heartbeat status_tags — no /metrics endpoint). Every field
+/// defaults to 0, so a mechanism with nothing to report (the cross-platform
+/// test fake, spark_registry, spark_service today) needs no code — only
+/// spark_file.cpp's teardown-quarantine machinery has anything to say yet.
+struct SparkMechanismStats {
+    /// Watches cancelled (unwatch() or a superseded ancestor) but not yet
+    /// drained by the mechanism's own worker — the #1979 retiring_ gauge.
+    std::uint64_t retiring{0};
+    /// New watches refused because retiring_ was at its cap (#1979) — a
+    /// failed arm() call at the SparkEngine layer, never silent.
+    std::uint64_t watch_rejected_total{0};
+    /// Watches leaked to process lifetime because a cancelled I/O's
+    /// completion never arrived within the shutdown budget (#1982) — should
+    /// stay 0 in practice; the retiring_ cap bounds it structurally.
+    std::uint64_t quarantined_total{0};
+    /// Mechanism-internal operations that took longer than the mechanism's
+    /// own "slow" threshold while holding its lock (#1980) — an early warning
+    /// for a stalled watcher, not a hard fault.
+    std::uint64_t slow_op_total{0};
+};
+
 /// One watch mechanism for one event-driven SparkType. Lifecycle mirrors the
 /// engine: register (pre-start) → start(emit, fault) → watch/unwatch as sparks
 /// arm/disarm while running → stop(). The engine calls start / watch / unwatch
@@ -109,6 +132,12 @@ public:
     /// BEFORE consumer dispatch threads — a mechanism is a producer, like the
     /// wheel, so it must quiesce before its downstream consumers.
     virtual void stop() = 0;
+
+    /// Point-in-time counters (#1979). Callable from any thread without
+    /// engine-lock coordination — an implementation with counters to report
+    /// backs them with atomics, never a lock shared with watch/unwatch/stop.
+    /// Defaulted so existing/fake mechanisms need no change.
+    [[nodiscard]] virtual SparkMechanismStats stats() const { return {}; }
 };
 
 /// Platform factory: a real IOCP + ReadDirectoryChangesW file-change mechanism

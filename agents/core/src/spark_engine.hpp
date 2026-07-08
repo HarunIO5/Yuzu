@@ -101,6 +101,12 @@ struct SparkEngineStats {
     std::uint64_t inline_us_max{0};
     std::uint64_t inline_over_100us_total{0}; ///< tail counter (p-high proxy)
     std::uint64_t inline_over_10ms_total{0};  ///< scheduler-quantum-class outliers
+    // Summed across every registered mechanism's stats() (#1979); see
+    // SparkMechanismStats for per-field meaning.
+    std::uint64_t mech_retiring{0};
+    std::uint64_t mech_watch_rejected_total{0};
+    std::uint64_t mech_quarantined_total{0};
+    std::uint64_t mech_slow_op_total{0};
 };
 
 class YUZU_EXPORT SparkEngine {

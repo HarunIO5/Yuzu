@@ -114,6 +114,12 @@ struct DirWatch {
 /// (already off the engine lock).
 class WindowsFileMechanism final : public ISparkMechanism {
 public:
+    /// Bounds retiring_ growth under re-arm churn faster than the single
+    /// worker thread can drain (#1979). ~256 * sizeof(DirWatch) (dominated by
+    /// the 32 KiB notify buffer) is worst-case ~8.5 MiB pinned — generous
+    /// against real churn, small against unbounded growth.
+    static constexpr std::size_t kRetiringCap = 256;
+
     ~WindowsFileMechanism() override { stop(); }
 
     void start(SparkEmitFn emit, SparkFaultFn fault) override {
@@ -145,6 +151,20 @@ public:
         std::lock_guard lk(mu_);
         if (!iocp_)
             return std::unexpected("file mechanism not started");
+        // #1979: refuse NEW work while too many cancelled watches are still
+        // awaiting their drained IOCP completion — re-arm churn faster than
+        // the single worker thread can drain would otherwise grow retiring_
+        // unbounded. Teardown (unwatch/release_ancestor below) is NEVER
+        // gated — only this entry point, which is the sole producer of new
+        // pending-I/O DirWatches, so the cap bounds growth even though
+        // retiring_ can transiently exceed it while in-flight teardowns land.
+        if (retiring_.size() >= kRetiringCap) {
+            watch_rejected_.fetch_add(1, std::memory_order_relaxed);
+            return std::unexpected(
+                std::string("file mechanism: ") + std::to_string(retiring_.size()) +
+                " watch(es) awaiting IOCP teardown (cap " + std::to_string(kRetiringCap) +
+                ") — arm refused");
+        }
         // #1981: a re-arm of THIS key against a DIFFERENT (dirkey, fname) than
         // its current registration — e.g. an authored path change on config
         // reload/redeploy, with no intervening explicit unwatch(key) — must
@@ -271,16 +291,44 @@ public:
             spdlog::error("spark_file: shutdown drain lost a completion — quarantined {} "
                           "outstanding watch(es) to process lifetime to avoid a UAF",
                           leaked);
+            quarantined_.fetch_add(leaked, std::memory_order_relaxed);
         }
         dirs_.clear();
         ancestors_.clear();
+        // Every entry still in retiring_ at this point is about to be freed
+        // (safely-drained) or was already moved to s_quarantine above — either
+        // way it's no longer "awaiting a drained completion" (#1979).
+        retiring_gauge_.fetch_sub(retiring_.size(), std::memory_order_relaxed);
         retiring_.clear();
         iocp_.reset();
         emit_ = nullptr;
         fault_ = nullptr;
     }
 
+    /// Lock-free — callable from any thread without coordinating with mu_
+    /// (#1979).
+    [[nodiscard]] SparkMechanismStats stats() const override {
+        return {
+            .retiring = retiring_gauge_.load(std::memory_order_relaxed),
+            .watch_rejected_total = watch_rejected_.load(std::memory_order_relaxed),
+            .quarantined_total = quarantined_.load(std::memory_order_relaxed),
+            .slow_op_total = slow_op_.load(std::memory_order_relaxed),
+        };
+    }
+
 private:
+    /// Move a cancelled-but-still-io_pending DirWatch into retiring_, bumping
+    /// the gauge and warning once per cap/2 crossing (#1979) — the single
+    /// choke point unwatch_locked() and release_ancestor() both route a
+    /// cancelled DirWatch through, so the gauge and the cap in watch() stay
+    /// consistent with each other regardless of which caller triggered it.
+    void push_retiring(std::unique_ptr<DirWatch> w) {
+        retiring_.push_back(std::move(w));
+        if (retiring_gauge_.fetch_add(1, std::memory_order_relaxed) + 1 == kRetiringCap / 2)
+            spdlog::warn("spark_file: retiring_ crossed {} of {} pending IOCP teardowns",
+                         kRetiringCap / 2, kRetiringCap);
+    }
+
     /// Core of unwatch(); ASSUMES mu_ IS ALREADY HELD. Also called by watch()
     /// to implicitly clear a stale key_index_ registration before re-arming
     /// the same key against a different (dirkey, fname) — see watch() (#1981).
@@ -322,7 +370,7 @@ private:
                 // is no live ReadDirectoryChangesW behind it (governance
                 // finding, PR #1927 review), matching release_ancestor's
                 // existing retiring_ pattern above.
-                retiring_.push_back(std::move(di->second));
+                push_retiring(std::move(di->second));
                 dirs_.erase(di);
             } else {
                 dirs_.erase(di);
@@ -423,7 +471,7 @@ private:
         if (it->second->handle && it->second->io_pending) {
             it->second->removing = true;
             ::CancelIoEx(it->second->handle.get(), &it->second->ov);
-            retiring_.push_back(std::move(it->second));
+            push_retiring(std::move(it->second));
         }
         ancestors_.erase(it);
     }
@@ -592,6 +640,7 @@ private:
         for (auto it = retiring_.begin(); it != retiring_.end(); ++it)
             if (it->get() == w) {
                 retiring_.erase(it);
+                retiring_gauge_.fetch_sub(1, std::memory_order_relaxed);
                 return;
             }
     }
@@ -606,6 +655,13 @@ private:
     std::unordered_map<std::wstring, std::unique_ptr<DirWatch>> ancestors_; ///< recreate-recovery
     std::vector<std::unique_ptr<DirWatch>> retiring_; ///< ancestors awaiting a drained completion
     std::unordered_map<std::string, std::pair<std::wstring, std::wstring>> key_index_; ///< key→(dir,fname)
+
+    // #1979 stats (SparkMechanismStats) — atomic, no lock shared with mu_ so
+    // stats() never blocks on or contends with watch/unwatch/stop.
+    std::atomic<std::uint64_t> retiring_gauge_{0};
+    std::atomic<std::uint64_t> watch_rejected_{0};
+    std::atomic<std::uint64_t> quarantined_{0};
+    std::atomic<std::uint64_t> slow_op_{0}; ///< bumped by PR-E (#1980)
 };
 
 } // namespace

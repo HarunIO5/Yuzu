@@ -1403,6 +1403,107 @@ TEST_CASE("File spark (real mechanism): watch() on an existing key with a differ
     fs::remove_all(dirB, ec);
 }
 
+TEST_CASE("File spark (real mechanism): retiring_ is capped and observable under "
+          "re-arm churn while the worker is wedged (#1979/#1982)",
+          "[spark][mechanism][windows][resilience]") {
+    // Determinism trick: the mechanism has ONE worker draining its IOCP, and
+    // it calls emit_ with mu_ RELEASED (spark_file.cpp run()) — a blocking
+    // emit callback therefore wedges the drain loop deterministically while
+    // watch()/unwatch() stay fully operable (they only need mu_, not the
+    // worker). Flood retiring_ past the cap while the worker can't drain,
+    // confirm it's bounded + observable + a fresh watch() is refused, then
+    // release the gate and confirm a full drain plus a prompt, leak-free stop().
+    namespace fs = std::filesystem;
+    const auto pid = std::to_string(::GetCurrentProcessId());
+    const fs::path trigger_dir = fs::temp_directory_path() / ("spark_1979_trig_" + pid);
+    std::error_code ec;
+    fs::remove_all(trigger_dir, ec);
+    fs::create_directories(trigger_dir);
+    const fs::path trigger_file = trigger_dir / "t.txt";
+    { std::ofstream(trigger_file) << "seed"; }
+
+    struct Gate {
+        std::mutex m;
+        std::condition_variable cv;
+        bool release{false};
+        std::atomic<int> emit_calls{0};
+        void wait() {
+            emit_calls.fetch_add(1);
+            std::unique_lock lk(m);
+            cv.wait(lk, [&] { return release; });
+        }
+        void open() {
+            {
+                std::lock_guard lk(m);
+                release = true;
+            }
+            cv.notify_all();
+        }
+    };
+    auto gate = std::make_shared<Gate>();
+
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+    // If any assertion below fails, Catch2 unwinds the stack — this guard's
+    // destructor (declared AFTER mech, so it runs BEFORE mech's own
+    // destructor per reverse-declaration-order) opens the gate unconditionally
+    // first. Without it, a failed assertion here leaves the worker wedged in
+    // emit() forever, and ~WindowsFileMechanism's stop()/worker_.join() hangs
+    // the WHOLE test binary, not just this test case.
+    struct GateOpener {
+        std::shared_ptr<Gate> g;
+        ~GateOpener() { g->open(); }
+    } gate_opener{gate};
+
+    mech->start([gate](const std::string&, SparkData) { gate->wait(); },
+                [](const std::string&, bool, std::string_view) {});
+
+    REQUIRE(mech->watch("trigger", FileSparkParams{trigger_file.string()}).has_value());
+    std::this_thread::sleep_for(150ms); // let the read arm
+
+    { std::ofstream(trigger_file, std::ios::app) << "change"; } // fires → worker blocks in emit()
+    CHECK(eventually([&] { return gate->emit_calls.load() >= 1; }));
+
+    // must match WindowsFileMechanism::kRetiringCap in spark_file.cpp
+    constexpr std::size_t kRetiringCapForTest = 256;
+    std::vector<fs::path> flood_dirs;
+    for (std::size_t i = 0; i < kRetiringCapForTest + 8; ++i) {
+        fs::path d = fs::temp_directory_path() /
+                     ("spark_1979_flood_" + pid + "_" + std::to_string(i));
+        fs::create_directories(d);
+        flood_dirs.push_back(d);
+        const std::string key = "flood" + std::to_string(i);
+        // NOT a REQUIRE: this loop deliberately floods PAST the cap, so once
+        // retiring_ hits kRetiringCapForTest mid-loop, watch() is SUPPOSED to
+        // start refusing — that's the mechanism under test, not a failure.
+        // unwatch() on a key whose arm was refused (never in key_index_) is a
+        // safe no-op, so it's fine to call unconditionally either way.
+        (void)mech->watch(key, FileSparkParams{(d / "f.txt").string()});
+        mech->unwatch(key); // cancels the just-armed read (if it armed) → retiring_
+    }
+
+    // The worker can't drain (wedged in emit()) — retiring_ must be bounded,
+    // observable, and refuse further growth rather than growing unbounded.
+    CHECK(mech->stats().retiring >= kRetiringCapForTest);
+    auto refused =
+        mech->watch("overflow", FileSparkParams{(trigger_dir / "overflow.txt").string()});
+    CHECK_FALSE(refused.has_value());
+    CHECK(mech->stats().watch_rejected_total >= 1);
+
+    gate->open(); // let the worker drain everything
+    CHECK(eventually([&] { return mech->stats().retiring == 0; }, 10000ms));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    mech->stop();
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(elapsed < 5000ms);
+    CHECK(mech->stats().quarantined_total == 0); // the cap kept this reachable in the first place
+
+    for (auto& d : flood_dirs)
+        fs::remove_all(d, ec);
+    fs::remove_all(trigger_dir, ec);
+}
+
 TEST_CASE("Registry spark (real mechanism): survives key delete + recreate",
           "[spark][mechanism][windows][resilience]") {
     const std::string sub =

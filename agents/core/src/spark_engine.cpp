@@ -920,6 +920,17 @@ SparkEngineStats SparkEngine::stats() const {
         // mechanism (a mechanism may itself run a small pool — this is a unit
         // count, not an OS-thread count; hence _units, not _threads).
         s.watcher_units = running_ ? (1 + mechanisms_.size()) : 0;
+        // Sum every mechanism's own counters (#1979). mechanisms_ is
+        // structurally stable post-registration and stats() is atomic-only
+        // (never shares a lock with watch/unwatch/stop), so calling it here
+        // under mu_ is safe — no blocking, no reentrancy into the engine.
+        for (const auto& [type, m] : mechanisms_) {
+            const auto ms = m->stats();
+            s.mech_retiring += ms.retiring;
+            s.mech_watch_rejected_total += ms.watch_rejected_total;
+            s.mech_quarantined_total += ms.quarantined_total;
+            s.mech_slow_op_total += ms.slow_op_total;
+        }
     }
     {
         std::lock_guard lk(consumers_mu_);
