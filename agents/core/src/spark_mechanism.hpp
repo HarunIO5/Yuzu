@@ -76,10 +76,21 @@ using SparkFaultFn =
 /// defaults to 0, so a mechanism with nothing to report (the cross-platform
 /// test fake, spark_registry, spark_service today) needs no code — only
 /// spark_file.cpp's teardown-quarantine machinery has anything to say yet.
+///
+/// CONSISTENCY CONTRACT: the fields are backed by independent atomics read
+/// without a shared lock, so a returned SparkMechanismStats is a point-in-time
+/// SKEW, not a coherent snapshot — never derive an invariant across two fields
+/// (e.g. do not assert `retiring <= retiring_cap` from a single read; each was
+/// sampled at a slightly different instant). Treat each field as its own gauge.
 struct SparkMechanismStats {
     /// Watches cancelled (unwatch() or a superseded ancestor) but not yet
     /// drained by the mechanism's own worker — the #1979 retiring_ gauge.
     std::uint64_t retiring{0};
+    /// The mechanism's fixed cap on `retiring` past which new watch() calls
+    /// are refused (#1979); 0 means "no cap / not applicable". Exposed so an
+    /// operator (and the test) can read how close `retiring` is to the limit
+    /// rather than hardcoding the constant.
+    std::uint64_t retiring_cap{0};
     /// New watches refused because retiring_ was at its cap (#1979) — a
     /// failed arm() call at the SparkEngine layer, never silent.
     std::uint64_t watch_rejected_total{0};

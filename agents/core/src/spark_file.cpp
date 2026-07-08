@@ -310,6 +310,7 @@ public:
     [[nodiscard]] SparkMechanismStats stats() const override {
         return {
             .retiring = retiring_gauge_.load(std::memory_order_relaxed),
+            .retiring_cap = kRetiringCap,
             .watch_rejected_total = watch_rejected_.load(std::memory_order_relaxed),
             .quarantined_total = quarantined_.load(std::memory_order_relaxed),
             .slow_op_total = slow_op_.load(std::memory_order_relaxed),
@@ -382,7 +383,11 @@ private:
     /// and warn (#1980). Both arm_dir() and arm_ancestor() run under mu_ (the
     /// mechanism's only lock) and can block on a slow/unresponsive filesystem
     /// path — this is an early warning sign of a stalled watcher, not a hard
-    /// fault, so it never changes behavior, only observability.
+    /// fault, so it never changes behavior, only observability. slow_op_total
+    /// is an APPROXIMATE early-warning gauge, not an exact count: a single slow
+    /// ancestor-arm can be counted twice because arm_ancestor's guard wraps the
+    /// nested arm_dir() call which has its own guard. Treat non-zero as "a watch
+    /// arm is stalling — investigate", not as a precise event tally.
     void note_if_slow(std::chrono::steady_clock::time_point t0, const char* what,
                       const std::wstring& dir) {
         const auto elapsed = std::chrono::steady_clock::now() - t0;
@@ -468,7 +473,11 @@ private:
         // mu_) for an unbounded time.
         for (fs::path prev; !anc.empty() && anc != prev && !fs::is_directory(anc, ec);) {
             if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(500)) {
-                slow_op_.fetch_add(1, std::memory_order_relaxed);
+                // NOT slow_op_.fetch_add here — the `guard` above already counts
+                // this via note_if_slow on scope exit (elapsed > 500ms > 100ms),
+                // so an explicit increment would double-count (cpp-safety Gate 3).
+                // Keep only the abandon-specific warn, which is more informative
+                // than note_if_slow's generic ">Nms" line.
                 spdlog::warn("spark_file: ancestor walk from '{}' exceeded 500ms — abandoning "
                              "(a path on this chain may be an unresponsive network share)",
                              fs::path(dependent.dir).string());

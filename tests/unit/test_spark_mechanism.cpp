@@ -530,7 +530,14 @@ TEST_CASE("File spark: a late unwatch from a torn-down arm does not clobber a "
 
 TEST_CASE("File spark: disarm() racing an equal-spec arm() under REAL concurrent "
           "scheduling never tears down a fresh watch (stress, #1994 M2)",
-          "[spark][mechanism]") {
+          "[spark][mechanism][stress]") {
+    // Companion to the deterministic hook test above (which forces the exact
+    // interleaving and is the actual proof of the recheck-then-skip logic).
+    // This twin runs the two ops on real threads with no seam: it does NOT
+    // reliably hit the nanosecond race window (measured ~0.11s for 500 trials
+    // on an idle runner — the window is almost never hit), so its value is
+    // exercising the cross-thread memory-ordering of mech_ops_mu_/mu_ under
+    // TSan, not interleaving coverage. Mirrors the M1 stress twin's framing.
     for (int trial = 0; trial < 500; ++trial) {
         SparkEngine engine;
         FakeMechanism* fake = wire_fake(engine, SparkType::File);
@@ -546,15 +553,21 @@ TEST_CASE("File spark: disarm() racing an equal-spec arm() under REAL concurrent
         REQUIRE(s1.has_value());
 
         std::atomic<bool> go{false};
+        // Catch2 assertion macros are NOT thread-safe and a failed REQUIRE
+        // throws — off the main thread that escapes the std::thread and
+        // std::terminate()s the whole binary (security-guardian/cpp-safety
+        // Gate 2/3). Capture the result and assert on the main thread after
+        // join(), matching the M1 stress twin.
+        std::atomic<bool> rearm_ok{false};
         std::thread rearmer([&] {
             while (!go.load(std::memory_order_acquire))
                 std::this_thread::yield();
-            auto s2 = engine.arm(*c2, spec);
-            REQUIRE(s2.has_value());
+            rearm_ok.store(engine.arm(*c2, spec).has_value(), std::memory_order_release);
         });
         go.store(true, std::memory_order_release);
         engine.disarm(*s1);
         rearmer.join();
+        CHECK(rearm_ok.load(std::memory_order_acquire));
 
         // Invariant under test regardless of interleaving order: if armed_
         // still shows the key armed (c2's subscription survived), the
@@ -1356,6 +1369,19 @@ TEST_CASE("File spark (real mechanism): watch() on an existing key with a differ
     { std::ofstream(fileA) << "seed"; }
     { std::ofstream(fileB) << "seed"; }
 
+    // Exception-safe cleanup (quality-engineer Gate 3): a failed assertion
+    // would otherwise skip the trailing remove_all and leak dirA/dirB.
+    // Declared before `mech` so it runs after ~mech closes its handles.
+    struct DirCleanup {
+        const fs::path& a;
+        const fs::path& b;
+        ~DirCleanup() {
+            std::error_code e;
+            fs::remove_all(a, e);
+            fs::remove_all(b, e);
+        }
+    } dir_cleanup{dirA, dirB};
+
     struct Fires {
         std::mutex mu;
         std::vector<std::string> keys;
@@ -1399,8 +1425,7 @@ TEST_CASE("File spark (real mechanism): watch() on an existing key with a differ
     mech->unwatch(key);
     std::this_thread::sleep_for(150ms); // let the worker drain the cancelled read
     mech->stop();
-    fs::remove_all(dirA, ec);
-    fs::remove_all(dirB, ec);
+    // dirA/dirB removed by DirCleanup on scope exit.
 }
 
 TEST_CASE("File spark (real mechanism): retiring_ is capped and observable under "
@@ -1421,6 +1446,27 @@ TEST_CASE("File spark (real mechanism): retiring_ is capped and observable under
     fs::create_directories(trigger_dir);
     const fs::path trigger_file = trigger_dir / "t.txt";
     { std::ofstream(trigger_file) << "seed"; }
+
+    // Populated by the flood loop below; captured by reference into the cleanup
+    // guard declared next.
+    std::vector<fs::path> flood_dirs;
+
+    // Exception-safe temp-dir cleanup (quality-engineer Gate 3): a failed
+    // REQUIRE/CHECK unwinds past the trailing remove_all calls, otherwise
+    // leaking up to kRetiringCap+8 PID-salted dirs. Declared BEFORE `mech` so
+    // (reverse-declaration order) it runs AFTER ~mech has stop()'d/joined and
+    // closed every directory handle — removing dirs with live handles open
+    // would silently fail. Declared AFTER flood_dirs so flood_dirs outlives it.
+    struct DirCleanup {
+        const fs::path& trig;
+        const std::vector<fs::path>& floods;
+        ~DirCleanup() {
+            std::error_code e;
+            for (const auto& d : floods)
+                fs::remove_all(d, e);
+            fs::remove_all(trig, e);
+        }
+    } dir_cleanup{trigger_dir, flood_dirs};
 
     struct Gate {
         std::mutex m;
@@ -1444,6 +1490,12 @@ TEST_CASE("File spark (real mechanism): retiring_ is capped and observable under
 
     auto mech = make_file_mechanism();
     REQUIRE(mech);
+    // The mechanism's own cap — read live rather than duplicating the 256
+    // literal, so a change to WindowsFileMechanism::kRetiringCap can't leave a
+    // silently-wrong constant here (quality-engineer Gate 3).
+    const std::uint64_t cap = mech->stats().retiring_cap;
+    REQUIRE(cap > 0);
+
     // If any assertion below fails, Catch2 unwinds the stack — this guard's
     // destructor (declared AFTER mech, so it runs BEFORE mech's own
     // destructor per reverse-declaration-order) opens the gate unconditionally
@@ -1464,18 +1516,15 @@ TEST_CASE("File spark (real mechanism): retiring_ is capped and observable under
     { std::ofstream(trigger_file, std::ios::app) << "change"; } // fires → worker blocks in emit()
     CHECK(eventually([&] { return gate->emit_calls.load() >= 1; }));
 
-    // must match WindowsFileMechanism::kRetiringCap in spark_file.cpp
-    constexpr std::size_t kRetiringCapForTest = 256;
-    std::vector<fs::path> flood_dirs;
-    for (std::size_t i = 0; i < kRetiringCapForTest + 8; ++i) {
+    for (std::uint64_t i = 0; i < cap + 8; ++i) {
         fs::path d = fs::temp_directory_path() /
                      ("spark_1979_flood_" + pid + "_" + std::to_string(i));
         fs::create_directories(d);
         flood_dirs.push_back(d);
         const std::string key = "flood" + std::to_string(i);
         // NOT a REQUIRE: this loop deliberately floods PAST the cap, so once
-        // retiring_ hits kRetiringCapForTest mid-loop, watch() is SUPPOSED to
-        // start refusing — that's the mechanism under test, not a failure.
+        // retiring_ hits the cap mid-loop, watch() is SUPPOSED to start
+        // refusing — that's the mechanism under test, not a failure.
         // unwatch() on a key whose arm was refused (never in key_index_) is a
         // safe no-op, so it's fine to call unconditionally either way.
         (void)mech->watch(key, FileSparkParams{(d / "f.txt").string()});
@@ -1484,10 +1533,14 @@ TEST_CASE("File spark (real mechanism): retiring_ is capped and observable under
 
     // The worker can't drain (wedged in emit()) — retiring_ must be bounded,
     // observable, and refuse further growth rather than growing unbounded.
-    CHECK(mech->stats().retiring >= kRetiringCapForTest);
+    CHECK(mech->stats().retiring >= cap);
     auto refused =
         mech->watch("overflow", FileSparkParams{(trigger_dir / "overflow.txt").string()});
-    CHECK_FALSE(refused.has_value());
+    REQUIRE_FALSE(refused.has_value());
+    // Assert it's the CAP rejection specifically, not some unrelated failure
+    // (e.g. a not-started mechanism) that would also produce an empty expected
+    // (quality-engineer Gate 3).
+    CHECK(refused.error().find("cap") != std::string::npos);
     CHECK(mech->stats().watch_rejected_total >= 1);
 
     gate->open(); // let the worker drain everything
@@ -1498,10 +1551,7 @@ TEST_CASE("File spark (real mechanism): retiring_ is capped and observable under
     const auto elapsed = std::chrono::steady_clock::now() - t0;
     CHECK(elapsed < 5000ms);
     CHECK(mech->stats().quarantined_total == 0); // the cap kept this reachable in the first place
-
-    for (auto& d : flood_dirs)
-        fs::remove_all(d, ec);
-    fs::remove_all(trigger_dir, ec);
+    // trigger_dir + flood_dirs removed by DirCleanup on scope exit.
 }
 
 TEST_CASE("Registry spark (real mechanism): survives key delete + recreate",

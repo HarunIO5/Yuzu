@@ -334,21 +334,32 @@ private:
     /// Lock order: mech_ops_mu_ → mu_, NEVER reversed; mechanism worker
     /// threads (wheel/IOCP/TP_WAIT callbacks) call emit()/fault() with their
     /// own internal lock released and never touch mech_ops_mu_, so there is no
-    /// cycle. Coarsened to per-engine (not per-key): arm/disarm are rare
+    /// cycle. REQUIRES (Stage-2 trap, enforced by convention): a mechanism must
+    /// deliver emit()/fault() ASYNCHRONOUSLY — off the watch()/unwatch() call
+    /// stack, from its own thread. A mechanism that fired emit() synchronously
+    /// from inside watch(), reaching an inline consumer that re-arms, would
+    /// re-enter arm_impl → mech_ops_mu_ and self-deadlock this non-recursive
+    /// lock. All shipped mechanisms emit from worker threads, so this holds
+    /// today; a future mechanism author must preserve it (cpp-safety Gate 3).
+    /// Coarsened to per-engine (not per-key): arm/disarm are rare
     /// control-plane operations, so a mechanism call briefly blocking another
     /// unrelated key's arm/disarm is an acceptable trade for not needing
     /// per-key generation tokens. KNOWN COUPLING (accepted, tracked): because
     /// this is ONE engine-wide lock rather than per-mechanism, a slow
-    /// watch() on one mechanism (e.g. a File watch stalling on an
-    /// unresponsive UNC path — itself now bounded to ~500ms by spark_file's
-    /// arm_ancestor deadline, #1980) blocks a concurrent unwatch() on a
-    /// DIFFERENT mechanism (e.g. Registry) that was fully independent before.
+    /// watch() on one mechanism blocks a concurrent unwatch() on a DIFFERENT
+    /// mechanism (e.g. File blocking Registry) that was fully independent
+    /// before. The "acceptable" defence rests on a BOUNDED worst-case watch(),
+    /// but that bound is currently FILE-ONLY (spark_file's ~500ms arm_ancestor
+    /// deadline, #1980); Registry (TP_WAIT) and Service (SCM query) watch
+    /// latencies are UNCHARACTERISED — a hung SCM RPC in Service::watch() would
+    /// stall this engine-wide lock with no proven bound (architect Gate 3).
     /// Only same-mechanism watch/unwatch were serialised previously (by each
     /// mechanism's own internal lock); this adds cross-mechanism serialisation
     /// that Stage 2's simultaneous File+Registry+Service guards will exercise.
     /// Correctness needs only same-KEY ordering; per-mechanism-type granularity
-    /// would drop the cross-mechanism coupling for modest extra bookkeeping —
-    /// deferred follow-up before Stage 2's real multi-mechanism load.
+    /// drops the cross-mechanism coupling for modest extra bookkeeping — this
+    /// is a HARD GATE before Stage 2 wires the SECOND live mechanism under
+    /// load, not an open-ended backlog item.
     mutable std::mutex mech_ops_mu_;
     std::condition_variable wheel_cv_;
     std::map<std::string, Armed> armed_; ///< by spark_key
