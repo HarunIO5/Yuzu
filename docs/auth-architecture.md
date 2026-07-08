@@ -1077,9 +1077,17 @@ that path. This exception is recorded in ADR-0022's exception ledger on
 acceptance. **gRPC** — a single server interceptor on the
 one `ServerBuilder` (`grpc_on_behalf_interceptor.hpp`) covers the agent,
 management, and gateway-upstream services and every future RPC method by
-construction; a call carrying a reserved metadata key is cancelled (client
-observes `CANCELLED`; best-effort — the handler may still run, tolerable
-because no handler reads these keys). **Gateway note:** the Erlang gateway's
+construction; a call carrying a reserved metadata key is cancelled via
+`ServerContext::TryCancel()` (client observes `CANCELLED`). `TryCancel()`
+alone does not stop a handler from running, so it is paired with an
+enforcement seam (`grpc_on_behalf_enforce.hpp`): the first statement of every
+RPC handler on `AgentServiceImpl` and `GatewayUpstreamServiceImpl`
+independently re-derives the same reserved-key check from
+`context->client_metadata()` (not `ServerContext::IsCancelled()` — its
+propagation from `TryCancel()` is not synchronous with handler dispatch,
+confirmed by an end-to-end test) — the call is a true no-op on that surface,
+not merely a wrong status code on an already-committed side effect. **Gateway
+note:** the Erlang gateway's
 own agent-facing listener reads only its known metadata keys and mints fresh
 upstream calls, so a reserved key sent to the gateway is dropped rather than
 rejected — tracked as a follow-up (Erlang-side reject, #1974) rather than an

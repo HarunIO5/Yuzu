@@ -7,20 +7,37 @@
 // server.cpp, so it covers the agent, management, and gateway-upstream
 // services alike.
 //
-// Rejection mechanics — BEST-EFFORT, know the limits: gRPC server
-// interceptors cannot synthesize a status of their own mid-stream, so the
-// guard cancels the RPC via ServerContext::TryCancel() — the client observes
-// CANCELLED. TryCancel does NOT prevent the application handler from running:
-// for a sync unary RPC the payload arrives with the call, the handler may
-// execute fully, and its side effects commit; only the client-visible status
-// changes. That residual is tolerable today because NO handler reads these
-// metadata keys — the assertion is inert either way, and the metric + warn
-// still fire — but this guard is a wire-level tripwire, not an enforcement
-// seam. When Phase 4 puts real machine traffic on this channel, the plan must
-// revisit with an enforceable seam (AuthMetadataProcessor on TLS builds, or
-// IsCancelled() at service entry). Defensive no-op today (no engine-principal
-// traffic crosses the agent gRPC channel under the plan's Decision 3); ships
-// now because the ADR rule binds on any surface from acceptance.
+// Rejection mechanics: gRPC server interceptors cannot synthesize a status of
+// their own mid-stream, so the guard cancels the RPC via
+// ServerContext::TryCancel() — a fast, transport-level abort the client
+// observes as CANCELLED. TryCancel does NOT prevent the application handler
+// from running: for a sync unary RPC the payload arrives with the call, the
+// handler may execute fully, and its side effects would commit before the
+// client-visible status changes. This interceptor is therefore a wire-level
+// tripwire, not by itself an enforcement seam.
+//
+// The enforcement seam is grpc_on_behalf_enforce.hpp's `call_rejected()`,
+// called as the first statement of every RPC handler reachable through the
+// ServerBuilder this interceptor is registered on (AgentServiceImpl,
+// GatewayUpstreamServiceImpl). It deliberately does NOT read
+// ServerContext::IsCancelled() — TryCancel()'s effect on that flag is not
+// synchronously visible to the handler thread (it propagates through
+// gRPC-core's internal call machinery on its own schedule, racing the
+// sync-server thread pool's handler dispatch; caught empirically by
+// test_grpc_on_behalf_enforce.cpp). Instead it independently re-derives the
+// same fact this interceptor computed, from the same ground truth
+// (`context->client_metadata()`, already complete and immutable by the time
+// any handler statement runs) — no shared mutable state, no race.
+//
+// The interceptor's own no-per-RPC-method-gap property (a single
+// registration, not a per-method check) is what makes the pairing sound: a
+// future new RPC method gets the TryCancel() half automatically by virtue of
+// being on the same ServerBuilder, and the enforcement half by convention
+// (call `call_rejected(context)` first, matching every existing handler).
+// Defensive no-op today in effect (no engine-principal traffic crosses the
+// agent gRPC channel under the plan's Decision 3, so no handler currently
+// reads these metadata keys) but now actually enforced, not merely inert;
+// ships now because the ADR rule binds on any surface from acceptance.
 
 #pragma once
 

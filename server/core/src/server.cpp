@@ -333,6 +333,18 @@ public:
         metrics_.describe("yuzu_http_requests_total",
                           "Total HTTP requests by method, status, and principal_class",
                           "counter");
+        // Pre-seed the closed principal_class dimension (docs/observability-
+        // conventions.md — every value of a closed-set label is initialised at
+        // startup, matching yuzu_onbehalf_rejected_total below). method/status
+        // are NOT closed sets, so a single representative GET/200 point per
+        // class is the seed — not a cross-product, which would be unbounded.
+        // "engine" is deliberately excluded: it is Phase-4-reserved and never
+        // emitted today (principal_class.hpp), so pre-seeding it now would
+        // advertise a series that cannot occur until that phase ships.
+        for (auto pc : {"human", "agent", "none"}) {
+            metrics_.counter("yuzu_http_requests_total",
+                             {{"method", "GET"}, {"status", "200"}, {"principal_class", pc}});
+        }
         // ADR-0022 Interim rules (execution-plan PR 1.1): rejected on-behalf-of
         // assertions, by ingress surface. Pre-seeded to 0 per
         // docs/observability-conventions.md so absent() alerts stay meaningful.
