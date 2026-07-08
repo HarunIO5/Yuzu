@@ -208,6 +208,18 @@ public:
     /// above: set before the register_consumer() call under test, no
     /// concurrent-access support.
     void set_register_race_hook_for_test(std::function<void()> hook);
+    /// Test seam: if set, invoked once inside arm_impl() after the mechanism
+    /// watch (if any) succeeds and before the post-insert consumer re-check —
+    /// lets a test deterministically force unregister_consumer() into the M1
+    /// ghost-subscription race window (#1994) instead of a timing-dependent
+    /// stress loop. Same set-then-use contract as the other race-hook seams.
+    void set_arm_race_hook_for_test(std::function<void()> hook);
+    /// Test seam: if set, invoked once inside disarm() and
+    /// unregister_consumer(), after mu_ is released and before the
+    /// staleness-rechecked mechanism unwatch() call — lets a test
+    /// deterministically force a concurrent equal-spec re-arm into the M2
+    /// late-unwatch race window (#1994). Same set-then-use contract.
+    void set_disarm_race_hook_for_test(std::function<void()> hook);
 
 private:
     struct Subscriber {
@@ -306,6 +318,21 @@ private:
 
     // armed sparks + subscription index + wheel state, all under mu_.
     mutable std::mutex mu_;
+    /// Serializes every mechanism watch()/unwatch() call engine-wide (#1994
+    /// M2). Without this, a disarm()'s pending unwatch(key) and a concurrent
+    /// re-arm's watch(key) for an equal spec can interleave out of order —
+    /// the late unwatch tears down the fresh watch while armed_ still shows
+    /// the key armed. Each call site re-checks armed_'s current state for the
+    /// key WHILE HOLDING this lock, immediately before issuing the mechanism
+    /// call, so the mechanism call always reflects the freshest armed_ state.
+    /// Lock order: mech_ops_mu_ → mu_, NEVER reversed; mechanism worker
+    /// threads (wheel/IOCP/TP_WAIT callbacks) call emit()/fault() with their
+    /// own internal lock released and never touch mech_ops_mu_, so there is no
+    /// cycle. Coarsened to per-engine (not per-key): arm/disarm are rare
+    /// control-plane operations, so a mechanism call briefly blocking another
+    /// unrelated key's arm/disarm is an acceptable trade for not needing
+    /// per-key generation tokens.
+    mutable std::mutex mech_ops_mu_;
     std::condition_variable wheel_cv_;
     std::map<std::string, Armed> armed_; ///< by spark_key
     std::map<SubscriptionId, std::string> sub_keys_;
@@ -336,6 +363,8 @@ private:
     std::atomic<std::uint64_t> cadence_floor_ms_{kMinCadenceMs}; ///< atomic: read at arm, set by test seam
     std::atomic<std::uint64_t> consumer_join_budget_ms_{kConsumerJoinBudgetMs}; ///< test seam
     std::function<void()> register_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
+    std::function<void()> arm_race_hook_for_test_;      ///< test seam; null = no-op (set-then-use)
+    std::function<void()> disarm_race_hook_for_test_;   ///< test seam; null = no-op (set-then-use)
 
     // Delivery counters touched by consumer dispatch threads live in a shared
     // block so a detached thread can write them after ~SparkEngine (UP-1). The

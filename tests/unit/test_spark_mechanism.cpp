@@ -157,6 +157,9 @@ SparkSpec registry_spec(const std::string& hive, const std::string& key) {
 SparkSpec service_spec(const std::string& name) {
     return SparkSpec{SparkType::Service, ServiceSparkParams{name}};
 }
+SparkSpec interval_spec(std::uint64_t ms) {
+    return SparkSpec{SparkType::Interval, IntervalSparkParams{ms}};
+}
 
 /// Register a fake for `type` and return the borrowed pointer (engine owns it).
 FakeMechanism* wire_fake(SparkEngine& engine, SparkType type) {
@@ -379,6 +382,153 @@ TEST_CASE("File spark: unregister_consumer unwatches a watch its removal empties
     CHECK(fake->unwatch_calls() == 1);
     CHECK(engine.stats().armed_sparks == 0);
     engine.stop();
+}
+
+TEST_CASE("File spark: a consumer unregistered mid-arm leaves no ghost subscription "
+          "(#1994 M1)",
+          "[spark][mechanism]") {
+    // Forces the exact interleaving M1 closes: the consumer existed at arm()'s
+    // pre-check (consumers_mu_), but is FULLY unregistered — subscription
+    // removed, mechanism unwatched, consumers_ entry erased — after the
+    // mechanism watch succeeds and before arm_impl's post-insert consumer
+    // re-check. Before the fix, this left a Subscriber permanently in armed_
+    // for a consumer that no longer exists: uncounted by unregister_consumer
+    // (which ran before the sub was inserted) and never delivered to (deliver()
+    // silently no-ops an unknown consumer id) — a silent resource leak, not a
+    // crash.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto consumer = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(consumer.has_value());
+    engine.start();
+
+    engine.set_arm_race_hook_for_test([&] { engine.unregister_consumer(*consumer); });
+
+    const auto spec = file_spec("/etc/hosts");
+    auto sub = engine.arm(*consumer, spec);
+    CHECK_FALSE(sub.has_value()); // lost the race — must report failure, not a ghost
+
+    CHECK(engine.stats().subscriptions == 0);
+    CHECK(engine.stats().armed_sparks == 0); // no orphaned key left behind
+    CHECK(fake->watch_calls() == 1);         // the watch DID succeed before the hook fired
+    CHECK(fake->unwatch_calls() == 1);       // unregister_consumer tore it back down — no leak
+    engine.stop();
+}
+
+TEST_CASE("SparkEngine: arm() racing unregister_consumer() under REAL concurrent "
+          "scheduling never leaves a ghost subscription (stress, #1994 M1)",
+          "[spark][engine][stress]") {
+    // The deterministic hook-based test above proves the recheck-then-rollback
+    // LOGIC is correct on one thread; this exercises the actual cross-thread
+    // memory-ordering half with real concurrent scheduling and no seam.
+    for (int trial = 0; trial < 500; ++trial) {
+        SparkEngine engine;
+        engine.set_cadence_floor_for_test(10);
+        engine.start();
+        auto consumer = engine.register_consumer("racer", [](const SparkEvent&) {});
+        REQUIRE(consumer.has_value());
+
+        std::atomic<bool> go{false};
+        std::thread unregisterer([&] {
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            engine.unregister_consumer(*consumer);
+        });
+        go.store(true, std::memory_order_release);
+        // Result intentionally unchecked: either outcome (won or lost the race
+        // against the concurrent unregister) is valid — the invariant under
+        // test is "no crash, no ghost", not which side wins.
+        (void)engine.arm(*consumer, interval_spec(20));
+        unregisterer.join();
+        engine.stop();
+
+        // Whichever side won, the consumer is gone and no subscription should
+        // remain pointing at it.
+        CHECK(engine.stats().consumers == 0);
+        CHECK(engine.stats().subscriptions == 0);
+    }
+    SUCCEED("500 concurrent arm()/unregister_consumer() trials completed without a crash or "
+            "a surviving ghost subscription");
+}
+
+TEST_CASE("File spark: a late unwatch from a torn-down arm does not clobber a "
+          "concurrent equal-spec re-arm (#1994 M2)",
+          "[spark][mechanism]") {
+    // Forces the exact interleaving M2 closes: disarm() removes the last
+    // subscription to a key (releasing mu_, about to call unwatch()) while a
+    // NEW arm() of an EQUAL spec races in, sees the key already gone from
+    // armed_, and re-establishes a fresh watch. Before the fix, the first
+    // disarm's now-stale unwatch() would run after the fresh watch() and tear
+    // it down — leaving armed_ showing the key armed with NO live OS watch.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    auto c2 = engine.register_consumer("c2", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    REQUIRE(c2.has_value());
+    engine.start();
+
+    const auto spec = file_spec("/etc/hosts");
+    const std::string key = spark_key(spec);
+    auto s1 = engine.arm(*c1, spec);
+    REQUIRE(s1.has_value());
+    CHECK(fake->is_watching(key));
+
+    // disarm()'s hook fires with mu_ already released, just before its
+    // staleness-rechecked unwatch() call — re-arm an equal spec here so the
+    // fresh watch is already up by the time the stale unwatch would fire.
+    engine.set_disarm_race_hook_for_test([&] {
+        auto s2 = engine.arm(*c2, spec);
+        REQUIRE(s2.has_value());
+    });
+    engine.disarm(*s1);
+
+    // The fresh watch must survive: still watched, and the stale unwatch must
+    // have been SKIPPED (not merely harmless) — the mechanism never saw it.
+    CHECK(fake->is_watching(key));
+    CHECK(engine.stats().armed_sparks == 1);
+    CHECK(fake->watch_calls() == 2);   // original arm + the re-arm
+    CHECK(fake->unwatch_calls() == 0); // the stale unwatch was skipped, not just harmless
+    engine.stop();
+}
+
+TEST_CASE("File spark: disarm() racing an equal-spec arm() under REAL concurrent "
+          "scheduling never tears down a fresh watch (stress, #1994 M2)",
+          "[spark][mechanism]") {
+    for (int trial = 0; trial < 500; ++trial) {
+        SparkEngine engine;
+        FakeMechanism* fake = wire_fake(engine, SparkType::File);
+        auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+        auto c2 = engine.register_consumer("c2", [](const SparkEvent&) {});
+        REQUIRE(c1.has_value());
+        REQUIRE(c2.has_value());
+        engine.start();
+
+        const auto spec = file_spec("/etc/hosts");
+        const std::string key = spark_key(spec);
+        auto s1 = engine.arm(*c1, spec);
+        REQUIRE(s1.has_value());
+
+        std::atomic<bool> go{false};
+        std::thread rearmer([&] {
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            auto s2 = engine.arm(*c2, spec);
+            REQUIRE(s2.has_value());
+        });
+        go.store(true, std::memory_order_release);
+        engine.disarm(*s1);
+        rearmer.join();
+
+        // Invariant under test regardless of interleaving order: if armed_
+        // still shows the key armed (c2's subscription survived), the
+        // mechanism must actually be watching it — never torn down and never
+        // silently orphaned.
+        if (engine.stats().armed_sparks > 0)
+            CHECK(fake->is_watching(key));
+        engine.stop();
+    }
+    SUCCEED("500 concurrent disarm()/arm() trials completed with no torn-down fresh watch");
 }
 
 TEST_CASE("File spark: a mechanism watch failure rolls the arm back", "[spark][mechanism]") {

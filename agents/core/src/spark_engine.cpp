@@ -139,7 +139,34 @@ SparkEngine::register_consumer(std::string name, QueuedHandler handler, std::siz
 }
 
 void SparkEngine::unregister_consumer(ConsumerId id) {
-    // 1) Remove the consumer's subscriptions so no new events are enqueued.
+    // 1) Take the consumer out of the fan-out map FIRST, before scanning
+    // armed_ for its subscriptions. LOAD-BEARING ordering for the M1
+    // ghost-subscription fix (#1994): arm()'s consumer-existence pre-check
+    // (consumers_mu_) and arm_impl()'s armed_ insert (mu_) are two different
+    // critical sections a concurrent unregister_consumer() can land between.
+    // arm_impl() closes its half of the race with a re-check AFTER the insert
+    // that rolls back on a lost race (see arm_impl below) — but that re-check
+    // is only airtight if THIS function's consumers_ erase always
+    // happens-before its own armed_ scan. With the erase first: any insert
+    // that lands before our armed_ scan is caught by the scan itself; any
+    // insert that lands after our armed_ scan must also land after our erase
+    // (same-thread program order), so arm_impl's re-check — which always runs
+    // after its insert — observes the consumer already gone and rolls back.
+    // A ghost would require our scan to miss the sub (scan-before-insert) AND
+    // arm_impl's re-check to see the consumer as present (re-check-before-
+    // erase) — impossible once erase precedes scan, since that would need
+    // erase < scan < insert < re-check < erase (self-contradictory).
+    std::shared_ptr<Consumer> consumer;
+    {
+        std::lock_guard lk(consumers_mu_);
+        auto it = consumers_.find(id);
+        if (it == consumers_.end())
+            return;
+        consumer = std::move(it->second);
+        consumers_.erase(it);
+    }
+
+    // 2) Remove the consumer's subscriptions so no new events are enqueued.
     // Collect (mechanism, key) pairs for any watch that goes fully
     // unsubscribed as a result, so they can be unwatch()'d with mu_ released
     // below — mirrors disarm()'s pattern exactly. Erasing armed_ without this
@@ -180,20 +207,26 @@ void SparkEngine::unregister_consumer(ConsumerId id) {
         }
     }
     // Stop watching with mu_ RELEASED (unwatch may block; a racing inline emit
-    // takes mu_) — mirrors disarm().
-    for (auto& pu : to_unwatch)
+    // takes mu_) — mirrors disarm(). Serialized via mech_ops_mu_ with a
+    // staleness re-check immediately before each call (#1994 M2): a
+    // concurrent re-arm of an equal spec may have already renewed this key
+    // between our erase above and here, in which case this unwatch is stale
+    // and must be skipped rather than tearing down the fresh watch.
+    for (auto& pu : to_unwatch) {
+        // Hook fires BEFORE mech_ops_mu_ is taken (never while held) — see
+        // disarm()'s identical placement rationale.
+        if (disarm_race_hook_for_test_)
+            disarm_race_hook_for_test_();
+        std::lock_guard ops(mech_ops_mu_);
+        {
+            std::lock_guard lk(mu_);
+            if (armed_.contains(pu.key))
+                continue; // a concurrent re-arm already renewed this key
+        }
         pu.mech->unwatch(pu.key);
-
-    // 2) Take the consumer out of the fan-out map, then bounded-join its thread.
-    std::shared_ptr<Consumer> consumer;
-    {
-        std::lock_guard lk(consumers_mu_);
-        auto it = consumers_.find(id);
-        if (it == consumers_.end())
-            return;
-        consumer = std::move(it->second);
-        consumers_.erase(it);
     }
+
+    // 3) Bounded-join (or detach) its dispatch thread.
     quiesce_consumer(consumer);
 }
 
@@ -376,6 +409,10 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
         return std::unexpected(cadence.error());
     const std::string key = spark_key(spec);
     const bool event_driven = is_event_driven(spec.type);
+    // Saved before `sub` is moved into armed_.subs below — needed for the
+    // post-insert consumer re-check (#1994 M1, Queued tier only).
+    const SparkTier tier = sub.tier;
+    const ConsumerId consumer_id = sub.consumer;
 
     // Set to the mechanism + params only when a NEW event-driven watch must be
     // armed live (a fresh key on a running engine). Deferred/deduped arms and
@@ -433,8 +470,20 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     // Arm the OS watch with mu_ RELEASED — watch() may block on handle setup,
     // and an inline emit from the mechanism re-enters under mu_. `mech` is set
     // only for a NEWLY-INSERTED event-driven key, so a failure here means the
-    // watcher for this whole key never came up.
+    // watcher for this whole key never came up. Serialized via mech_ops_mu_
+    // with a staleness re-check immediately before the call (#1994 M2): a
+    // concurrent disarm/unregister may have torn this brand-new key down
+    // already (its sole subscriber — ours — removed, e.g. by
+    // unregister_consumer racing our own consumer), in which case watching it
+    // now would leave an orphaned OS watch with no armed_ entry.
     if (mech) {
+        std::lock_guard ops(mech_ops_mu_);
+        {
+            std::lock_guard lk(mu_);
+            if (!armed_.contains(key))
+                return std::unexpected(std::string("spark '") + key +
+                                       "' was disarmed before its watch could be armed");
+        }
         auto w = mech->watch(key, watch_params);
         if (!w) {
             // Tear down the ENTIRE key, not just our own subscription (governance
@@ -454,6 +503,27 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
             }
             return std::unexpected(std::string("watch mechanism failed to arm '") + key +
                                    "': " + w.error());
+        }
+    }
+
+    if (arm_race_hook_for_test_)
+        arm_race_hook_for_test_();
+
+    // M1 (#1994): `consumer_id` existed at arm()'s pre-check, but a concurrent
+    // unregister_consumer() may have removed it (and our subscription with it)
+    // any time between that pre-check and here. Re-check AFTER the insert (and
+    // watch, if any) and roll back via disarm() on a lost race — see
+    // unregister_consumer()'s erase-before-scan ordering for why this
+    // re-check is airtight. Inline subs have no registered consumer to check.
+    if (tier == SparkTier::Queued) {
+        bool consumer_alive = false;
+        {
+            std::lock_guard lk(consumers_mu_);
+            consumer_alive = consumers_.contains(consumer_id);
+        }
+        if (!consumer_alive) {
+            disarm(id);
+            return std::unexpected("consumer unregistered during arm");
         }
     }
     return id;
@@ -491,9 +561,26 @@ void SparkEngine::disarm(SubscriptionId id) {
         wheel_cv_.notify_all();
     }
     // Stop watching with mu_ RELEASED (unwatch may block; a racing inline emit
-    // takes mu_).
-    if (mech)
+    // takes mu_). Serialized via mech_ops_mu_ with a staleness re-check
+    // immediately before the call (#1994 M2): a concurrent re-arm of an equal
+    // spec may have already renewed this key between our unlock above and
+    // here, in which case this unwatch is stale and must be skipped rather
+    // than tearing down the fresh watch.
+    if (mech) {
+        // Hook fires BEFORE mech_ops_mu_ is taken (never while held): a test
+        // hook that re-arms from here calls back into arm_impl(), which takes
+        // this same non-recursive mutex — invoking the hook any later would
+        // self-deadlock.
+        if (disarm_race_hook_for_test_)
+            disarm_race_hook_for_test_();
+        std::lock_guard ops(mech_ops_mu_);
+        {
+            std::lock_guard lk(mu_);
+            if (armed_.contains(unwatch_key))
+                return; // a concurrent re-arm already renewed this key
+        }
         mech->unwatch(unwatch_key);
+    }
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -542,6 +629,15 @@ void SparkEngine::start() {
                      report_fault(key, faulted, reason);
                  });
     for (auto& r : replays) {
+        // Serialized via mech_ops_mu_ with a staleness re-check (#1994 M2): a
+        // concurrent disarm() may have torn this key down between start()'s
+        // collection pass above (mu_ released since) and here.
+        std::lock_guard ops(mech_ops_mu_);
+        {
+            std::lock_guard lk(mu_);
+            if (!armed_.contains(r.key))
+                continue; // disarmed before its pre-start replay could run
+        }
         auto w = r.mech->watch(r.key, r.params);
         if (!w) {
             // Pre-start replay failure leaves the spark armed-without-watcher —
@@ -859,6 +955,14 @@ void SparkEngine::set_consumer_join_budget_for_test(std::uint64_t ms) {
 
 void SparkEngine::set_register_race_hook_for_test(std::function<void()> hook) {
     register_race_hook_for_test_ = std::move(hook);
+}
+
+void SparkEngine::set_arm_race_hook_for_test(std::function<void()> hook) {
+    arm_race_hook_for_test_ = std::move(hook);
+}
+
+void SparkEngine::set_disarm_race_hook_for_test(std::function<void()> hook) {
+    disarm_race_hook_for_test_ = std::move(hook);
 }
 
 } // namespace yuzu::agent

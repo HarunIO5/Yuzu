@@ -99,7 +99,10 @@ public:
     watch(const std::string& key, const SparkParams& params) = 0;
 
     /// Stop watching one spark (its last subscription went). Idempotent; an
-    /// unknown key is ignored.
+    /// unknown key is ignored. May be invoked concurrently with another
+    /// unwatch(), with watch(), and with stop() — implementations must
+    /// tolerate an unwatch() that arrives after stop() as an idempotent no-op
+    /// (#1994 L3).
     virtual void unwatch(const std::string& key) = 0;
 
     /// Join the mechanism thread(s). Idempotent. Called by SparkEngine::stop()
