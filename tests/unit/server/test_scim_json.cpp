@@ -92,6 +92,25 @@ TEST_CASE("scim_json: parse_user missing userName errors", "[scim][json]") {
     CHECK(result.error().scim_type == "invalidValue");
 }
 
+TEST_CASE("scim_json: parse_user rejects a non-string userName (FIX-3)", "[scim][json]") {
+    // Previously body.value<std::string>("userName", {}) threw
+    // nlohmann::json::type_error on a non-string value, escaping the
+    // std::expected contract as an unhandled 500 instead of a clean 400.
+    nlohmann::json body = {{"userName", 123}};
+    auto result = parse_user(body);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().status == 400);
+    CHECK(result.error().scim_type == "invalidValue");
+}
+
+TEST_CASE("scim_json: parse_user rejects a non-string externalId (FIX-3)", "[scim][json]") {
+    nlohmann::json body = {{"userName", "jdoe"}, {"externalId", nlohmann::json::array()}};
+    auto result = parse_user(body);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().status == 400);
+    CHECK(result.error().scim_type == "invalidValue");
+}
+
 TEST_CASE("scim_json: parse_user rejects an oversized externalId (S-EXTID)", "[scim][json]") {
     nlohmann::json body = {{"userName", "jdoe"},
                            {"externalId", std::string(kMaxExternalIdLength + 1, 'x')}};

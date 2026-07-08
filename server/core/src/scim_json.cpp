@@ -50,11 +50,22 @@ std::expected<ScimUserInput, ScimError> parse_user(const nlohmann::json& body) {
     }
 
     ScimUserInput input;
+    // FIX-3 (Hermes LOW): body.value<std::string>(...) throws
+    // nlohmann::json::type_error when the key is present but holds a
+    // non-string (e.g. {"userName":123}) — that escapes this function's
+    // std::expected contract and surfaces as an unhandled 500 instead of a
+    // clean SCIM 400. Guard the type before extracting.
+    if (body.contains("userName") && !body["userName"].is_string()) {
+        return std::unexpected(ScimError{400, "invalidValue", "userName must be a string"});
+    }
     input.user_name = body.value("userName", std::string{});
     if (input.user_name.empty()) {
         return std::unexpected(ScimError{400, "invalidValue", "userName is required"});
     }
 
+    if (body.contains("externalId") && !body["externalId"].is_string()) {
+        return std::unexpected(ScimError{400, "invalidValue", "externalId must be a string"});
+    }
     input.external_id = body.value("externalId", std::string{});
     if (input.external_id.size() > kMaxExternalIdLength) {
         return std::unexpected(

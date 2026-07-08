@@ -843,6 +843,25 @@ TEST_CASE("ScimRoutes: malformed JSON body — 400 on POST/PATCH", "[scim][route
     CHECK(patch_res->status == 400);
 }
 
+TEST_CASE("ScimRoutes: POST with a non-string userName/externalId — 400, not 500 (FIX-3)",
+         "[scim][routes][malformed]") {
+    // Confirms the route path that calls scim::parse_user() propagates its
+    // std::expected 400 cleanly rather than an nlohmann::json::type_error
+    // unwinding to an unhandled 500.
+    Fixture f;
+    auto res1 = f.post("/scim/v2/Users", {{"userName", 123}});
+    REQUIRE(res1);
+    CHECK(res1->status == 400);
+    auto body1 = json::parse(res1->body);
+    CHECK(body1["scimType"] == "invalidValue");
+
+    auto res2 = f.post("/scim/v2/Users", {{"userName", "vic"}, {"externalId", json::array()}});
+    REQUIRE(res2);
+    CHECK(res2->status == 400);
+    auto body2 = json::parse(res2->body);
+    CHECK(body2["scimType"] == "invalidValue");
+}
+
 TEST_CASE("ScimRoutes: oversized body — 413 on POST/PATCH", "[scim][routes][malformed]") {
     Fixture f;
     std::string huge_body = R"({"userName":")" + std::string(70 * 1024, 'x') + R"("})";
@@ -879,6 +898,35 @@ TEST_CASE("ScimRoutes: POST active:false — 201 body's ETag matches a following
     auto get_body = json::parse(get_res->body);
     CHECK(get_body["meta"]["version"] == post_etag);
     CHECK(get_body["active"] == false);
+}
+
+TEST_CASE("ScimRoutes: POST active:false — the underlying account is ACTUALLY deactivated "
+         "(FIX-1)",
+         "[scim][routes][post]") {
+    // Hermes MEDIUM (fail-open): honouring active:false on create previously
+    // only LOGGED a remove_user() failure and fell through to set_active(),
+    // so a failed deactivation could ship a 201 with active:false while the
+    // auth account stayed LIVE. This asserts the success path end-to-end —
+    // not just the SCIM resource flag (covered by the ETag test above) but
+    // that the auth account itself is actually deactivated, the way
+    // deactivate()'s own tests assert for PATCH/DELETE.
+    Fixture f;
+    auto res = f.post("/scim/v2/Users", {{"userName", "uma2"}, {"active", false}});
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK_FALSE(f.auth_mgr.get_user_role("uma2").has_value());
+
+    // NOTE (injection gap): forcing remove_user()'s own DB write to fail at
+    // exactly this point — without also failing the preceding
+    // upsert_user()/reactivate_user() call on the same connection — needs
+    // either a multi-second SQLITE_BUSY wait on AuthDB's fixed 5s
+    // busy_timeout or corrupting the shared auth.db file mid-request,
+    // neither of which is a clean/fast unit-test injection (same gap
+    // documented on the revive-refusal undo test above). The fail-closed
+    // branch itself (remove_user() failure -> 500 + audit "failure" +
+    // return, never falling through to set_active()) is exercised by
+    // inspection and mirrors deactivate()'s identical, already-tested
+    // contract.
 }
 
 // ── S-CLAMP-COUNT ────────────────────────────────────────────────────────

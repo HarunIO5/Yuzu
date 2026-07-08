@@ -457,6 +457,20 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         // (fixes UP-1/2/3's deadlock: previously DELETE removed the
         // scim_resource but ON CONFLICT DO NOTHING made re-provisioning via
         // POST permanently fail).
+        // FIX-2 (Hermes LOW): auth_mgr is a raw pointer threaded through from
+        // the server's wiring — every other handler on this surface derefs
+        // it freely too, but provenance_ok() (below, indirectly reached from
+        // PATCH/PUT/DELETE) guards it explicitly before calling
+        // auth_db_ptr(). Match that posture here at this handler's first
+        // direct deref, rather than trust a caller-supplied non-null.
+        if (!auth_mgr) {
+            spdlog::error("ScimRoutes: cannot provision '{}' — no AuthManager configured",
+                         input.user_name);
+            send_scim_error(res, 500, "SCIM provisioning is unavailable (no AuthManager configured)");
+            audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure", input.user_name);
+            record_request(auth_mgr, "create", 500);
+            return;
+        }
         AuthDB* db = auth_mgr->auth_db_ptr();
         if (!db) {
             spdlog::error("ScimRoutes: cannot provision '{}' — no AuthDB configured (SCIM "
@@ -672,9 +686,22 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         // made/revived.
         if (input.active.has_value() && !*input.active) {
             if (!auth_mgr->remove_user(input.user_name)) {
+                // FIX-1 (Hermes MEDIUM, fail-open): previously this branch
+                // only logged and fell through to set_active(false) below,
+                // so a failed deactivation still shipped a 201 with
+                // active:false while the underlying auth account stayed
+                // LIVE — the IdP believes the user is deactivated when it
+                // is not. Fail closed (500) and stop here, mirroring
+                // deactivate()'s remove_user-failure branch above.
                 spdlog::error("ScimRoutes: remove_user failed honouring active:false on create "
                              "for '{}' — the account remains active",
                              input.user_name);
+                send_scim_error(res, 500, "failed to deactivate the underlying account");
+                audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure",
+                     input.user_name,
+                     "active:false on create — remove_user failed, account left active");
+                record_request(auth_mgr, "create", 500);
+                return;
             }
             // UP-N3 (FIX-3): check the ScimStore mirror write — previously
             // unchecked, so a failure here silently shipped a 201 body
