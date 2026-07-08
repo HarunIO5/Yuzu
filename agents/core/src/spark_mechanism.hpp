@@ -79,9 +79,12 @@ using SparkFaultFn =
 ///
 /// CONSISTENCY CONTRACT: the fields are backed by independent atomics read
 /// without a shared lock, so a returned SparkMechanismStats is a point-in-time
-/// SKEW, not a coherent snapshot — never derive an invariant across two fields
-/// (e.g. do not assert `retiring <= retiring_cap` from a single read; each was
-/// sampled at a slightly different instant). Treat each field as its own gauge.
+/// SKEW, not a coherent snapshot — never derive an invariant across two fields.
+/// Note in particular that `retiring` CAN exceed `retiring_cap`: the cap gates
+/// only new watch() calls, while teardown (unwatch / superseded-ancestor) is
+/// deliberately never gated, so in-flight teardowns can overshoot the cap
+/// (spark_file's watch() documents this) — it is NOT a `retiring <= retiring_cap`
+/// invariant. Treat each field as its own independent gauge.
 struct SparkMechanismStats {
     /// Watches cancelled (unwatch() or a superseded ancestor) but not yet
     /// drained by the mechanism's own worker — the #1979 retiring_ gauge.

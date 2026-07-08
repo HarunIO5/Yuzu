@@ -74,6 +74,8 @@ public:
     std::expected<void, std::string> watch(const std::string& key, const SparkParams&) override {
         std::lock_guard lk(mu_);
         ++watch_calls_;
+        if (throw_watch_)
+            throw std::runtime_error("forced watch throw"); // contract-violating mechanism (UP-7)
         if (fail_watch_)
             return std::unexpected("forced watch failure");
         watched_.insert(key);
@@ -134,6 +136,10 @@ public:
         std::lock_guard lk(mu_);
         fail_watch_ = b;
     }
+    void set_throw_watch(bool b) {
+        std::lock_guard lk(mu_);
+        throw_watch_ = b;
+    }
 
 private:
     std::mutex mu_;
@@ -142,6 +148,7 @@ private:
     std::set<std::string> watched_;
     bool started_{false};
     bool fail_watch_{false};
+    bool throw_watch_{false};
     int watch_calls_{0};
     int unwatch_calls_{0};
     int stop_calls_{0};
@@ -592,6 +599,36 @@ TEST_CASE("File spark: a mechanism watch failure rolls the arm back", "[spark][m
     CHECK_FALSE(sub.has_value());          // watch failed → arm reported failure
     CHECK(engine.stats().armed_sparks == 0); // and the whole key was torn down (B1)
     CHECK(engine.stats().subscriptions == 0);
+    engine.stop();
+}
+
+TEST_CASE("File spark: a mechanism that THROWS from watch() rolls the arm back cleanly "
+          "(#1994 UP-7)",
+          "[spark][mechanism]") {
+    // The engine's contract is that a mechanism returns std::unexpected on
+    // failure, but the real spark_file::watch() can throw (fs::current_path()
+    // on a relative path). A throw must NOT unwind past arm_impl's rollback and
+    // leave a zombie armed_ entry with no watcher and no id returned — it must
+    // be treated exactly like a returned failure: whole-key teardown, arm()
+    // returns a clean std::unexpected (never propagates the exception).
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    fake->set_throw_watch(true);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    std::expected<SparkEngine::SubscriptionId, std::string> sub;
+    REQUIRE_NOTHROW(sub = engine.arm(*c, file_spec("/etc/hosts"))); // throw is caught, not propagated
+    CHECK_FALSE(sub.has_value());
+    CHECK(engine.stats().armed_sparks == 0); // no zombie armed entry
+    CHECK(engine.stats().subscriptions == 0);
+
+    // The engine is still usable afterward: a subsequent good arm succeeds.
+    fake->set_throw_watch(false);
+    auto ok = engine.arm(*c, file_spec("/etc/hosts"));
+    CHECK(ok.has_value());
+    CHECK(engine.stats().armed_sparks == 1);
     engine.stop();
 }
 

@@ -349,10 +349,17 @@ private:
     /// watch() on one mechanism blocks a concurrent unwatch() on a DIFFERENT
     /// mechanism (e.g. File blocking Registry) that was fully independent
     /// before. The "acceptable" defence rests on a BOUNDED worst-case watch(),
-    /// but that bound is currently FILE-ONLY (spark_file's ~500ms arm_ancestor
-    /// deadline, #1980); Registry (TP_WAIT) and Service (SCM query) watch
-    /// latencies are UNCHARACTERISED — a hung SCM RPC in Service::watch() would
-    /// stall this engine-wide lock with no proven bound (architect Gate 3).
+    /// but that bound is WEAK and FILE-ONLY: spark_file's arm_ancestor deadline
+    /// (#1980) checks the 500ms budget BETWEEN probes, and fs::is_directory is
+    /// uninterruptible — so a single hung probe on a dead UNC/network path
+    /// holds this lock for the full OS network timeout (tens of seconds), not
+    /// ~500ms; the deadline bounds the NUMBER of slow probes to ~one, not the
+    /// wall-clock of any one probe (unhappy-path UP-1). Registry (TP_WAIT) and
+    /// Service (SCM query) watch latencies are entirely UNCHARACTERISED — a hung
+    /// SCM RPC in Service::watch() would stall this engine-wide lock with no
+    /// bound at all (architect Gate 3). Truly bounding this needs the
+    /// walk-off-mu_ (probe on a separate thread) restructure — the deferred
+    /// follow-up below.
     /// Only same-mechanism watch/unwatch were serialised previously (by each
     /// mechanism's own internal lock); this adds cross-mechanism serialisation
     /// that Stage 2's simultaneous File+Registry+Service guards will exercise.

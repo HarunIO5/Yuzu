@@ -468,9 +468,14 @@ private:
         // network timeout on a dead/unresponsive UNC path — the fixed-point
         // guard above stops an INFINITE loop, but not a SLOW one. A deadline,
         // checked every iteration, caps the walk at one-probe-past-500ms
-        // instead of depth × per-probe-timeout, so a single bad path can no
-        // longer stall the whole mechanism (every other watch needs this same
-        // mu_) for an unbounded time.
+        // instead of depth × per-probe-timeout. IMPORTANT (unhappy-path UP-1):
+        // this bounds the NUMBER of slow probes to ~one, NOT the wall-clock of
+        // any single probe — the deadline is checked BETWEEN probes, and
+        // fs::is_directory is uninterruptible, so one hung probe on a dead path
+        // still holds mu_ for the full OS network timeout before this check
+        // fires. It is strictly better than the prior infinite hang, but it is
+        // NOT a ~500ms wall-clock bound; truly bounding it needs to move the
+        // probe off mu_ onto a separate thread (deferred follow-up).
         for (fs::path prev; !anc.empty() && anc != prev && !fs::is_directory(anc, ec);) {
             if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(500)) {
                 // NOT slow_op_.fetch_add here — the `guard` above already counts

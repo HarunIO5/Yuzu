@@ -484,8 +484,27 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
                 return std::unexpected(std::string("spark '") + key +
                                        "' was disarmed before its watch could be armed");
         }
-        auto w = mech->watch(key, watch_params);
-        if (!w) {
+        // A mechanism must RETURN std::unexpected on failure, not throw — but
+        // the real ones can (e.g. spark_file's watch() uses fs::current_path()
+        // without an ec overload, which throws on a relative path with a bad
+        // CWD). An escaping throw would unwind PAST the rollback below, leaving
+        // a zombie armed_ entry with no watcher and no id ever returned to the
+        // caller — an std::expected-contract violation the caller can neither
+        // observe nor disarm (governance UP-7). Treat a throw exactly like a
+        // returned failure: fall into the whole-key teardown.
+        std::string watch_err;
+        bool watch_ok = false;
+        try {
+            auto w = mech->watch(key, watch_params);
+            watch_ok = w.has_value();
+            if (!watch_ok)
+                watch_err = w.error();
+        } catch (const std::exception& e) {
+            watch_err = std::string("watch mechanism threw: ") + e.what();
+        } catch (...) {
+            watch_err = "watch mechanism threw a non-std exception";
+        }
+        if (!watch_ok) {
             // Tear down the ENTIRE key, not just our own subscription (governance
             // B1): between our unlock above and here, a concurrent arm() of an
             // equal spec may have deduped ONTO this key (adding its own sub with
@@ -502,7 +521,7 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
                 armed_.erase(it);
             }
             return std::unexpected(std::string("watch mechanism failed to arm '") + key +
-                                   "': " + w.error());
+                                   "': " + watch_err);
         }
     }
 
