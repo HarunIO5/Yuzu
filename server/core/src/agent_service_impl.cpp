@@ -64,10 +64,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
 
     // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp. Must run
     // before any side effect below (audit, auth-mgr lookup, registry write).
-    if (onbehalf::call_rejected(context)) {
-        return grpc::Status(grpc::StatusCode::CANCELLED,
-                            "on-behalf-of assertions are not accepted on any surface (ADR-0022)");
-    }
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     const auto& info = request->info();
 
@@ -598,10 +595,7 @@ grpc::Status AgentServiceImpl::Heartbeat(grpc::ServerContext* context,
         .increment();
 
     // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp.
-    if (onbehalf::call_rejected(context)) {
-        return grpc::Status(grpc::StatusCode::CANCELLED,
-                            "on-behalf-of assertions are not accepted on any surface (ADR-0022)");
-    }
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     // PR3: lock a revoked agent out of liveness too — otherwise a revoked cert,
     // rejected at Subscribe, could keep heart-beating and mask the revocation by
@@ -676,10 +670,7 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
         .increment();
 
     // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp.
-    if (onbehalf::call_rejected(context)) {
-        return grpc::Status(grpc::StatusCode::CANCELLED,
-                            "on-behalf-of assertions are not accepted on any surface (ADR-0022)");
-    }
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     if (auto s = reject_revoked_peer(context, "report_inventory"); !s.ok())
         return s;
@@ -772,10 +763,7 @@ grpc::Status AgentServiceImpl::Subscribe(
     // "command-result handler" the execution plan's PR 1.1 rationale names:
     // the agent posts CommandResponse results over this bidi stream, so a
     // reserved header at stream-open must stop it before any registry work.
-    if (onbehalf::call_rejected(context)) {
-        return grpc::Status(grpc::StatusCode::CANCELLED,
-                            "on-behalf-of assertions are not accepted on any surface (ADR-0022)");
-    }
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     const auto session_id = client_metadata_value(*context, kSessionMetadataKey);
     if (session_id.empty()) {
@@ -1875,10 +1863,7 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
         .increment();
 
     // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp.
-    if (onbehalf::call_rejected(context)) {
-        return grpc::Status(grpc::StatusCode::CANCELLED,
-                            "on-behalf-of assertions are not accepted on any surface (ADR-0022)");
-    }
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     // B-1 (#1239): a revoked agent must not learn the latest version / sha256 /
     // mandatory flag / rollout eligibility for its agent_id. This is the OTA
@@ -1930,10 +1915,7 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
         .increment();
 
     // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp.
-    if (onbehalf::call_rejected(context)) {
-        return grpc::Status(grpc::StatusCode::CANCELLED,
-                            "on-behalf-of assertions are not accepted on any surface (ADR-0022)");
-    }
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     // PR3: a revoked agent must not be able to pull the agent binary over the OTA
     // path. (Requiring a *positive* identity here — not just non-revocation — is a

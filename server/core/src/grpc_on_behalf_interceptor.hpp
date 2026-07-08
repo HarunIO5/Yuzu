@@ -16,8 +16,8 @@
 // client-visible status changes. This interceptor is therefore a wire-level
 // tripwire, not by itself an enforcement seam.
 //
-// The enforcement seam is grpc_on_behalf_enforce.hpp's `call_rejected()`,
-// called as the first statement of every RPC handler reachable through the
+// The enforcement seam is grpc_on_behalf_enforce.hpp's `enforce()`, called
+// as the first statement of every RPC handler reachable through the
 // ServerBuilder this interceptor is registered on (AgentServiceImpl,
 // GatewayUpstreamServiceImpl). It deliberately does NOT read
 // ServerContext::IsCancelled() — TryCancel()'s effect on that flag is not
@@ -33,7 +33,8 @@
 // registration, not a per-method check) is what makes the pairing sound: a
 // future new RPC method gets the TryCancel() half automatically by virtue of
 // being on the same ServerBuilder, and the enforcement half by convention
-// (call `call_rejected(context)` first, matching every existing handler).
+// (call `if (auto s = onbehalf::enforce(context); !s.ok()) return s;` first,
+// matching every existing handler).
 // Defensive no-op today in effect (no engine-principal traffic crosses the
 // agent gRPC channel under the plan's Decision 3, so no handler currently
 // reads these metadata keys) but now actually enforced, not merely inert;

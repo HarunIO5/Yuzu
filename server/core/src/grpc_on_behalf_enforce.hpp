@@ -28,19 +28,44 @@
 // useful (fast transport-level abort, especially for a long-lived stream)
 // and stays in place unchanged; this header no longer depends on it.
 //
-// Call `call_rejected(context)` as the FIRST statement of every RPC handler
-// reachable through the ServerBuilder the interceptor is registered on —
-// before any work that could commit a side effect (registry mutation, DB
-// write, audit row) — so a reserved-header call is a true no-op, not merely
-// a wrong status code on an already-committed action.
+// Call `if (auto s = onbehalf::enforce(context); !s.ok()) return s;` as the
+// FIRST statement of every RPC handler reachable through the ServerBuilder
+// the interceptor is registered on — before any work that could commit a
+// side effect (registry mutation, DB write, audit row) — so a
+// reserved-header call is a true no-op, not merely a wrong status code on an
+// already-committed action. Mirrors the exact idiom
+// `AgentServiceImpl::reject_revoked_peer` already established in this
+// codebase for a structurally identical guard.
 //
-// Deliberately a free function, not a per-class method like
-// AgentServiceImpl::reject_revoked_peer: it needs no instance state, and a
-// free function keeps the same one-line guard usable identically from every
-// service impl class the interceptor covers (AgentServiceImpl,
-// GatewayUpstreamServiceImpl, and any future one) — the same
-// "no per-RPC-method gap by construction" property the interceptor itself
-// has, now extended to enforcement.
+// Deliberately a free function, not a per-class method: it needs no
+// instance state, and a free function keeps the same one-line guard usable
+// identically from every service impl class the interceptor covers
+// (AgentServiceImpl, GatewayUpstreamServiceImpl, and any future one) — the
+// same "no per-RPC-method gap by construction" property the interceptor
+// itself has, now extended to enforcement. This guard's own coverage is
+// still a manual per-handler convention, not itself mechanically enforced
+// like the interceptor's single registration — a future RPC method (on any
+// service registered on the same ServerBuilder, including a future
+// ManagementServiceImpl handler) must remember to call this first; nothing
+// currently fails CI if it doesn't (tracked as a follow-up: at least a
+// second end-to-end regression test covering a streaming handler, beyond
+// the Register coverage in test_grpc_on_behalf_enforce.cpp — added
+// alongside this comment for Subscribe, the "command-result handler").
+//
+// `context == nullptr` returns OK (not rejected) rather than failing closed.
+// This is NOT a production fail-open path — gRPC always supplies a real
+// ServerContext per call; a null context only ever occurs in this
+// codebase's OWN established unit-test convention of calling a handler
+// method directly (bypassing gRPC transport entirely) to exercise its
+// business logic without a live call — see e.g. the ~20 `nullptr`-context
+// call sites already in test_agent_service_impl.cpp, several asserting
+// `.ok()`. Failing closed here would break that established convention
+// wholesale for a state gRPC itself never produces.
+//
+// Relies on the interceptor (grpc_on_behalf_interceptor.hpp) for the
+// rejection metric/log — this function only enforces, it does not itself
+// call `note_rejection`. Do not call it on a context that did not traverse
+// the registered ServerBuilder's interceptor chain.
 
 #pragma once
 
@@ -50,8 +75,13 @@
 
 namespace yuzu::server::onbehalf {
 
-[[nodiscard]] inline bool call_rejected(grpc::ServerContext* context) {
-    return context != nullptr && find_reserved_key(context->client_metadata()).has_value();
+[[nodiscard]] inline grpc::Status enforce(grpc::ServerContext* context) {
+    if (context == nullptr) return grpc::Status::OK;
+    if (find_reserved_key(context->client_metadata())) {
+        return grpc::Status(grpc::StatusCode::CANCELLED,
+                            "on-behalf-of assertions are not accepted on any surface (ADR-0022)");
+    }
+    return grpc::Status::OK;
 }
 
 }  // namespace yuzu::server::onbehalf

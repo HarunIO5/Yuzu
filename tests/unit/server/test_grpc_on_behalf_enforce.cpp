@@ -138,3 +138,29 @@ TEST_CASE("Register with no reserved key proceeds normally through the same inte
     // discriminating (reserved keys only), not blocking everything.
     CHECK(status.ok());
 }
+
+TEST_CASE("Subscribe (bidi stream) carrying a reserved on-behalf-of key is rejected at stream-open",
+          "[grpc][onbehalf][adr0022]") {
+    // cpp-safety Gate 3 finding: Register's unary coverage doesn't prove the
+    // guard works identically for a streaming RPC — Subscribe is the
+    // "command-result handler" the execution plan's PR 1.1 rationale singles
+    // out by name, and its guard placement (right after the null-context
+    // check, before any session/registry work) differs structurally from the
+    // unary handlers'.
+    LiveInterceptorHarness h;
+
+    grpc::ClientContext ctx;
+    ctx.AddMetadata("x-yuzu-on-behalf-of", "alice");
+
+    auto stream = h.stub_->Subscribe(&ctx);
+    REQUIRE(stream != nullptr);
+
+    // The rejection happens at stream-open (interceptor's
+    // POST_RECV_INITIAL_METADATA hook, before any message exchange), so the
+    // very first Read() must observe the stream already closed.
+    apb::CommandRequest ignored;
+    CHECK_FALSE(stream->Read(&ignored));
+
+    auto status = stream->Finish();
+    CHECK(status.error_code() == grpc::StatusCode::CANCELLED);
+}

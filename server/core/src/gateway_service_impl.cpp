@@ -42,10 +42,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                                                        pb::RegisterResponse* response) {
     // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp. Must run
     // before any side effect below (audit, auth-mgr lookup, registry write).
-    if (onbehalf::call_rejected(context)) {
-        return grpc::Status(grpc::StatusCode::CANCELLED,
-                            "on-behalf-of assertions are not accepted on any surface (ADR-0022)");
-    }
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     const auto& info = request->info();
 
@@ -461,10 +458,7 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
                                                         const gw::BatchHeartbeatRequest* request,
                                                         gw::BatchHeartbeatResponse* response) {
     // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp.
-    if (onbehalf::call_rejected(context)) {
-        return grpc::Status(grpc::StatusCode::CANCELLED,
-                            "on-behalf-of assertions are not accepted on any surface (ADR-0022)");
-    }
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     int acked = 0;
     for (const auto& hb : request->heartbeats()) {
@@ -523,10 +517,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
                                                         const pb::InventoryReport* request,
                                                         pb::InventoryAck* response) {
     // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp.
-    if (onbehalf::call_rejected(context)) {
-        return grpc::Status(grpc::StatusCode::CANCELLED,
-                            "on-behalf-of assertions are not accepted on any surface (ADR-0022)");
-    }
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     std::string agent_id;
     {
@@ -621,10 +612,7 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                                                const gw::StreamStatusNotification* request,
                                                gw::StreamStatusAck* response) {
     // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp.
-    if (onbehalf::call_rejected(context)) {
-        return grpc::Status(grpc::StatusCode::CANCELLED,
-                            "on-behalf-of assertions are not accepted on any surface (ADR-0022)");
-    }
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     const auto& agent_id = request->agent_id();
     const auto& session_id = request->session_id();
@@ -677,10 +665,7 @@ GatewayUpstreamServiceImpl::ForwardGuardianMessage(grpc::ServerContext* context,
                                                    const gw::ForwardGuardianRequest* request,
                                                    gw::ForwardGuardianAck* response) {
     // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp.
-    if (onbehalf::call_rejected(context)) {
-        return grpc::Status(grpc::StatusCode::CANCELLED,
-                            "on-behalf-of assertions are not accepted on any surface (ADR-0022)");
-    }
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     const auto& agent_id = request->agent_id();
 
