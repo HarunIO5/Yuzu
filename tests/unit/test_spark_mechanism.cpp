@@ -1327,6 +1327,82 @@ TEST_CASE("File spark (real mechanism): arm() on a nonexistent drive root does n
     // else: deliberately leak `probe` (and the parked thread inside it).
 }
 
+TEST_CASE("File spark (real mechanism): watch() on an existing key with a different "
+          "directory clears the stale registration (#1981)",
+          "[spark][mechanism][windows][resilience]") {
+    // Drives WindowsFileMechanism DIRECTLY, bypassing SparkEngine: its arm()
+    // always derives `key` from spark_key(spec), so the same key can never
+    // map to two different paths through THAT call path. ISparkMechanism's
+    // contract treats `key` as an opaque caller-supplied identifier though
+    // (spark_mechanism.hpp) — a future caller may legitimately re-call
+    // watch() for an EXISTING key with updated params on a content edit
+    // (Stage 6's differential re-apply: "unchanged bindings don't re-arm"
+    // implies a changed one updates in place) without an intervening
+    // explicit unwatch(). Before the fix, watch() unconditionally overwrote
+    // key_index_[key], leaking the OLD DirWatch::keys[old_fname] entry
+    // forever — a spurious-fires-forever leak from the abandoned path
+    // (governance chaos-injector Gate 5 finding).
+    namespace fs = std::filesystem;
+    const auto pid = std::to_string(::GetCurrentProcessId());
+    const fs::path dirA = fs::temp_directory_path() / ("spark_1981_a_" + pid);
+    const fs::path dirB = fs::temp_directory_path() / ("spark_1981_b_" + pid);
+    std::error_code ec;
+    fs::remove_all(dirA, ec);
+    fs::remove_all(dirB, ec);
+    fs::create_directories(dirA);
+    fs::create_directories(dirB);
+    const fs::path fileA = dirA / "target.txt";
+    const fs::path fileB = dirB / "target.txt";
+    { std::ofstream(fileA) << "seed"; }
+    { std::ofstream(fileB) << "seed"; }
+
+    struct Fires {
+        std::mutex mu;
+        std::vector<std::string> keys;
+        void add(std::string k) {
+            std::lock_guard lk(mu);
+            keys.push_back(std::move(k));
+        }
+        std::size_t count() {
+            std::lock_guard lk(mu);
+            return keys.size();
+        }
+        std::string at(std::size_t i) {
+            std::lock_guard lk(mu);
+            return keys.at(i);
+        }
+    };
+    auto fires = std::make_shared<Fires>();
+
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+    mech->start([fires](const std::string& key, SparkData) { fires->add(key); },
+                [](const std::string&, bool, std::string_view) {});
+
+    const std::string key = "shared-key-1981";
+    REQUIRE(mech->watch(key, FileSparkParams{fileA.string()}).has_value());
+    std::this_thread::sleep_for(150ms); // let the read arm
+
+    // Re-arm the SAME key against dirB, with NO intervening unwatch().
+    REQUIRE(mech->watch(key, FileSparkParams{fileB.string()}).has_value());
+    std::this_thread::sleep_for(150ms);
+
+    { std::ofstream(fileA, std::ios::app) << "changeA"; }
+    std::this_thread::sleep_for(300ms);
+    CHECK(fires->count() == 0); // the OLD registration must be gone — no spurious fire
+
+    { std::ofstream(fileB, std::ios::app) << "changeB"; }
+    CHECK(eventually([&] { return fires->count() >= 1; }, 8000ms));
+    if (fires->count() >= 1)
+        CHECK(fires->at(0) == key);
+
+    mech->unwatch(key);
+    std::this_thread::sleep_for(150ms); // let the worker drain the cancelled read
+    mech->stop();
+    fs::remove_all(dirA, ec);
+    fs::remove_all(dirB, ec);
+}
+
 TEST_CASE("Registry spark (real mechanism): survives key delete + recreate",
           "[spark][mechanism][windows][resilience]") {
     const std::string sub =

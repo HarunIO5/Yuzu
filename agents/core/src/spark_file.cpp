@@ -145,6 +145,20 @@ public:
         std::lock_guard lk(mu_);
         if (!iocp_)
             return std::unexpected("file mechanism not started");
+        // #1981: a re-arm of THIS key against a DIFFERENT (dirkey, fname) than
+        // its current registration — e.g. an authored path change on config
+        // reload/redeploy, with no intervening explicit unwatch(key) — must
+        // not silently overwrite key_index_[key] below: the OLD registration
+        // in the abandoned DirWatch::keys[old_fname] would never be cleaned
+        // up, so that entry keeps firing this key from the old path forever
+        // (a permanent per-key leak). Implicitly clear the stale registration
+        // first, exactly as if the caller had unwatch()'d it. A same-
+        // (dirkey, fname) re-arm is unaffected — key_index_'s stored pair
+        // already matches, so this is a no-op (idempotent).
+        if (auto ki = key_index_.find(key);
+            ki != key_index_.end() && ki->second != std::pair{dirkey, fname}) {
+            unwatch_locked(key);
+        }
         auto& slot = dirs_[dirkey];
         if (!slot) {
             slot = std::make_unique<DirWatch>();
@@ -163,49 +177,7 @@ public:
 
     void unwatch(const std::string& key) override {
         std::lock_guard lk(mu_);
-        auto ki = key_index_.find(key);
-        if (ki == key_index_.end())
-            return;
-        const auto [dirkey, fname] = ki->second;
-        key_index_.erase(ki);
-        auto di = dirs_.find(dirkey);
-        if (di == dirs_.end())
-            return;
-        DirWatch& w = *di->second;
-        auto fi = w.keys.find(fname);
-        if (fi != w.keys.end()) {
-            fi->second.erase(key);
-            if (fi->second.empty())
-                w.keys.erase(fi);
-        }
-        if (w.keys.empty()) {
-            // No spark cares about this dir any more. Drop its ancestor dependency
-            // (S1) first, then free. If an I/O is outstanding, cancel it and let
-            // the worker free the DirWatch when the (aborted) completion drains —
-            // never free memory a pending completion points at. Else drop now.
-            release_ancestor(w);
-            // Guard shape matches release_ancestor's below exactly (io_pending
-            // implies handle everywhere in this file, but check both so the
-            // two "same pattern" sites stay textually identical — governance
-            // Gate-4 consistency finding).
-            if (w.io_pending && w.handle) {
-                w.removing = true;
-                ::CancelIoEx(w.handle.get(), &w.ov);
-                // Free dirkey for reuse NOW — a watch() racing this unwatch()
-                // must get a fresh DirWatch, never resurrect this one (it's
-                // already been told to die and will be freed by drop_watch()
-                // when the aborted completion drains). Leaving it keyed in
-                // dirs_ let a same-dir re-arm silently insert into a watch
-                // that's about to be freed — arm() reports success but there
-                // is no live ReadDirectoryChangesW behind it (governance
-                // finding, PR #1927 review), matching release_ancestor's
-                // existing retiring_ pattern above.
-                retiring_.push_back(std::move(di->second));
-                dirs_.erase(di);
-            } else {
-                dirs_.erase(di);
-            }
-        }
+        unwatch_locked(key);
     }
 
     void stop() override {
@@ -309,6 +281,55 @@ public:
     }
 
 private:
+    /// Core of unwatch(); ASSUMES mu_ IS ALREADY HELD. Also called by watch()
+    /// to implicitly clear a stale key_index_ registration before re-arming
+    /// the same key against a different (dirkey, fname) — see watch() (#1981).
+    void unwatch_locked(const std::string& key) {
+        auto ki = key_index_.find(key);
+        if (ki == key_index_.end())
+            return;
+        const auto [dirkey, fname] = ki->second;
+        key_index_.erase(ki);
+        auto di = dirs_.find(dirkey);
+        if (di == dirs_.end())
+            return;
+        DirWatch& w = *di->second;
+        auto fi = w.keys.find(fname);
+        if (fi != w.keys.end()) {
+            fi->second.erase(key);
+            if (fi->second.empty())
+                w.keys.erase(fi);
+        }
+        if (w.keys.empty()) {
+            // No spark cares about this dir any more. Drop its ancestor dependency
+            // (S1) first, then free. If an I/O is outstanding, cancel it and let
+            // the worker free the DirWatch when the (aborted) completion drains —
+            // never free memory a pending completion points at. Else drop now.
+            release_ancestor(w);
+            // Guard shape matches release_ancestor's below exactly (io_pending
+            // implies handle everywhere in this file, but check both so the
+            // two "same pattern" sites stay textually identical — governance
+            // Gate-4 consistency finding).
+            if (w.io_pending && w.handle) {
+                w.removing = true;
+                ::CancelIoEx(w.handle.get(), &w.ov);
+                // Free dirkey for reuse NOW — a watch() racing this unwatch()
+                // must get a fresh DirWatch, never resurrect this one (it's
+                // already been told to die and will be freed by drop_watch()
+                // when the aborted completion drains). Leaving it keyed in
+                // dirs_ let a same-dir re-arm silently insert into a watch
+                // that's about to be freed — arm() reports success but there
+                // is no live ReadDirectoryChangesW behind it (governance
+                // finding, PR #1927 review), matching release_ancestor's
+                // existing retiring_ pattern above.
+                retiring_.push_back(std::move(di->second));
+                dirs_.erase(di);
+            } else {
+                dirs_.erase(di);
+            }
+        }
+    }
+
     /// Issue (or re-issue) the overlapped ReadDirectoryChangesW for `w`. Opens
     /// the directory handle + associates it with the IOCP on first arm. Returns
     /// false if the directory can't be opened (caller falls back to ancestor).
