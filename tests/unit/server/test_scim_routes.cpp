@@ -334,6 +334,70 @@ TEST_CASE("ScimRoutes: PATCH active=true is a no-op when the resource is already
     CHECK(f.auth_mgr.get_user_role("heidi2").has_value());
 }
 
+// FIX-2 (MEDIUM-1, CC6.8 deprovision desync): a PATCH active=false against a
+// resource whose MIRROR already reads inactive must not blindly no-op — it
+// must verify the real auth account state first. Desync is induced directly
+// at the store layer (`set_active`, bypassing `deactivate()`) so the auth
+// account stays genuinely live while the mirror flips to inactive — the
+// exact "IdP believes terminated, account is not" gap the fix closes.
+TEST_CASE("ScimRoutes: PATCH active=false re-runs deactivation when the mirror is desynced "
+         "from a still-live auth account",
+         "[scim][routes][patch][deprovision]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "ivan"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.get_user_role("ivan").has_value());
+
+    // Desync: flip the mirror to inactive WITHOUT touching the auth account.
+    REQUIRE(f.scim_store->set_active(id, false));
+    REQUIRE(f.auth_mgr.get_user_role("ivan").has_value()); // still live
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(json::parse(res->body)["active"] == false);
+
+    // The desync is repaired: the auth account is now ACTUALLY deactivated,
+    // and the real deactivation path fired — asserted via the dedicated
+    // "scim.user.deactivated" audit action (NOT total_count(), which every
+    // PATCH bumps via the routine "scim.user.updated" row regardless of
+    // whether active actually transitioned).
+    CHECK_FALSE(f.auth_mgr.get_user_role("ivan").has_value());
+    AuditQuery q;
+    q.action = "scim.user.deactivated";
+    q.target_id = id;
+    CHECK(f.audit_store->query(q).size() == 1);
+}
+
+TEST_CASE("ScimRoutes: PATCH active=false stays a clean no-op when the account is genuinely "
+         "already inactive",
+         "[scim][routes][patch][deprovision]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "ivan2"}})->body);
+    auto id = created["id"].get<std::string>();
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    REQUIRE(f.patch("/scim/v2/Users/" + id, patch_body)->status == 200);
+    CHECK_FALSE(f.auth_mgr.get_user_role("ivan2").has_value());
+
+    // Second active=false against an account that is ALSO genuinely
+    // inactive at the auth layer — must stay a true no-op: 200, and no
+    // SECOND "scim.user.deactivated" row (deactivate() is not re-run;
+    // preserves the happy-path idempotency other reviewers verified). The
+    // routine "scim.user.updated" audit still fires per-PATCH regardless —
+    // that is pre-existing, orthogonal behavior, not what this fix guards.
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    AuditQuery q;
+    q.action = "scim.user.deactivated";
+    q.target_id = id;
+    CHECK(f.audit_store->query(q).size() == 1);
+}
+
 // ── DELETE ──────────────────────────────────────────────────────────────────
 
 TEST_CASE("ScimRoutes: DELETE — 204 + account soft-deleted", "[scim][routes][delete]") {
@@ -826,6 +890,26 @@ TEST_CASE("ScimRoutes: PUT active=false then active=true round-trips the auth ac
     CHECK(f.auth_mgr.get_user_role("kate").has_value());
 }
 
+// FIX-2 (MEDIUM-1, CC6.8 deprovision desync) — PUT counterpart of the PATCH
+// test above.
+TEST_CASE("ScimRoutes: PUT active=false re-runs deactivation when the mirror is desynced "
+         "from a still-live auth account",
+         "[scim][routes][put]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "laura"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.get_user_role("laura").has_value());
+
+    REQUIRE(f.scim_store->set_active(id, false));
+    REQUIRE(f.auth_mgr.get_user_role("laura").has_value()); // still live
+
+    auto res = f.put("/scim/v2/Users/" + id, {{"userName", "laura"}, {"active", false}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(json::parse(res->body)["active"] == false);
+    CHECK_FALSE(f.auth_mgr.get_user_role("laura").has_value());
+}
+
 // ── Malformed body handling ──────────────────────────────────────────────
 
 TEST_CASE("ScimRoutes: malformed JSON body — 400 on POST/PATCH", "[scim][routes][malformed]") {
@@ -946,6 +1030,65 @@ TEST_CASE("ScimRoutes: GET list clamps count to maxResults", "[scim][routes][lis
     auto body = json::parse(res->body);
     CHECK(body["itemsPerPage"] == scim::kMaxScimListResults);
     CHECK(body["Resources"].size() == static_cast<std::size_t>(scim::kMaxScimListResults));
+}
+
+// FIX-1 (MEDIUM-2, S-BOUND-INTPARAM): a malformed startIndex/count must
+// fail cleanly with a SCIM 400 `invalidValue`, never an unhandled
+// std::stoi exception escaping to a 500.
+TEST_CASE("ScimRoutes: GET list — non-numeric startIndex is a 400, not a 500",
+         "[scim][routes][list]") {
+    Fixture f;
+    auto res = f.get("/scim/v2/Users?startIndex=abc");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto body = json::parse(res->body);
+    CHECK(body["scimType"] == "invalidValue");
+}
+
+TEST_CASE("ScimRoutes: GET list — an absurdly long startIndex is a 400, not a 500",
+         "[scim][routes][list]") {
+    Fixture f;
+    auto res = f.get("/scim/v2/Users?startIndex=" + std::string(40, '9'));
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto body = json::parse(res->body);
+    CHECK(body["scimType"] == "invalidValue");
+}
+
+TEST_CASE("ScimRoutes: GET list — a malformed count is a 400, not a 500",
+         "[scim][routes][list]") {
+    Fixture f;
+    auto res = f.get("/scim/v2/Users?count=" + std::string(40, '9'));
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto body = json::parse(res->body);
+    CHECK(body["scimType"] == "invalidValue");
+}
+
+TEST_CASE("ScimRoutes: GET list — a negative startIndex is clamped to 1, not a 400",
+         "[scim][routes][list]") {
+    Fixture f;
+    REQUIRE(f.scim_store->create_resource("negidxuser").has_value());
+
+    auto res = f.get("/scim/v2/Users?startIndex=-5");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = json::parse(res->body);
+    CHECK(body["startIndex"] == 1);
+}
+
+TEST_CASE("ScimRoutes: GET list — a valid startIndex/count still works", "[scim][routes][list]") {
+    Fixture f;
+    for (int i = 0; i < 10; ++i)
+        REQUIRE(f.scim_store->create_resource("pageuser" + std::to_string(i)).has_value());
+
+    auto res = f.get("/scim/v2/Users?startIndex=2&count=5");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = json::parse(res->body);
+    CHECK(body["startIndex"] == 2);
+    CHECK(body["itemsPerPage"] == 5);
+    CHECK(body["Resources"].size() == 5);
 }
 
 // ── scim_boot_guard_ok (S-BOOTGUARD-TEST) ───────────────────────────────

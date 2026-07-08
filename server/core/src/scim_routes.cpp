@@ -10,8 +10,10 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -56,6 +58,37 @@ void send_scim_error(httplib::Response& res, int status, std::string_view detail
 void send_scim_error(httplib::Response& res, const scim::ScimError& e) {
     res.status = e.status;
     res.set_content(scim::error(e).dump(), kScimJson);
+}
+
+/// S-BOUND-INTPARAM (sec MEDIUM-2): parse a SCIM list query int param
+/// (`startIndex`/`count`) with a shape check on the raw string BEFORE ever
+/// handing it to `std::stoi` — an empty value, non-numeric garbage, or an
+/// absurdly long digit string must fail cleanly with a SCIM 400
+/// `invalidValue`, never an unhandled `std::invalid_argument`/
+/// `std::out_of_range` escaping to an unhandled-exception 500. `raw` is
+/// rejected if empty, longer than 10 characters (a legitimate startIndex/
+/// count never needs more digits than `INT_MAX`), or not all-digits with an
+/// optional leading `-`. `std::stoi` is still wrapped in try/catch as
+/// belt-and-suspenders. On failure, sends the 400 response and returns
+/// `std::nullopt`; the caller is responsible for `record_request(...)`.
+std::optional<int> parse_scim_int_param(httplib::Response& res, std::string_view raw,
+                                        std::string_view param_name) {
+    bool shape_ok = !raw.empty() && raw.size() <= 10;
+    if (shape_ok) {
+        std::size_t i = (raw.front() == '-') ? 1 : 0;
+        shape_ok = i < raw.size();
+        for (; shape_ok && i < raw.size(); ++i)
+            shape_ok = std::isdigit(static_cast<unsigned char>(raw[i])) != 0;
+    }
+    if (shape_ok) {
+        try {
+            return std::stoi(std::string(raw));
+        } catch (const std::exception&) {
+            shape_ok = false;
+        }
+    }
+    send_scim_error(res, 400, std::string(param_name) + " must be an integer", "invalidValue");
+    return std::nullopt;
 }
 
 /// Fixed audit principal — there is no session/human operator on this
@@ -777,24 +810,27 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
                 int start_index = 1;
                 if (req.has_param("startIndex")) {
-                    try {
-                        start_index = std::stoi(req.get_param_value("startIndex"));
-                    } catch (const std::exception&) {
-                        send_scim_error(res, 400, "startIndex must be an integer",
-                                       "invalidValue");
+                    auto parsed =
+                        parse_scim_int_param(res, req.get_param_value("startIndex"), "startIndex");
+                    if (!parsed) {
                         record_request(auth_mgr, "list", 400);
                         return;
                     }
+                    start_index = *parsed;
+                    // SCIM startIndex is 1-based (RFC 7644 §3.4.2); clamp
+                    // anything below 1 up to the first page rather than
+                    // echoing a negative/zero value back in the response.
+                    if (start_index < 1)
+                        start_index = 1;
                 }
                 int count = 100;
                 if (req.has_param("count")) {
-                    try {
-                        count = std::stoi(req.get_param_value("count"));
-                    } catch (const std::exception&) {
-                        send_scim_error(res, 400, "count must be an integer", "invalidValue");
+                    auto parsed = parse_scim_int_param(res, req.get_param_value("count"), "count");
+                    if (!parsed) {
                         record_request(auth_mgr, "list", 400);
                         return;
                     }
+                    count = *parsed;
                 }
                 // S-CLAMP-COUNT: never serve more than the maxResults this
                 // server advertises in ServiceProviderConfig, regardless of
@@ -902,6 +938,32 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     }
                     resource->active = true;
                     active_transitioned = true;
+                } else if (input.active.has_value() && !*input.active && !resource->active) {
+                    // FIX (MEDIUM-1, CC6.8 deprovision desync): the
+                    // scim_resource mirror already reads inactive, but do
+                    // not trust it blindly before taking the no-op
+                    // short-circuit — a prior mirror-write failure (see
+                    // deactivate()'s M-ATOMICITY comment) or an
+                    // out-of-band reactivation could leave the underlying
+                    // auth account genuinely LIVE while SCIM/the IdP
+                    // believes it is already deprovisioned. Check the real
+                    // auth state; only take the no-op when it is ALSO
+                    // genuinely inactive.
+                    if (auth_mgr->get_user_role(resource->username).has_value()) {
+                        spdlog::warn(
+                            "ScimRoutes: PUT active:false — scim_resource mirror for '{}' "
+                            "(scim_id={}) says inactive but the auth account is still live; "
+                            "re-running deactivation",
+                            resource->username, resource->scim_id);
+                        if (!deactivate(scim_store, auth_mgr, audit_store, req, res, *resource,
+                                        "scim.user.deactivated")) {
+                            record_request(auth_mgr, "replace", res.status);
+                            return;
+                        }
+                        resource->active = false;
+                        active_transitioned = true;
+                    }
+                    // else: genuinely already inactive — true no-op, no audit.
                 }
 
                 if (!scim_store->update_resource(resource->scim_id, resource->username,
@@ -1004,8 +1066,30 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                           }
                           resource->active = true;
                           active_transitioned = true;
+                      } else if (!*patch.active && !resource->active) {
+                          // FIX (MEDIUM-1, CC6.8 deprovision desync): same
+                          // reasoning as the PUT active:false no-op branch
+                          // — verify the real auth state before trusting
+                          // the mirror's "already inactive" and short-
+                          // circuiting to a no-op.
+                          if (auth_mgr->get_user_role(resource->username).has_value()) {
+                              spdlog::warn(
+                                  "ScimRoutes: PATCH active:false — scim_resource mirror for "
+                                  "'{}' (scim_id={}) says inactive but the auth account is "
+                                  "still live; re-running deactivation",
+                                  resource->username, resource->scim_id);
+                              if (!deactivate(scim_store, auth_mgr, audit_store, req, res,
+                                              *resource, "scim.user.deactivated")) {
+                                  record_request(auth_mgr, "patch", res.status);
+                                  return;
+                              }
+                              resource->active = false;
+                              active_transitioned = true;
+                          }
+                          // else: genuinely already inactive — true no-op, no audit.
                       }
-                      // else: no-op (already in the requested state).
+                      // else: no-op (active:true already reads active — no
+                      // desync risk on the reactivate path).
                   }
 
                   if (patch.external_id.has_value()) {
