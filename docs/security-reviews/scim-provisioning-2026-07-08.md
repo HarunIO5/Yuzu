@@ -48,12 +48,43 @@ follow-up).
   `scim.user.provenance_denied` audit row, so the attempt is still
   recorded even though the caller sees a plain not-found.
 - **Deprovision cascades sessions; reactivation does not resurrect MFA.**
-  `active:false` (via `PATCH` or `DELETE`) soft-deletes the auth account
-  **and** revokes any live session for that user — a terminated employee's
-  in-flight session does not outlive the IdP's call. `active:true` restores
-  the account and clears stale lockout state, but deliberately does **not**
-  restore TOTP enrollment — a reactivated user re-enrolls MFA from scratch,
-  so a dormant device/secret from before termination is never trusted again.
+  `active:false` (via `PATCH`, `PUT`, or `DELETE`) soft-deletes the auth
+  account **and** revokes any live session for that user — a terminated
+  employee's in-flight session does not outlive the IdP's call. `active:true`
+  restores the account and clears stale lockout state, but deliberately does
+  **not** restore TOTP enrollment — a reactivated user re-enrolls MFA from
+  scratch, so a dormant device/secret from before termination is never
+  trusted again. Session revocation is the *auth session* cascade — see the
+  API-token caveat under Residual risks below for a related, narrower gap.
+- **The provenance guard now also re-checks `role`.** Every deactivate/
+  reactivate/update/delete re-verifies `provisioning_source == "scim"` **and**
+  `role == "user"` immediately before mutating, refusing `404` on either
+  mismatch. This closes a gap where a SCIM-provisioned account later
+  promoted by a human admin (e.g. to `admin`) could still be torn down by an
+  IdP push — that account now drops out of SCIM's write authority the
+  moment it is elevated, regardless of how it was originally created.
+- **Reprovisioning a returning employee is supported.** `POST` against a
+  `userName` matching an existing, currently-**deactivated** SCIM-provisioned
+  account revives it rather than `409`ing — a `409` is reserved for a
+  collision against a currently-**active** account. This closes a usability
+  gap (a `409` on rejoin would have forced manual admin intervention) without
+  weakening the uniqueness guarantee against active accounts.
+- **Audit posture: fail-closed on the state-changing path.** Deactivate/
+  reactivate audit writes are now fail-closed — if the audit write itself
+  fails, the request returns `500` (the IdP retries) rather than mutating
+  the account with no record. Provision/update remain set-and-proceed
+  (account change succeeds even if the audit write fails), tracked via
+  `yuzu_scim_audit_write_failures_total` — a missed *creation* audit row is a
+  materially lower integrity risk than a missed *termination* one, so the
+  stricter posture is reserved for the path where losing the record matters
+  most.
+- **New metrics close an observability gap.** `yuzu_scim_requests_total{op,
+  status}`, `yuzu_scim_auth_failures_total`, `yuzu_scim_audit_write_failures_total`,
+  and `yuzu_scim_provenance_denied_total` give an operator a Prometheus-native
+  signal for auth failures, guard denials, and audit-write failures on this
+  surface without having to scrape the audit log directly — this is a
+  strengthened control added in this hardening round, not present in the
+  original review.
 - **Storage rides `auth.db`, not a new store.** `scim_resources` (id/
   externalId ↔ username mapping) and `scim_tokens` (sha256 hashes) live
   inside the same `auth.db` file `AuthDB` manages, under their own
@@ -62,7 +93,9 @@ follow-up).
   `auth.db`'s eventual Postgres migration (ADR-0006) rather than needing a
   second migration path or second `.db` file.
 - **Audit actions:** `scim.user.provisioned`, `.updated`, `.deactivated`,
-  `.reactivated`, `.deleted`, `.provenance_denied` — all `target_type=User`.
+  `.reactivated`, `.deleted`, `.provenance_denied`, and (new this round)
+  `scim.auth.denied` — all `target_type=User`, `principal=scim-service`.
+  Result values are `success` | `failure` | `denied` (not `ok`/`error`).
 
 ## Threats considered
 
@@ -98,6 +131,38 @@ follow-up).
 
 ## Residual risks (accepted / tracked)
 
+> **Correction to this review's original framing.** An earlier draft of
+> this document characterized deprovision as unconditionally "cascading
+> session revocation / revoking any live session," which overstates the
+> guarantee in three respects corrected below: (a) it does not revoke a
+> live **API token**; (b) the auth-session cascade itself has an
+> irreducible crash-window (not a bug, a property of the two-connection
+> design); (c) it says nothing about the `userName`-charset limitation
+> that can block provisioning entirely for a naively-configured IdP. All
+> three are recorded here rather than silently left as an inflated claim.
+
+- **API-token revocation on user delete/deactivate is a pre-existing,
+  shared gap — not new to SCIM.** SCIM's deactivate/delete path revokes the
+  user's **auth sessions** but does not revoke that user's live **API
+  tokens** (`ApiTokenStore` rows are not touched). This is not a SCIM-specific
+  omission: the dashboard's own manual "disable user" path has the same
+  gap today. Tracked as a shared follow-up against the API-token lifecycle,
+  not something this SCIM slice introduced or is uniquely responsible for
+  closing.
+- **The two-connection deactivate/reactivate path has an irreducible
+  crash-window.** `ScimStore` and `AuthDB` are separate `sqlite3`
+  connections onto the same `auth.db` file; a crash between "soft-delete
+  the account" and "revoke sessions" is not covered by a single atomic
+  transaction. This is accepted, not deferred-as-a-bug: the recovery
+  mechanism is the IdP's own periodic re-sync (SCIM connectors poll/re-push
+  state on a schedule), which re-issues the deactivate call and closes the
+  gap within one sync interval, rather than a code-level fix in this slice.
+- **`userName` is email-incompatible; a naive IdP setup 400s on every
+  provisioning call.** Yuzu usernames are slug-shaped (no `@`); Okta/Entra's
+  default `userName=email` mapping fails closed (`400`) rather than
+  silently truncating or mangling the value — correct fail-closed behavior,
+  but a real setup-friction point until native email-`userName` support
+  ships. Tracked in `docs/auth-architecture.md` "Residual risks / deferred".
 - **`location_base` trusts `Host`/`X-Forwarded-Proto`.** The `Location`
   header on a `201` and the `meta.location` field in SCIM User bodies are
   built from the request's `Host`/`X-Forwarded-Proto`, which are
@@ -111,8 +176,8 @@ follow-up).
   rate-limit only; there is no throttle tuned to expected IdP-connector call
   volume/shape. A compromised or malfunctioning connector could still hit
   the global limit but has no SCIM-specific amplification path beyond that.
-  Tracked as a follow-up (`docs/auth-architecture.md` "Deferred (next
-  slice)").
+  Tracked as a follow-up (`docs/auth-architecture.md` "Residual risks /
+  deferred (next slice)").
 - **SCIM bearer token stored as a verify-only hash, not a reversible
   encrypted blob.** This is actually the *stronger* posture (nothing to
   decrypt if `auth.db` leaks), so it is not itself a gap — noted because a

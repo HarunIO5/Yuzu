@@ -7,6 +7,7 @@
 #include <yuzu/version.hpp>
 
 #include "insecure_tls_gate.hpp"
+#include "scim_routes.hpp"
 #include "security_headers.hpp"
 
 #include <CLI/CLI.hpp>
@@ -1264,17 +1265,14 @@ int main(int argc, char* argv[]) {
     // ── SCIM v2 provisioning fail-closed guard (CC6.2) ──────────────────────
     // An unauthenticated /scim/v2/* provisioning surface would be catastrophic
     // (any anonymous caller could mint/deactivate operator accounts), so refuse
-    // to start rather than boot it half-configured.
+    // to start rather than boot it half-configured. The token/HTTPS
+    // preconditions live in the testable `scim_boot_guard_ok` (S-BOOTGUARD-TEST,
+    // scim_routes.cpp) — this is the thin main-side wrapper, mirroring
+    // `break_glass_user_valid` above.
     if (cfg.scim_enable) {
-        if (cfg.scim_token.empty()) {
-            spdlog::error("--scim-enable requires --scim-token (or YUZU_SCIM_TOKEN) — refusing "
-                          "to start an unauthenticated provisioning surface.");
-            return EXIT_FAILURE;
-        }
-        if (!cfg.https_enabled) {
-            spdlog::error("--scim-enable requires HTTPS (the bearer token would otherwise cross "
-                          "the wire in plaintext) — refusing to start with --no-https set. Enable "
-                          "HTTPS or disable --scim-enable.");
+        std::string err;
+        if (!yuzu::server::scim_boot_guard_ok(cfg, err)) {
+            spdlog::error("{}", err);
             return EXIT_FAILURE;
         }
         spdlog::warn("SCIM v2 provisioning ACTIVE (--scim-enable): /scim/v2/* accepts a "

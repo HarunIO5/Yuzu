@@ -19,6 +19,7 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <cstddef>
 #include <expected>
 #include <optional>
 #include <string>
@@ -41,6 +42,19 @@ inline constexpr std::string_view kSchemaServiceProviderConfig =
 inline constexpr std::string_view kSchemaResourceType =
     "urn:ietf:params:scim:schemas:core:2.0:ResourceType";
 inline constexpr std::string_view kSchemaSchema = "urn:ietf:params:scim:schemas:core:2.0:Schema";
+
+/// Bound on `externalId` (S-EXTID, UP-13): IdP-supplied opaque identifiers
+/// are typically GUIDs/short opaque strings; 256 bytes is generous headroom
+/// while refusing an absurdly oversized value on a field Yuzu only stores
+/// and echoes back, never interprets. Uniqueness enforcement on this field
+/// is NOT implemented (out of scope for this slice).
+inline constexpr std::size_t kMaxExternalIdLength = 256;
+
+/// The `filter.maxResults` this server advertises in ServiceProviderConfig
+/// (S-CLAMP-COUNT). `ScimRoutes`'s GET /Users list handler clamps a
+/// caller-supplied `count` to this same constant so the advertised cap is
+/// actually enforced, not just documented.
+inline constexpr int kMaxScimListResults = 200;
 
 /// A structured SCIM error: `status` is the HTTP status to send AND is
 /// serialized as a JSON *string* per RFC 7644 §3.12; `scim_type` is the

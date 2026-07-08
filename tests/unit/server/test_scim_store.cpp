@@ -24,6 +24,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string_view>
 
@@ -33,10 +34,21 @@ using yuzu::server::auth::Role;
 
 namespace {
 
+/// Pre-create an empty file at `path`. Production ScimStore no longer opens
+/// with SQLITE_OPEN_CREATE (S-DROP-CREATE — AuthDB is always the one that
+/// creates+chmods-0600 auth.db first, see scim_store.cpp), so a standalone-
+/// ScimStore fixture with no live AuthDB in the loop must ensure the file
+/// exists before construction.
+bool touch_file(const std::filesystem::path& path) {
+    std::ofstream f(path, std::ios::binary);
+    return f.good();
+}
+
 /// Owns a standalone ScimStore over its own temp file — used by tests that
 /// don't need to exercise coexistence with a live AuthDB connection.
 struct ScimFixture {
     yuzu::test::TempDbFile db_file{std::string_view{"yuzu-scim-"}};
+    bool touched_{touch_file(db_file.path)};
     ScimStore store{db_file.path};
 };
 
@@ -311,6 +323,52 @@ TEST_CASE("AuthDB: provisioning_source accessors reject unknown/invalid username
 
     // Well-formed but absent user -> UserNotFound.
     auto missing = db.get_provisioning_source("ghost");
+    REQUIRE_FALSE(missing.has_value());
+    CHECK(missing.error() == AuthDBError::UserNotFound);
+}
+
+// ── AuthDB::set_identity_source (S-IDENTITY-SRC) ────────────────────────
+
+TEST_CASE("AuthDB: set_identity_source round-trips and defaults to local",
+         "[scim][auth_db][identity_source]") {
+    auto data_dir = yuzu::test::unique_temp_path("yuzu-identsrc-");
+    std::filesystem::create_directories(data_dir);
+
+    AuthDB db(data_dir, /*cleanup_interval_secs=*/0);
+    REQUIRE(db.initialize().has_value());
+
+    auto salt = AuthManager::random_bytes(16);
+    auto salt_hex = AuthManager::bytes_to_hex(salt);
+    auto hash = AuthManager::pbkdf2_sha256("pw", salt, 1000);
+    REQUIRE(db.upsert_user("ida", hash, salt_hex, Role::user).has_value());
+
+    // v6 default, before any SCIM provisioning touches it.
+    auto before = db.get_user("ida");
+    REQUIRE(before.has_value());
+    CHECK(before->identity_source == "local");
+
+    REQUIRE(db.set_identity_source("ida", "scim").has_value());
+
+    auto after = db.get_user("ida");
+    REQUIRE(after.has_value());
+    CHECK(after->identity_source == "scim");
+    // Distinct dimension — provisioning_source is untouched by this call.
+    CHECK(db.get_provisioning_source("ida").value() == "local");
+}
+
+TEST_CASE("AuthDB: set_identity_source rejects unknown/invalid usernames",
+         "[scim][auth_db][identity_source]") {
+    auto data_dir = yuzu::test::unique_temp_path("yuzu-identsrc-invalid-");
+    std::filesystem::create_directories(data_dir);
+
+    AuthDB db(data_dir, /*cleanup_interval_secs=*/0);
+    REQUIRE(db.initialize().has_value());
+
+    auto bad = db.set_identity_source("bad:name", "scim");
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error() == AuthDBError::InvalidUsername);
+
+    auto missing = db.set_identity_source("ghost", "scim");
     REQUIRE_FALSE(missing.has_value());
     CHECK(missing.error() == AuthDBError::UserNotFound);
 }

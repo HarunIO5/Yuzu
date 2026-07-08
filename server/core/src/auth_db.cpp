@@ -2524,6 +2524,38 @@ AuthDB::get_provisioning_source(const std::string& username) {
     return std::unexpected(AuthDBError::UserNotFound);
 }
 
+std::expected<void, AuthDBError> AuthDB::set_identity_source(const std::string& username,
+                                                              const std::string& source) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    // Single UPDATE ... RETURNING (no sqlite3_changes() — #1033). Touches
+    // ONLY identity_source — never credentials, role, or provisioning_source.
+    static const char* sql = R"(
+        UPDATE users SET identity_source = ?1, updated_at = CURRENT_TIMESTAMP
+        WHERE username = ?2 AND is_active = 1
+        RETURNING identity_source
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare set_identity_source statement: {}",
+                      sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_text(stmt, 1, source.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, username.c_str(), -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc == SQLITE_ROW) {
+        return {};
+    }
+    if (rc != SQLITE_DONE) {
+        spdlog::error("set_identity_source failed: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+    return std::unexpected(AuthDBError::UserNotFound);
+}
+
 std::expected<void, AuthDBError> AuthDB::reactivate_user(const std::string& username) {
     if (!is_valid_username(username)) {
         return std::unexpected(AuthDBError::InvalidUsername);

@@ -37,9 +37,13 @@ constexpr const char* kResourceColumns =
 } // namespace
 
 ScimStore::ScimStore(const std::filesystem::path& db_path) {
+    // Deliberately NO SQLITE_OPEN_CREATE (S-DROP-CREATE, authdb LOW): AuthDB
+    // is the primary owner of this file and always creates it (chmod 0600)
+    // before ScimStore ever opens a connection to it (see server.cpp boot
+    // order). Without this, a boot-ordering bug could let ScimStore
+    // race-create auth.db first, leaving it world-readable at default umask.
     int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("ScimStore: failed to open {}: {}", db_path.string(),
                       db_ ? sqlite3_errmsg(db_) : "unknown");

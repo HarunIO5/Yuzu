@@ -92,6 +92,23 @@ TEST_CASE("scim_json: parse_user missing userName errors", "[scim][json]") {
     CHECK(result.error().scim_type == "invalidValue");
 }
 
+TEST_CASE("scim_json: parse_user rejects an oversized externalId (S-EXTID)", "[scim][json]") {
+    nlohmann::json body = {{"userName", "jdoe"},
+                           {"externalId", std::string(kMaxExternalIdLength + 1, 'x')}};
+    auto result = parse_user(body);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().status == 400);
+    CHECK(result.error().scim_type == "invalidValue");
+}
+
+TEST_CASE("scim_json: parse_user accepts externalId at exactly the max length", "[scim][json]") {
+    nlohmann::json body = {{"userName", "jdoe"},
+                           {"externalId", std::string(kMaxExternalIdLength, 'x')}};
+    auto result = parse_user(body);
+    REQUIRE(result.has_value());
+    CHECK(result->external_id.size() == kMaxExternalIdLength);
+}
+
 // ── parse_patch ──────────────────────────────────────────────────────────
 
 TEST_CASE("scim_json: parse_patch pathless value-object active:false", "[scim][json]") {
@@ -113,6 +130,25 @@ TEST_CASE("scim_json: parse_patch explicit path active:false", "[scim][json]") {
     REQUIRE(result.has_value());
     REQUIRE(result->active.has_value());
     CHECK(result->active.value() == false);
+}
+
+TEST_CASE("scim_json: parse_patch rejects an oversized externalId, both forms (S-EXTID)",
+         "[scim][json]") {
+    std::string oversized(kMaxExternalIdLength + 1, 'x');
+
+    nlohmann::json explicit_path_body = {
+        {"Operations",
+         nlohmann::json::array({{{"op", "replace"}, {"path", "externalId"}, {"value", oversized}}})}};
+    auto explicit_path_result = parse_patch(explicit_path_body);
+    REQUIRE_FALSE(explicit_path_result.has_value());
+    CHECK(explicit_path_result.error().status == 400);
+
+    nlohmann::json pathless_body = {
+        {"Operations",
+         nlohmann::json::array({{{"op", "replace"}, {"value", {{"externalId", oversized}}}}})}};
+    auto pathless_result = parse_patch(pathless_body);
+    REQUIRE_FALSE(pathless_result.has_value());
+    CHECK(pathless_result.error().status == 400);
 }
 
 TEST_CASE("scim_json: parse_patch unsupported op errors", "[scim][json]") {
@@ -216,7 +252,10 @@ TEST_CASE("scim_json: service_provider_config shape", "[scim][json]") {
     CHECK(j["bulk"]["supported"] == false);
     CHECK(j["filter"]["supported"] == true);
     CHECK(j["filter"]["maxResults"] == 200);
-    CHECK(j["etag"]["supported"] == true);
+    // S-ETAG-FALSE: no If-Match conditional-write enforcement exists yet —
+    // advertising etag support would invite a connector to rely on 412
+    // semantics that never fire. meta.version/ETag stay informational-only.
+    CHECK(j["etag"]["supported"] == false);
     REQUIRE(j["authenticationSchemes"].is_array());
     CHECK(j["authenticationSchemes"][0]["type"] == "oauthbearertoken");
 }

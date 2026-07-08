@@ -26,18 +26,23 @@
 
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include <yuzu/server/scim_json.hpp>
 #include <yuzu/server/scim_store.hpp>
+#include <yuzu/server/server.hpp>
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 using namespace yuzu::server;
 using json = nlohmann::json;
@@ -59,7 +64,12 @@ struct Fixture {
     std::unique_ptr<ScimRoutes> routes;
     const std::string token{"unit-test-scim-bearer-token-0123456789"};
 
-    Fixture() {
+    /// `broken_audit=true` points AuditStore at a path whose parent
+    /// directory does not exist, so `sqlite3_open_v2` fails and every
+    /// `AuditStore::log()` call returns false thereafter — used to exercise
+    /// the set-and-proceed vs. fail-closed audit contract
+    /// (M-AUDIT-FAILCLOSED) without needing mid-test fault injection.
+    explicit Fixture(bool broken_audit = false) {
         std::filesystem::create_directories(data_dir);
         auth_db = std::make_unique<AuthDB>(data_dir, /*cleanup_interval_secs=*/0);
         REQUIRE(auth_db->initialize().has_value());
@@ -69,8 +79,14 @@ struct Fixture {
         REQUIRE(scim_store->is_open());
         REQUIRE(scim_store->set_token(token, "test"));
 
-        audit_store = std::make_unique<AuditStore>(audit_db_file.path);
-        REQUIRE(audit_store->is_open());
+        if (broken_audit) {
+            audit_store = std::make_unique<AuditStore>(
+                std::filesystem::path("/nonexistent-yuzu-scim-test-dir-0123") / "audit.db");
+            REQUIRE_FALSE(audit_store->is_open());
+        } else {
+            audit_store = std::make_unique<AuditStore>(audit_db_file.path);
+            REQUIRE(audit_store->is_open());
+        }
 
         routes = std::make_unique<ScimRoutes>();
         routes->register_routes(sink, scim_store.get(), &auth_mgr, audit_store.get());
@@ -378,4 +394,373 @@ TEST_CASE("ScimRoutes: provenance guard — SCIM cannot touch a locally-created 
     auto still_mapped = f.scim_store->get_by_scim_id(mapped->scim_id);
     REQUIRE(still_mapped.has_value());
     CHECK(still_mapped->active);
+}
+
+TEST_CASE("ScimRoutes: POST refuses to adopt a SOFT-DELETED local account (S-UNIQUE-DBREAD)",
+         "[scim][routes][provenance]") {
+    Fixture f;
+    // A local admin, soft-deleted via the ordinary human /api/settings/users
+    // DELETE path (remove_user) — no longer visible via get_user_role, the
+    // in-memory cache the OLD uniqueness check relied on.
+    REQUIRE(f.auth_mgr.upsert_user("paul", "correct-horse-battery-staple", auth::Role::admin));
+    REQUIRE(f.auth_mgr.remove_user("paul"));
+    CHECK_FALSE(f.auth_mgr.get_user_role("paul").has_value());
+
+    auto res = f.post("/scim/v2/Users", {{"userName", "paul"}});
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(json::parse(res->body)["scimType"] == "uniqueness");
+    // Still local and still inactive — SCIM never adopted it.
+    CHECK(f.auth_db->get_provisioning_source("paul").value() == "local");
+    CHECK_FALSE(f.auth_mgr.get_user_role("paul").has_value());
+}
+
+// ── M-LIFECYCLE — revive-on-reprovision ─────────────────────────────────
+
+TEST_CASE("ScimRoutes: DELETE then re-POST the same userName revives the account",
+         "[scim][routes][revive]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "olga"}})->body);
+    auto old_id = created["id"].get<std::string>();
+
+    auto del_res = f.del("/scim/v2/Users/" + old_id);
+    REQUIRE(del_res);
+    CHECK(del_res->status == 204);
+    CHECK_FALSE(f.auth_mgr.get_user_role("olga").has_value());
+    // The scim_resource mapping is hard-deleted...
+    CHECK_FALSE(f.scim_store->get_by_scim_id(old_id).has_value());
+    // ...but the underlying auth row survives as a soft-deleted SCIM
+    // tombstone — the exact state a returning employee's account is in.
+    auto tombstoned_source = f.auth_db->get_provisioning_source("olga");
+    REQUIRE(tombstoned_source.has_value());
+    CHECK(*tombstoned_source == "scim");
+
+    // Revive: re-POST the same userName. Previously this deadlocked (UP-1/
+    // 2/3): upsert_user's ON CONFLICT DO NOTHING made the write silently
+    // no-op forever, and no path ever called reactivate_user for a POST.
+    auto revived_res = f.post("/scim/v2/Users", {{"userName", "olga"}});
+    REQUIRE(revived_res);
+    CHECK(revived_res->status == 201);
+    auto revived_body = json::parse(revived_res->body);
+    CHECK(revived_body["userName"] == "olga");
+    CHECK(revived_body["active"] == true);
+    // Fresh scim_id — the old scim_resource row is gone for good.
+    auto new_id = revived_body["id"].get<std::string>();
+    CHECK(new_id != old_id);
+
+    auto role = f.auth_mgr.get_user_role("olga");
+    REQUIRE(role.has_value());
+    CHECK(*role == auth::Role::user);
+    CHECK(f.auth_db->get_provisioning_source("olga").value() == "scim");
+
+    // The revived account is fully usable again through the ordinary
+    // PATCH deprovision path.
+    json deactivate_body{{"Operations", json::array({{{"op", "replace"},
+                                                      {"value", {{"active", false}}}}})}};
+    auto patch_res = f.patch("/scim/v2/Users/" + new_id, deactivate_body);
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 200);
+    CHECK_FALSE(f.auth_mgr.get_user_role("olga").has_value());
+}
+
+TEST_CASE("ScimRoutes: concurrent duplicate POST for a brand-new userName — exactly one 201, "
+         "one 409 (UP-9, store layer race)",
+         "[scim][routes][post][race]") {
+    Fixture f;
+    std::atomic<int> created{0};
+    std::atomic<int> conflicted{0};
+    std::atomic<int> other{0};
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 2; ++i) {
+        threads.emplace_back([&f, &created, &conflicted, &other] {
+            auto res = f.post("/scim/v2/Users", {{"userName", "race-user"}});
+            if (!res) {
+                other.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            if (res->status == 201)
+                created.fetch_add(1, std::memory_order_relaxed);
+            else if (res->status == 409)
+                conflicted.fetch_add(1, std::memory_order_relaxed);
+            else
+                other.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    for (auto& t : threads)
+        t.join();
+
+    CHECK(created.load() == 1);
+    CHECK(conflicted.load() == 1);
+    CHECK(other.load() == 0);
+
+    // Exactly one scim_resource / auth account for "race-user" survives.
+    int total = -1;
+    auto page = f.scim_store->list(1, 100, total);
+    CHECK(total == 1);
+    CHECK(f.auth_mgr.get_user_role("race-user").has_value());
+}
+
+// ── M-DEPROV-ROLE ────────────────────────────────────────────────────────
+
+TEST_CASE("ScimRoutes: deprovision refused once an operator elevates the SCIM account to admin",
+         "[scim][routes][deprov_role]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "noah"}})->body);
+    auto id = created["id"].get<std::string>();
+
+    REQUIRE(f.auth_mgr.update_role("noah", auth::Role::admin));
+
+    json deactivate_body{{"Operations", json::array({{{"op", "replace"},
+                                                      {"value", {{"active", false}}}}})}};
+    auto patch_res = f.patch("/scim/v2/Users/" + id, deactivate_body);
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 404);
+    CHECK(f.auth_mgr.get_user_role("noah").value() == auth::Role::admin);
+
+    auto del_res = f.del("/scim/v2/Users/" + id);
+    REQUIRE(del_res);
+    CHECK(del_res->status == 404);
+    // Untouched — still admin, still active, still SCIM-provenanced (the
+    // account itself was never SCIM's to begin with adopting; only its
+    // lifecycle ownership is revoked by the role elevation).
+    CHECK(f.auth_mgr.get_user_role("noah").value() == auth::Role::admin);
+    CHECK(f.scim_store->get_by_scim_id(id).has_value());
+}
+
+// ── M-OPTDEREF ───────────────────────────────────────────────────────────
+
+TEST_CASE("ScimRoutes: PATCH after DELETE on the same id — 404, no crash",
+         "[scim][routes][optderef]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "rex"}})->body);
+    auto id = created["id"].get<std::string>();
+
+    auto del_res = f.del("/scim/v2/Users/" + id);
+    REQUIRE(del_res);
+    CHECK(del_res->status == 204);
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto patch_res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 404);
+
+    auto put_res = f.put("/scim/v2/Users/" + id, {{"userName", "rex"}});
+    REQUIRE(put_res);
+    CHECK(put_res->status == 404);
+}
+
+// ── M-AUDIT-FAILCLOSED / set-and-proceed split ──────────────────────────
+
+TEST_CASE("ScimRoutes: audit write failure on a non-termination action — set-and-proceed (201)",
+         "[scim][routes][audit]") {
+    Fixture f{/*broken_audit=*/true};
+    auto res = f.post("/scim/v2/Users", {{"userName", "sam"}});
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK(f.auth_mgr.get_user_role("sam").has_value());
+}
+
+TEST_CASE("ScimRoutes: audit write failure on a termination action — fails CLOSED (500)",
+         "[scim][routes][audit]") {
+    Fixture f{/*broken_audit=*/true};
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "tara"}})->body);
+    auto id = created["id"].get<std::string>();
+
+    json deactivate_body{{"Operations", json::array({{{"op", "replace"},
+                                                      {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, deactivate_body);
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    // The mutation ALREADY happened — fail-closed only withholds success
+    // reporting so the IdP retries; the retry is idempotent.
+    CHECK_FALSE(f.auth_mgr.get_user_role("tara").has_value());
+    auto stored = f.scim_store->get_by_scim_id(id);
+    REQUIRE(stored.has_value());
+    CHECK_FALSE(stored->active);
+}
+
+TEST_CASE("ScimRoutes: audit write failure on DELETE — fails CLOSED (500)",
+         "[scim][routes][audit]") {
+    Fixture f{/*broken_audit=*/true};
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "uri"}})->body);
+    auto id = created["id"].get<std::string>();
+
+    auto res = f.del("/scim/v2/Users/" + id);
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    CHECK_FALSE(f.auth_mgr.get_user_role("uri").has_value());
+}
+
+// ── PUT /scim/v2/Users/{id} — full replace ──────────────────────────────
+
+TEST_CASE("ScimRoutes: PUT identity replace — 200, externalId updated", "[scim][routes][put]") {
+    Fixture f;
+    auto created =
+        json::parse(f.post("/scim/v2/Users", {{"userName", "ivy"}, {"externalId", "ext-old"}})
+                        ->body);
+    auto id = created["id"].get<std::string>();
+
+    auto res = f.put("/scim/v2/Users/" + id, {{"userName", "ivy"}, {"externalId", "ext-new"}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = json::parse(res->body);
+    CHECK(body["userName"] == "ivy");
+    CHECK(body["externalId"] == "ext-new");
+    CHECK(body["active"] == true);
+}
+
+TEST_CASE("ScimRoutes: PUT userName change — 400 mutability, account untouched",
+         "[scim][routes][put]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "jack"}})->body);
+    auto id = created["id"].get<std::string>();
+
+    auto res = f.put("/scim/v2/Users/" + id, {{"userName", "jack2"}});
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(json::parse(res->body)["scimType"] == "mutability");
+    CHECK(f.auth_mgr.get_user_role("jack").has_value());
+}
+
+TEST_CASE("ScimRoutes: PUT unknown id — 404", "[scim][routes][put]") {
+    Fixture f;
+    auto res = f.put("/scim/v2/Users/deadbeefdeadbeefdeadbeefdeadbeef", {{"userName", "nobody"}});
+    REQUIRE(res);
+    CHECK(res->status == 404);
+}
+
+TEST_CASE("ScimRoutes: PUT active=false then active=true round-trips the auth account",
+         "[scim][routes][put]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "kate"}})->body);
+    auto id = created["id"].get<std::string>();
+
+    auto deactivate_res =
+        f.put("/scim/v2/Users/" + id, {{"userName", "kate"}, {"active", false}});
+    REQUIRE(deactivate_res);
+    CHECK(deactivate_res->status == 200);
+    CHECK(json::parse(deactivate_res->body)["active"] == false);
+    CHECK_FALSE(f.auth_mgr.get_user_role("kate").has_value());
+
+    auto reactivate_res = f.put("/scim/v2/Users/" + id, {{"userName", "kate"}, {"active", true}});
+    REQUIRE(reactivate_res);
+    CHECK(reactivate_res->status == 200);
+    CHECK(json::parse(reactivate_res->body)["active"] == true);
+    CHECK(f.auth_mgr.get_user_role("kate").has_value());
+}
+
+// ── Malformed body handling ──────────────────────────────────────────────
+
+TEST_CASE("ScimRoutes: malformed JSON body — 400 on POST/PATCH", "[scim][routes][malformed]") {
+    Fixture f;
+    auto post_res = f.sink.dispatch("POST", "/scim/v2/Users", "{not json",
+                                    "application/scim+json", f.auth_header());
+    REQUIRE(post_res);
+    CHECK(post_res->status == 400);
+
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "leo"}})->body);
+    auto id = created["id"].get<std::string>();
+    auto patch_res = f.sink.dispatch("PATCH", "/scim/v2/Users/" + id, "{not json",
+                                     "application/scim+json", f.auth_header());
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 400);
+}
+
+TEST_CASE("ScimRoutes: oversized body — 413 on POST/PATCH", "[scim][routes][malformed]") {
+    Fixture f;
+    std::string huge_body = R"({"userName":")" + std::string(70 * 1024, 'x') + R"("})";
+    auto post_res = f.sink.dispatch("POST", "/scim/v2/Users", huge_body, "application/scim+json",
+                                    f.auth_header());
+    REQUIRE(post_res);
+    CHECK(post_res->status == 413);
+
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "mia"}})->body);
+    auto id = created["id"].get<std::string>();
+    auto patch_res = f.sink.dispatch("PATCH", "/scim/v2/Users/" + id, huge_body,
+                                     "application/scim+json", f.auth_header());
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 413);
+}
+
+// ── S-POST-REFETCH ───────────────────────────────────────────────────────
+
+TEST_CASE("ScimRoutes: POST active:false — 201 body's ETag matches a following GET",
+         "[scim][routes][post]") {
+    Fixture f;
+    auto res = f.post("/scim/v2/Users", {{"userName", "uma"}, {"active", false}});
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    auto body = json::parse(res->body);
+    CHECK(body["active"] == false);
+    auto id = body["id"].get<std::string>();
+    auto post_etag = res->get_header_value("ETag");
+    CHECK_FALSE(post_etag.empty());
+    CHECK(body["meta"]["version"] == post_etag);
+
+    auto get_res = f.get("/scim/v2/Users/" + id);
+    REQUIRE(get_res);
+    auto get_body = json::parse(get_res->body);
+    CHECK(get_body["meta"]["version"] == post_etag);
+    CHECK(get_body["active"] == false);
+}
+
+// ── S-CLAMP-COUNT ────────────────────────────────────────────────────────
+
+TEST_CASE("ScimRoutes: GET list clamps count to maxResults", "[scim][routes][list]") {
+    Fixture f;
+    // Seed scim_resource rows directly at the store layer (cheap — no
+    // PBKDF2/AuthDB write per row) so this test can exceed maxResults
+    // without the cost of 200+ real HTTP provisions.
+    for (int i = 0; i < scim::kMaxScimListResults + 5; ++i) {
+        REQUIRE(f.scim_store->create_resource("clampuser" + std::to_string(i)).has_value());
+    }
+
+    auto res = f.get("/scim/v2/Users?count=99999");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = json::parse(res->body);
+    CHECK(body["itemsPerPage"] == scim::kMaxScimListResults);
+    CHECK(body["Resources"].size() == static_cast<std::size_t>(scim::kMaxScimListResults));
+}
+
+// ── scim_boot_guard_ok (S-BOOTGUARD-TEST) ───────────────────────────────
+
+TEST_CASE("scim_boot_guard_ok: disabled — always ok", "[scim][bootguard]") {
+    Config cfg;
+    cfg.scim_enable = false;
+    std::string err;
+    CHECK(scim_boot_guard_ok(cfg, err));
+    CHECK(err.empty());
+}
+
+TEST_CASE("scim_boot_guard_ok: enabled without a token — fails", "[scim][bootguard]") {
+    Config cfg;
+    cfg.scim_enable = true;
+    cfg.https_enabled = true;
+    cfg.scim_token.clear();
+    std::string err;
+    CHECK_FALSE(scim_boot_guard_ok(cfg, err));
+    CHECK_FALSE(err.empty());
+}
+
+TEST_CASE("scim_boot_guard_ok: enabled without HTTPS — fails", "[scim][bootguard]") {
+    Config cfg;
+    cfg.scim_enable = true;
+    cfg.https_enabled = false;
+    cfg.scim_token = "token";
+    std::string err;
+    CHECK_FALSE(scim_boot_guard_ok(cfg, err));
+    CHECK_FALSE(err.empty());
+}
+
+TEST_CASE("scim_boot_guard_ok: enabled with token AND https — ok", "[scim][bootguard]") {
+    Config cfg;
+    cfg.scim_enable = true;
+    cfg.https_enabled = true;
+    cfg.scim_token = "token";
+    std::string err;
+    CHECK(scim_boot_guard_ok(cfg, err));
+    CHECK(err.empty());
 }

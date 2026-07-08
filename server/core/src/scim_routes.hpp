@@ -34,9 +34,23 @@
 
 #include <httplib.h>
 
+#include <string>
+
 namespace yuzu::server {
 
 class AuditStore;
+struct Config;
+
+/// Testable core of the `--scim-enable` fail-closed boot guard (SOC 2 CC6.2,
+/// S-BOOTGUARD-TEST) — extracted from main.cpp so the token/HTTPS
+/// preconditions have direct unit coverage instead of only being exercised
+/// end-to-end by booting a server. Mirrors `break_glass_account_problem`'s
+/// pattern (auth_db.hpp): a thin main-side wrapper logs `err` and returns
+/// EXIT_FAILURE. Returns true (leaving `err` untouched) when the
+/// configuration is safe to boot with: SCIM disabled, or SCIM enabled with
+/// BOTH a non-empty token AND HTTPS. Never touches disk/network — pure
+/// config validation.
+bool scim_boot_guard_ok(const Config& cfg, std::string& err);
 
 class ScimRoutes {
 public:

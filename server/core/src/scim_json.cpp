@@ -56,6 +56,12 @@ std::expected<ScimUserInput, ScimError> parse_user(const nlohmann::json& body) {
     }
 
     input.external_id = body.value("externalId", std::string{});
+    if (input.external_id.size() > kMaxExternalIdLength) {
+        return std::unexpected(
+            ScimError{400, "invalidValue",
+                     "externalId exceeds the maximum length of " +
+                         std::to_string(kMaxExternalIdLength) + " bytes"});
+    }
 
     if (body.contains("active") && body["active"].is_boolean())
         input.active = body["active"].get<bool>();
@@ -128,6 +134,12 @@ std::expected<ScimPatch, ScimError> parse_patch(const nlohmann::json& body) {
                     return std::unexpected(
                         ScimError{400, "invalidValue", "externalId value must be a string"});
                 }
+                if (value.get_ref<const std::string&>().size() > kMaxExternalIdLength) {
+                    return std::unexpected(ScimError{
+                        400, "invalidValue",
+                        "externalId exceeds the maximum length of " +
+                            std::to_string(kMaxExternalIdLength) + " bytes"});
+                }
                 patch.external_id = value.get<std::string>();
             } else {
                 return std::unexpected(
@@ -160,6 +172,13 @@ std::expected<ScimPatch, ScimError> parse_patch(const nlohmann::json& body) {
                 if (!value["externalId"].is_string()) {
                     return std::unexpected(
                         ScimError{400, "invalidValue", "externalId value must be a string"});
+                }
+                if (value["externalId"].get_ref<const std::string&>().size() >
+                    kMaxExternalIdLength) {
+                    return std::unexpected(ScimError{
+                        400, "invalidValue",
+                        "externalId exceeds the maximum length of " +
+                            std::to_string(kMaxExternalIdLength) + " bytes"});
                 }
                 patch.external_id = value["externalId"].get<std::string>();
             }
@@ -269,10 +288,14 @@ nlohmann::json service_provider_config() {
     j["schemas"] = nlohmann::json::array({kSchemaServiceProviderConfig});
     j["patch"] = {{"supported", true}};
     j["bulk"] = {{"supported", false}, {"maxOperations", 0}, {"maxPayloadSize", 0}};
-    j["filter"] = {{"supported", true}, {"maxResults", 200}};
+    j["filter"] = {{"supported", true}, {"maxResults", kMaxScimListResults}};
     j["changePassword"] = {{"supported", false}};
     j["sort"] = {{"supported", false}};
-    j["etag"] = {{"supported", true}};
+    // S-ETAG-FALSE: `meta.version`/`ETag` are emitted as informational
+    // versioning only — there is no `If-Match` conditional-write enforcement
+    // on PUT/PATCH in this slice, so advertising etag support would invite a
+    // connector to rely on 412 semantics that never fire.
+    j["etag"] = {{"supported", false}};
     j["authenticationSchemes"] = nlohmann::json::array(
         {{{"type", "oauthbearertoken"}, {"name", "OAuth Bearer Token"}, {"primary", true}}});
     j["meta"] = {{"resourceType", "ServiceProviderConfig"}};

@@ -737,6 +737,33 @@ public:
         metrics_.describe("yuzu_auth_sso_provision_total",
                           "Total durable SSO identity provision/refresh upserts, by source",
                           "counter");
+        // SCIM v2 provisioning observability (governance hardening round,
+        // M-METRICS). Registered unconditionally (like every other describe()
+        // in this constructor) even when --scim-enable is off, so Prometheus
+        // alert rules can be authored up front; the series simply never
+        // increments on a disabled surface.
+        metrics_.describe("yuzu_scim_requests_total",
+                          "Total /scim/v2/Users requests, by op "
+                          "(create|get|list|replace|patch|delete) and status (2xx|4xx|5xx)",
+                          "counter");
+        metrics_.describe("yuzu_scim_auth_failures_total",
+                          "Total /scim/v2/* requests rejected by the bearer gate — a "
+                          "credential-guess/replay signal against a surface that can "
+                          "provision/deprovision operator accounts",
+                          "counter");
+        metrics_.describe("yuzu_scim_audit_write_failures_total",
+                          "Total SCIM audit rows that failed to persist, by action. The "
+                          "companion metric that makes set-and-proceed defensible for the "
+                          "non-termination actions (provisioned/updated/list) — termination "
+                          "actions (deactivated/deleted/reactivated) fail the request closed "
+                          "instead (M-AUDIT-FAILCLOSED)",
+                          "counter");
+        metrics_.describe("yuzu_scim_provenance_denied_total",
+                          "Total SCIM mutations refused because the target account's "
+                          "provisioning_source is not 'scim' (or its role was elevated outside "
+                          "SCIM's ownership) — SCIM attempting to touch an account it does not "
+                          "own is a misconfigured-IdP or compromised-IdP signal",
+                          "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -5161,6 +5188,12 @@ private:
                 // it is not on the request path, so report ok.
                 {"ca_store", !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open())},
                 {"ca_root", !cfg_.using_default_certs || (ca_store_ && ca_store_->has_root())},
+                // SRE Gate 6 HC-1: ScimStore is only constructed when
+                // --scim-enable is set (opt-in, mirrors the ca_store pattern
+                // above); a failed open/migration would otherwise silently
+                // reject every /scim/v2/* request while /readyz reported
+                // "ready".
+                {"scim_store", !cfg_.scim_enable || (scim_store_ && scim_store_->is_open())},
             };
 
             std::string failed_list;

@@ -31,6 +31,15 @@
 
 namespace yuzu::server {
 
+/// Canonical `users.provisioning_source` values (auth.db migration v7). Every
+/// read/write site MUST go through these constants rather than a raw string
+/// literal — a typo in either fails the SCIM provenance guard OPEN (S-PROV-
+/// CONST, consistency S2): a mismatched write would tag a fresh account with
+/// an unrecognised source (never revivable by SCIM), and a mismatched read in
+/// `provenance_ok` would refuse to recognise a legitimately SCIM-owned row.
+inline constexpr std::string_view kProvisioningSourceScim = "scim";
+inline constexpr std::string_view kProvisioningSourceLocal = "local";
+
 // ── Error Types ──────────────────────────────────────────────────────────────
 
 // Explicit underlying type — locks ABI/serialization width so adding new
@@ -208,6 +217,21 @@ public:
     /// for malformed input.
     std::expected<std::string, AuthDBError>
     get_provisioning_source(const std::string& username);
+
+    /// Set the `identity_source` marker (auth.db migration v6) directly —
+    /// distinct from `set_provisioning_source` (WHO manages the account's
+    /// lifecycle) — this is HOW the account authenticates, the same column
+    /// `upsert_sso_identity` writes for OIDC rows and the Settings user list
+    /// reads to render the "SSO" badge (S-IDENTITY-SRC). SCIM provisioning is
+    /// its own login surface (IdP-driven, no local password usable — see
+    /// `scim_routes.cpp`), so it gets its own value rather than being rendered
+    /// as `'local'`-login-capable. `source` is caller-supplied; this storage-
+    /// layer accessor does not itself enforce an enum. Single UPDATE ...
+    /// RETURNING (no sqlite3_changes() — #1033). UserNotFound when no active
+    /// row matched, InvalidUsername for malformed input. Never touches
+    /// credentials, role, or provisioning_source.
+    std::expected<void, AuthDBError> set_identity_source(const std::string& username,
+                                                          const std::string& source);
 
     /// Reactivate a soft-deleted (`is_active = 0`) user row — the SCIM v2
     /// PATCH/PUT `active: true` (un-suspend) path, and the only writer of
