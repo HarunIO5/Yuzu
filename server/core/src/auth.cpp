@@ -924,6 +924,41 @@ bool AuthManager::remove_user(const std::string& username) {
     return erased;
 }
 
+bool AuthManager::reactivate_user(const std::string& username) {
+    // No AuthDB, no soft-delete to reverse — config-file-only deployments
+    // never set is_active=0 in the first place (remove_user() there just
+    // erases the in-memory/config entry outright).
+    if (!auth_db_) {
+        spdlog::error("AuthManager::reactivate_user: no AuthDB configured for '{}'", username);
+        return false;
+    }
+
+    // DB write FIRST, outside mu_ — mirrors remove_user/update_role's lock
+    // ordering: the durable row is authoritative, the in-memory map is a
+    // read-optimization layered on top, never the other way around.
+    auto result = auth_db_->reactivate_user(username);
+    if (!result) {
+        spdlog::error("AuthDB reactivate_user failed for '{}'", username);
+        return false;
+    }
+
+    // remove_user() erased this username from users_; re-read the REAL row
+    // (role/credential-hash/identity_source) from AuthDB rather than
+    // synthesizing a stale entry, so get_user_role/list_users reflect the
+    // reactivated account immediately rather than only after a fresh login.
+    auto entry = auth_db_->get_user(username);
+    if (!entry) {
+        spdlog::error("AuthManager::reactivate_user: AuthDB reactivated '{}' but the row could "
+                      "not be re-read afterward",
+                      username);
+        return false;
+    }
+
+    std::unique_lock lock(mu_);
+    users_[username] = *entry;
+    return true;
+}
+
 std::optional<Role> AuthManager::get_user_role(const std::string& username) const {
     std::shared_lock lock(mu_);
     auto it = users_.find(username);

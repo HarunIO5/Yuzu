@@ -324,6 +324,18 @@ int main(int argc, char* argv[]) {
         ->check(CLI::Range(1, 2592000))
         ->envname("YUZU_BREAK_GLASS_WINDOW_SECS");
 
+    // SCIM v2 provisioning (`/scim/v2/*`) — enterprise IdP (Okta/Entra)
+    // auto-provisioning + auto-deprovisioning. Disabled by default; fail-closed
+    // checks (token required, HTTPS required) run just before serving — see below.
+    app.add_flag("--scim-enable", cfg.scim_enable,
+                "Enable the SCIM v2 provisioning surface (/scim/v2/*). Requires "
+                "--scim-token and HTTPS; refuses to start otherwise.")
+        ->envname("YUZU_SCIM_ENABLE");
+    app.add_option("--scim-token", cfg.scim_token,
+                  "Bearer credential IdPs present on every /scim/v2/* request. "
+                  "Required when --scim-enable is set; stored as a sha256 hash only.")
+        ->envname("YUZU_SCIM_TOKEN");
+
     // Account lockout — SOC 2 CC6.3. See docs/auth-architecture.md.
     app.add_option("--auth-lockout-threshold", cfg.auth_lockout_threshold,
                    "Consecutive failed local-password attempts before an account is temporarily "
@@ -1247,6 +1259,27 @@ int main(int argc, char* argv[]) {
         spdlog::warn("--break-glass-user='{}' is set but --auth-mode is 'standard' — the "
                      "break-glass exemption only applies under --auth-mode=sso-only; ignoring.",
                      cfg.break_glass_user);
+    }
+
+    // ── SCIM v2 provisioning fail-closed guard (CC6.2) ──────────────────────
+    // An unauthenticated /scim/v2/* provisioning surface would be catastrophic
+    // (any anonymous caller could mint/deactivate operator accounts), so refuse
+    // to start rather than boot it half-configured.
+    if (cfg.scim_enable) {
+        if (cfg.scim_token.empty()) {
+            spdlog::error("--scim-enable requires --scim-token (or YUZU_SCIM_TOKEN) — refusing "
+                          "to start an unauthenticated provisioning surface.");
+            return EXIT_FAILURE;
+        }
+        if (!cfg.https_enabled) {
+            spdlog::error("--scim-enable requires HTTPS (the bearer token would otherwise cross "
+                          "the wire in plaintext) — refusing to start with --no-https set. Enable "
+                          "HTTPS or disable --scim-enable.");
+            return EXIT_FAILURE;
+        }
+        spdlog::warn("SCIM v2 provisioning ACTIVE (--scim-enable): /scim/v2/* accepts a "
+                     "bearer-token-authenticated IdP push that can provision AND deprovision "
+                     "operator accounts (read-only 'user' role only).");
     }
 
     std::signal(SIGINT, on_signal);

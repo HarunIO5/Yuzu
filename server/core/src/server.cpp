@@ -26,6 +26,7 @@
 #include "ca_store.hpp"
 #include "default_certs.hpp"
 #include "key_provider.hpp"
+#include "scim_routes.hpp"
 #include "x509_ca.hpp"
 #include "compliance_eval.hpp"
 #include "custom_properties_store.hpp"
@@ -10092,6 +10093,24 @@ private:
                 return import_subordinate_chain(intermediate_pem, parent_chain_pem);
             });
 
+        // -- SCIM v2 provisioning (/scim/v2/*) — enterprise IdP auto-(de)provisioning --
+        // Entirely inert when disabled: no store, no routes, no route table
+        // entries at all. main.cpp already refuses to start if --scim-enable is
+        // set without --scim-token or without HTTPS (CC6.2 fail-closed).
+        if (cfg_.scim_enable) {
+            scim_store_ = std::make_unique<ScimStore>(cfg_.db_dir() / "auth.db");
+            if (!scim_store_->is_open()) {
+                spdlog::error("SCIM: failed to open auth.db for the SCIM resource/token store — "
+                             "the /scim/v2/* surface will reject every request.");
+            } else if (!scim_store_->set_token(cfg_.scim_token, "boot")) {
+                spdlog::error("SCIM: failed to store the configured --scim-token — the "
+                             "/scim/v2/* surface will reject every request.");
+            }
+            scim_routes_ = std::make_unique<ScimRoutes>();
+            scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
+                                          audit_store_.get());
+        }
+
         // -- A2 discovery surface (roadmap Issue 17.1): /api/v1/discover/* --------
         // Agentic-first (A1/A2, docs/agentic-first-principle.md) — RBAC permission
         // catalog, published instruction definitions, REST route catalog (subset of
@@ -10926,6 +10945,12 @@ private:
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
     std::unique_ptr<CaRoutes> ca_routes_; // PKI PR4: /api/v1/ca/*
+    // SCIM v2 provisioning (/scim/v2/*) — only constructed when --scim-enable.
+    // ScimStore opens its OWN connection to the SAME auth.db AuthDB manages
+    // (see scim_store.hpp); scim_routes_ borrows non-owning ScimStore*/
+    // AuthManager*/AuditStore* pointers, all of which outlive it.
+    std::unique_ptr<ScimStore> scim_store_;
+    std::unique_ptr<ScimRoutes> scim_routes_;
     std::unique_ptr<DiscoverRoutes> discover_routes_; // A2: /api/v1/discover/* (Issue 17.1)
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
