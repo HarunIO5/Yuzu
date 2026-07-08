@@ -341,6 +341,46 @@ TEST_CASE("File spark: unwatch fires only when the last subscription is disarmed
     engine.stop();
 }
 
+TEST_CASE("File spark: unregister_consumer unwatches a watch its removal empties "
+          "(governance Tr3kkR finding, PR #1927)",
+          "[spark][mechanism]") {
+    // unregister_consumer erases a consumer's LAST subscription to an armed
+    // spark the same way disarm() does — it must tear down the OS watch the
+    // same way too. Before the fix, this path erased the armed_ entry without
+    // ever calling unwatch(): the mechanism's watch stayed live for a spark
+    // the engine no longer considered armed.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto ca = engine.register_consumer("a", [](const SparkEvent&) {});
+    auto cb = engine.register_consumer("b", [](const SparkEvent&) {});
+    REQUIRE(ca.has_value());
+    REQUIRE(cb.has_value());
+    engine.start();
+
+    const auto spec = file_spec("/etc/hosts");
+    const std::string key = spark_key(spec);
+    auto sa = engine.arm(*ca, spec);
+    auto sb = engine.arm(*cb, spec);
+    REQUIRE(sa.has_value());
+    REQUIRE(sb.has_value());
+    CHECK(fake->is_watching(key));
+
+    // Consumer b still holds a subscription — unregistering a NEVER touches
+    // the watch, mirroring disarm()'s "watch stays while a subscription
+    // remains" behavior.
+    engine.unregister_consumer(*ca);
+    CHECK(fake->is_watching(key));
+    CHECK(fake->unwatch_calls() == 0);
+
+    // Unregistering b removes the watch's LAST subscription — the watch must
+    // be torn down, exactly as if b had called disarm() on it directly.
+    engine.unregister_consumer(*cb);
+    CHECK(eventually([&] { return !fake->is_watching(key); }));
+    CHECK(fake->unwatch_calls() == 1);
+    CHECK(engine.stats().armed_sparks == 0);
+    engine.stop();
+}
+
 TEST_CASE("File spark: a mechanism watch failure rolls the arm back", "[spark][mechanism]") {
     SparkEngine engine;
     FakeMechanism* fake = wire_fake(engine, SparkType::File);

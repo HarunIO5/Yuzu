@@ -534,6 +534,35 @@ TEST_CASE("SparkEngine: unregister_consumer removes its subscriptions and joins 
     engine.stop();
 }
 
+TEST_CASE("SparkEngine: register_consumer racing stop() never strands an unjoined "
+          "thread (governance Tr3kkR finding, PR #1927)",
+          "[spark][engine]") {
+    // Forces the exact interleaving the fix closes: stop() lands after
+    // register_consumer's dispatch thread has started but before it is
+    // inserted into consumers_. Before the fix, the insert proceeded
+    // unconditionally — the new consumer was never signalled by stop(), and
+    // its still-joinable std::thread inside consumers_ would std::terminate
+    // the process (an un-joined joinable std::thread's destructor) once the
+    // engine was destroyed.
+    SparkEngine engine;
+    engine.start();
+    engine.set_register_race_hook_for_test([&] { engine.stop(); });
+
+    Collector got;
+    auto consumer = engine.register_consumer("racer", got.handler());
+
+    // Lost the race: register_consumer must report failure, not silently
+    // succeed into a stopped engine.
+    CHECK_FALSE(consumer.has_value());
+    CHECK(engine.stats().consumers == 0);
+    CHECK_FALSE(engine.is_running());
+
+    // ~SparkEngine (end of scope) must not terminate. That IS the regression
+    // this test exists to catch: a joinable std::thread reachable from a live
+    // shared_ptr<Consumer> at destruction crashes the whole test binary
+    // (std::terminate), not just fails an assertion.
+}
+
 TEST_CASE("SparkEngine: stop is prompt and idempotent; engine is single-shot",
           "[spark][engine]") {
     SparkEngine engine;

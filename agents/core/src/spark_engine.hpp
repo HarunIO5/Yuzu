@@ -199,6 +199,15 @@ public:
     /// Test seam: shrink the per-consumer shutdown budget so the detach-a-hung-
     /// handler path (UP-1) is exercised in ms, not kConsumerJoinBudgetMs.
     void set_consumer_join_budget_for_test(std::uint64_t ms);
+    /// Test seam: if set, invoked once inside register_consumer() right after
+    /// its dispatch thread starts but before the consumers_ insert — lets a
+    /// test deterministically force stop() into the exact
+    /// register_consumer()/stop() race window instead of relying on a
+    /// timing-dependent multi-threaded stress loop (governance Tr3kkR finding,
+    /// PR #1927 review). Same set-then-use contract as the other test seams
+    /// above: set before the register_consumer() call under test, no
+    /// concurrent-access support.
+    void set_register_race_hook_for_test(std::function<void()> hook);
 
 private:
     struct Subscriber {
@@ -301,7 +310,14 @@ private:
     std::map<std::string, Armed> armed_; ///< by spark_key
     std::map<SubscriptionId, std::string> sub_keys_;
     bool running_{false};
-    bool stopped_{false};
+    /// Atomic (not just mu_-guarded, though every write and most reads still
+    /// hold mu_ too): register_consumer() must re-check this under
+    /// consumers_mu_ — a DIFFERENT mutex — to close the race where stop() lands
+    /// between its stopped_ check and its consumers_ insert (governance Tr3kkR
+    /// finding, PR #1927 review). Atomic gives that cross-mutex read a defined
+    /// value without relying on a same-thread mu_-then-consumers_mu_ publish
+    /// argument that a future refactor could silently break.
+    std::atomic<bool> stopped_{false};
     std::thread wheel_thread_;
     std::uint64_t next_id_{1}; ///< shared consumer/subscription id counter
 
@@ -319,6 +335,7 @@ private:
                                ///< wheel snapshots it once at thread start — set-then-start)
     std::atomic<std::uint64_t> cadence_floor_ms_{kMinCadenceMs}; ///< atomic: read at arm, set by test seam
     std::atomic<std::uint64_t> consumer_join_budget_ms_{kConsumerJoinBudgetMs}; ///< test seam
+    std::function<void()> register_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
 
     // Delivery counters touched by consumer dispatch threads live in a shared
     // block so a detached thread can write them after ~SparkEngine (UP-1). The

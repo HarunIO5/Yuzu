@@ -101,8 +101,27 @@ SparkEngine::register_consumer(std::string name, QueuedHandler handler, std::siz
     // Capture only the two shared_ptrs, NEVER `this`: the thread may be detached
     // at shutdown (UP-1) and outlive the engine, so it must not dereference it.
     consumer->thread = std::thread(&SparkEngine::consumer_loop, consumer, delivery_);
+    // Test seam: lets a test deterministically force stop() to run exactly
+    // here — the un-synchronized window this function's own re-check below
+    // exists to close — instead of relying on a flaky multi-threaded race.
+    if (register_race_hook_for_test_)
+        register_race_hook_for_test_();
     {
         std::lock_guard lk(consumers_mu_);
+        // Re-check: stop() can land between the stopped_ check above and this
+        // insert. stop() sets stopped_ (under mu_) and later swaps consumers_
+        // out (under consumers_mu_) without ever seeing an entry inserted after
+        // its swap — nobody signals the thread just started above, and the
+        // un-joined joinable std::thread inside its shared_ptr<Consumer>
+        // terminates the process at destruction. That breaks this header's own
+        // "register safe from any thread" contract (governance Tr3kkR finding,
+        // PR #1927 review).
+        if (stopped_) {
+            // Lost the race: quiesce the just-started thread ourselves, exactly
+            // as stop() would have, before reporting failure.
+            quiesce_consumer(consumer);
+            return std::unexpected("engine is stopped");
+        }
         consumers_.emplace(id, std::move(consumer));
     }
     return id;
@@ -110,6 +129,20 @@ SparkEngine::register_consumer(std::string name, QueuedHandler handler, std::siz
 
 void SparkEngine::unregister_consumer(ConsumerId id) {
     // 1) Remove the consumer's subscriptions so no new events are enqueued.
+    // Collect (mechanism, key) pairs for any watch that goes fully
+    // unsubscribed as a result, so they can be unwatch()'d with mu_ released
+    // below — mirrors disarm()'s pattern exactly. Erasing armed_ without this
+    // leaves the mechanism's OS watch (IOCP directory registration / registry
+    // TP_WAIT / SCM notification) live for a spark the engine no longer
+    // considers armed: emit_event() finds no armed_ entry and drops the
+    // firings, the handle accumulates until engine stop(), and
+    // stats().armed_sparks undercounts what the OS is actually watching
+    // (governance Tr3kkR finding, PR #1927 review).
+    struct PendingUnwatch {
+        ISparkMechanism* mech;
+        std::string key;
+    };
+    std::vector<PendingUnwatch> to_unwatch;
     {
         std::lock_guard lk(mu_);
         for (auto it = armed_.begin(); it != armed_.end();) {
@@ -121,9 +154,25 @@ void SparkEngine::unregister_consumer(ConsumerId id) {
                 }
                 return false;
             });
-            it = subs.empty() ? armed_.erase(it) : std::next(it);
+            if (subs.empty()) {
+                // Same running_-gated pattern as disarm(): a pre-start or
+                // post-stop unregister has no watch to drop.
+                if (running_ && is_event_driven(it->second.spec.type)) {
+                    auto mit = mechanisms_.find(it->second.spec.type);
+                    if (mit != mechanisms_.end())
+                        to_unwatch.push_back({mit->second.get(), it->first});
+                }
+                it = armed_.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
+    // Stop watching with mu_ RELEASED (unwatch may block; a racing inline emit
+    // takes mu_) — mirrors disarm().
+    for (auto& pu : to_unwatch)
+        pu.mech->unwatch(pu.key);
+
     // 2) Take the consumer out of the fan-out map, then bounded-join its thread.
     std::shared_ptr<Consumer> consumer;
     {
@@ -795,6 +844,10 @@ void SparkEngine::set_cadence_floor_for_test(std::uint64_t floor_ms) {
 
 void SparkEngine::set_consumer_join_budget_for_test(std::uint64_t ms) {
     consumer_join_budget_ms_.store(ms, std::memory_order_relaxed);
+}
+
+void SparkEngine::set_register_race_hook_for_test(std::function<void()> hook) {
+    register_race_hook_for_test_ = std::move(hook);
 }
 
 } // namespace yuzu::agent
