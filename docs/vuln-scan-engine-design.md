@@ -17,9 +17,12 @@
 > **ADR-0022 reconciliation (2026-07, updated 2026-07-08).** This document's
 > **server-side placement is interim**: vulnerability interpretation (feed ingest,
 > matching, findings, scoring) is long-term a **use-case engine module**, not a
-> server capability. The in-server vuln stack — the shipped NVD sync/matching,
-> the ADR-0023 correlation engine + `VulnFindingStore`, and the ADR-4001 `/vuln`
-> dashboard lens — is **absorbed into ADR-0022 grandfathered surface #2**
+> server capability. The in-server vuln stack — among it the shipped NVD
+> sync/matching, the ADR-0023 correlation engine + `VulnFindingStore`, the
+> ADR-4001 `/vuln` dashboard lens and its `attack_path_engine` (the one component
+> carrying a lapse conditional, tied to ADR-4002's boundary review); the full
+> enumeration lives in the plan section cited below — is **absorbed into
+> ADR-0022 grandfathered surface #2**
 > (placement-only, bounded to those ADRs' designed scope, outside-by-default
 > beyond it) and re-homes via the strangler migration in
 > `docs/adr-0022-execution-plan.md` § "Relationship to ADR-0023 and ADR-4001"
