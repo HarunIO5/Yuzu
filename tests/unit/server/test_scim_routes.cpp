@@ -22,10 +22,12 @@
 #include "scim_routes.hpp"
 
 #include "audit_store.hpp"
+#include "on_behalf_guard.hpp"
 #include "rate_limiter.hpp"
 #include "test_route_sink.hpp"
 #include "web_utils.hpp"
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/scim_json.hpp>
@@ -1264,23 +1266,23 @@ TEST_CASE("scim_boot_guard_ok: 23 chars fails the floor by one (M1)",
 // 302-redirected to /login before ScimRoutes ever ran) because the sink has
 // no pre-routing middleware at all (#438's whole reason for existing). This
 // section spins up a REAL httplib::Server with a pre-routing handler that
-// mirrors server.cpp's production wiring (rate limiter, THEN
-// `is_login_exempt_path`, THEN a no-session-cookie 401/redirect fallback for
-// everything else), registers ScimRoutes against it, and drives it over the
-// wire with httplib::Client — the only way to prove the exemption + ordering
-// holds on a real request.
+// mirrors server.cpp's production wiring (the ADR-0022 on-behalf-of guard
+// FIRST, then the rate limiter, THEN `is_login_exempt_path`, THEN a
+// no-session-cookie 401/redirect fallback for everything else), registers
+// ScimRoutes against it, and drives it over the wire with httplib::Client —
+// the only way to prove the exemption + ordering holds on a real request.
 //
-// NOTE (scope): server.cpp's production pre-routing handler does not yet
-// implement an on-behalf-of/ADR-0022 rejection — grepped repo-wide, the only
-// "on-behalf-of" text in the tree is the FUTURE-tense description in
-// docs/adr/0022-headless-platform-use-case-engines.md ("no engine principal
-// class exists... the server accepts no on-behalf-of assertion on any
-// surface"), not a shipped check. This harness therefore does not assert an
-// `X-Yuzu-On-Behalf-Of` 403 — there is nothing in the codebase yet for that
-// assertion to exercise. The ordering guarantee this harness DOES prove
-// (rate limiter runs before the exemption) is the same structural guarantee
-// that will keep an on-behalf-of check safe once ADR-0022 lands, since it
-// would be added to the SAME `if` block per the review's own instructions.
+// UPDATE (post PR #2018 review, dev merge landed the ADR-0022 guard on this
+// branch): the on-behalf-of guard shipped in server.cpp (~line 4781, guarded
+// by `on_behalf_guard.hpp`'s `onbehalf::find_reserved_key`) since the note
+// below was written. This harness now wires the SAME production helper —
+// not a re-implementation — into the mock pre-routing handler, positioned
+// exactly where server.cpp runs it: before the rate limiter and before
+// `is_login_exempt_path`. That proves the SCIM login-exemption (H1's whole
+// point) does NOT also exempt /scim/v2/* from ADR-0022 — a reserved
+// on-behalf-of header still 403s even with an otherwise-valid SCIM bearer
+// token, and even though the request never reaches the login-redirect
+// fallback this exemption softened.
 //
 // SKIPPED UNDER ThreadSanitizer (#438) — same rationale as
 // test_security_headers.cpp's integration block: httplib::Server's threaded
@@ -1302,10 +1304,13 @@ namespace {
 
 /// Wires ScimRoutes against a REAL httplib::Server whose pre-routing
 /// handler mirrors server.cpp's `set_pre_routing_handler` lambda closely
-/// enough to reproduce H1: `is_login_exempt_path` gates the login-redirect
-/// fallback, and a configurable RateLimiter runs BEFORE it (same ordering
+/// enough to reproduce H1: the ADR-0022 on-behalf-of guard runs FIRST
+/// (production helper, `onbehalf::find_reserved_key` — not a
+/// re-implementation), then a configurable RateLimiter, then
+/// `is_login_exempt_path` gates the login-redirect fallback (same ordering
 /// as production) — see the "Do NOT" warning in the review against wiring
-/// the SCIM exemption into an earlier early-return that skips the limiter.
+/// the SCIM exemption into an earlier early-return that skips the limiter
+/// (and, now, against wiring it before the on-behalf-of guard either).
 struct ScimIntegrationServer {
     httplib::Server svr;
     std::thread server_thread;
@@ -1318,6 +1323,7 @@ struct ScimIntegrationServer {
     std::unique_ptr<AuditStore> audit_store;
     std::unique_ptr<ScimRoutes> routes;
     RateLimiter rate_limiter;
+    yuzu::MetricsRegistry metrics;
     const std::string token{"integration-test-scim-bearer-0123456789"};
 
     explicit ScimIntegrationServer(int rate_per_second = 100) : rate_limiter(rate_per_second) {}
@@ -1335,14 +1341,27 @@ struct ScimIntegrationServer {
         audit_store = std::make_unique<AuditStore>(audit_db_file.path);
         REQUIRE(audit_store->is_open());
 
-        // Mirrors server.cpp's pre-routing lambda: rate limiter FIRST, then
-        // the login-exempt-path decision, then a 401 (API-shaped path) or a
-        // redirect (page-shaped path) for anything unauthenticated that
-        // falls through. There is no session cookie anywhere in this
-        // harness — every non-exempt path is always "unauthenticated".
+        // Mirrors server.cpp's pre-routing lambda ordering (server.cpp
+        // ~4743-4830): the ADR-0022 on-behalf-of guard FIRST (using the
+        // real production helper, not a reimplementation — the whole point
+        // is exercising the shipped reserved-key detection), then the rate
+        // limiter, then the login-exempt-path decision, then a 401
+        // (API-shaped path) or a redirect (page-shaped path) for anything
+        // unauthenticated that falls through. There is no session cookie
+        // anywhere in this harness — every non-exempt path is always
+        // "unauthenticated".
         svr.set_pre_routing_handler(
             [this](const httplib::Request& req, httplib::Response& res)
                 -> httplib::Server::HandlerResponse {
+                if (auto reserved = onbehalf::find_reserved_key(req.headers)) {
+                    (void)onbehalf::note_rejection(metrics, "http");
+                    res.status = 403;
+                    res.set_content(
+                        R"({"error":{"code":403,"message":"on-behalf-of assertion rejected per ADR-0022"}})",
+                        "application/json");
+                    (void)reserved;
+                    return httplib::Server::HandlerResponse::Handled;
+                }
                 if (!rate_limiter.allow(req.remote_addr)) {
                     res.status = 429;
                     return httplib::Server::HandlerResponse::Handled;
@@ -1481,6 +1500,37 @@ TEST_CASE("H1 integration: rate limiting is RETAINED for /scim/v2/* despite the 
     auto r2 = cli.Get("/scim/v2/ServiceProviderConfig", auth_hdr);
     REQUIRE(r2);
     CHECK(r2->status == 429);
+}
+
+TEST_CASE("H1 integration: a reserved on-behalf-of header against /scim/v2/* is 403 per "
+         "ADR-0022, even with an otherwise-valid SCIM bearer token (the SCIM login-exemption "
+         "does not strip the on-behalf-of guard)",
+         "[scim][routes][integration][h1][adr0022][onbehalf]") {
+    ScimIntegrationServer ts;
+    ts.start();
+
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+
+    // A real reserved key from on_behalf_guard.hpp's kReservedKeys, alongside
+    // an otherwise-valid bearer token — proving the 403 fires on the
+    // presence of the reserved header, not on the absence of auth.
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token},
+                         {"X-Yuzu-On-Behalf-Of", "alice@example.com"}};
+    auto r = cli.Post("/scim/v2/Users", hdr, R"({"userName":"onbehalf-user"})",
+                      "application/scim+json");
+    REQUIRE(r);
+    CHECK(r->status == 403);
+
+    // Control: the same request MINUS the reserved header provisions
+    // normally (201) — isolates the 403 to the on-behalf-of guard, not some
+    // other rejection of this payload/token pair.
+    httplib::Headers clean{{"Authorization", "Bearer " + ts.token}};
+    auto r2 = cli.Post("/scim/v2/Users", clean, R"({"userName":"onbehalf-user-clean"})",
+                       "application/scim+json");
+    REQUIRE(r2);
+    CHECK(r2->status == 201);
 }
 
 #endif // YUZU_SCIM_TSAN_BUILD
