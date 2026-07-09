@@ -22,7 +22,9 @@
 #include "scim_routes.hpp"
 
 #include "audit_store.hpp"
+#include "rate_limiter.hpp"
 #include "test_route_sink.hpp"
+#include "web_utils.hpp"
 
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -36,6 +38,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -702,6 +705,83 @@ TEST_CASE("ScimRoutes: deprovision refused once an operator elevates the SCIM ac
     CHECK(f.scim_store->get_by_scim_id(id).has_value());
 }
 
+TEST_CASE("ScimRoutes: deprovision refused for a DB-elevated admin even with a COLD "
+         "AuthManager cache (H2, 2026-07-08 review — fail-closed, not fail-open)",
+         "[scim][routes][deprov_role][cold_cache]") {
+    // H2: AuthManager::get_user_role only ever reads the in-memory `users_`
+    // cache, which nothing preloads at construction. A freshly-started
+    // process (modeled here by a SECOND AuthManager wired to the SAME
+    // AuthDB, whose cache has never seen this username) previously read
+    // back nullopt for a DB-elevated admin and treated that as "no
+    // elevation on file" — deactivating an admin an operator had promoted
+    // out of SCIM's ownership. The fix reads the role authoritatively from
+    // AuthDB (db_authoritative_role) instead.
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "cora"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.update_role("cora", auth::Role::admin));
+
+    // A user-role sibling, provisioned the same way, to prove the
+    // cold-cache manager still deprovisions a genuinely SCIM-owned 'user'
+    // account normally (not an across-the-board fail-closed regression).
+    auto created_user = json::parse(f.post("/scim/v2/Users", {{"userName", "dana"}})->body);
+    auto user_id = created_user["id"].get<std::string>();
+
+    // A second AuthManager over the SAME AuthDB file/object, standing in
+    // for a fresh process: its users_ cache has never been populated for
+    // either username.
+    auth::AuthManager cold_auth_mgr;
+    cold_auth_mgr.set_auth_db(f.auth_db.get());
+    REQUIRE_FALSE(cold_auth_mgr.get_user_role("cora").has_value());
+    REQUIRE_FALSE(cold_auth_mgr.get_user_role("dana").has_value());
+
+    // Prime the cache for "dana" only, via `reactivate_user` — a legitimate,
+    // idempotent AuthDB write (harmless on an already-active row; clears
+    // lockout state, nothing else) that happens to be the ONLY mechanism
+    // AuthManager exposes for loading an entry into a cold `users_` map.
+    // This is NOT priming the thing H2 actually fixes (the role read below
+    // still goes through `db_authoritative_role`'s DB-authoritative path
+    // regardless of cache state) — it works around a SEPARATE, pre-existing
+    // quirk this test surfaced: `AuthManager::remove_user()`'s bool return
+    // is `users_.erase(username) > 0`, so on a truly virgin cache it
+    // returns false — and `deactivate()` treats that as a failed removal —
+    // even though the underlying AuthDB write already succeeded. That is a
+    // latent bug in the shared `remove_user()` primitive, well outside this
+    // PR's scope (H2 only asked for a DB-authoritative ROLE read; the
+    // review explicitly says not to touch `AuthManager::get_user_role`,
+    // let alone `remove_user`), so it is deferred rather than fixed here —
+    // flagged instead as a follow-up in the review response.
+    REQUIRE(cold_auth_mgr.reactivate_user("dana"));
+
+    test::TestRouteSink cold_sink;
+    ScimRoutes cold_routes;
+    cold_routes.register_routes(cold_sink, f.scim_store.get(), &cold_auth_mgr, f.audit_store.get());
+
+    auto del_admin =
+        cold_sink.dispatch("DELETE", "/scim/v2/Users/" + id, {}, "application/scim+json",
+                           f.auth_header());
+    REQUIRE(del_admin);
+    CHECK(del_admin->status == 404);
+    CHECK(json::parse(del_admin->body)["detail"] == "resource not found");
+    // Untouched — the admin is still active, despite the cold cache.
+    CHECK(f.auth_mgr.get_user_role("cora").value() == auth::Role::admin);
+    CHECK(f.scim_store->get_by_scim_id(id)->active);
+
+    auto del_user =
+        cold_sink.dispatch("DELETE", "/scim/v2/Users/" + user_id, {}, "application/scim+json",
+                           f.auth_header());
+    REQUIRE(del_user);
+    CHECK(del_user->status == 204);
+    // Checked via `cold_auth_mgr` (the manager that actually performed the
+    // removal), not `f.auth_mgr` — the two AuthManager instances have
+    // entirely independent in-memory caches over the SAME AuthDB, so
+    // `f.auth_mgr`'s cache legitimately still holds dana's pre-removal
+    // entry (it was never touched by cold_auth_mgr's write). The
+    // DB-authoritative source of truth agrees with cold_auth_mgr here.
+    CHECK_FALSE(cold_auth_mgr.get_user_role("dana").has_value());
+    CHECK_FALSE(f.auth_db->get_user("dana").has_value());
+}
+
 TEST_CASE("ScimRoutes: revive-on-reprovision refuses an operator-elevated account — 404, and "
          "the remove_user() undo leaves the account INACTIVE, not reactivated-at-elevated-role "
          "(UP-N5/FIX-5, Gate-8 round-2)",
@@ -1115,7 +1195,9 @@ TEST_CASE("scim_boot_guard_ok: enabled without HTTPS — fails", "[scim][bootgua
     Config cfg;
     cfg.scim_enable = true;
     cfg.https_enabled = false;
-    cfg.scim_token = "token";
+    // Long enough to clear the M1 length floor, so this test exercises the
+    // HTTPS branch specifically, not the length one.
+    cfg.scim_token = "a-plenty-long-enough-token-0123456789";
     std::string err;
     CHECK_FALSE(scim_boot_guard_ok(cfg, err));
     CHECK_FALSE(err.empty());
@@ -1125,8 +1207,280 @@ TEST_CASE("scim_boot_guard_ok: enabled with token AND https — ok", "[scim][boo
     Config cfg;
     cfg.scim_enable = true;
     cfg.https_enabled = true;
-    cfg.scim_token = "token";
+    cfg.scim_token = "a-plenty-long-enough-token-0123456789";
     std::string err;
     CHECK(scim_boot_guard_ok(cfg, err));
     CHECK(err.empty());
 }
+
+// ── M1 — token length/entropy floor ─────────────────────────────────────
+
+TEST_CASE("scim_boot_guard_ok: enabled with a short token — fails (M1)",
+         "[scim][bootguard][m1]") {
+    Config cfg;
+    cfg.scim_enable = true;
+    cfg.https_enabled = true;
+    cfg.scim_token = "short-token"; // < 24 chars
+    std::string err;
+    CHECK_FALSE(scim_boot_guard_ok(cfg, err));
+    CHECK_FALSE(err.empty());
+}
+
+TEST_CASE("scim_boot_guard_ok: a 32-hex-char token passes the length floor (M1)",
+         "[scim][bootguard][m1]") {
+    Config cfg;
+    cfg.scim_enable = true;
+    cfg.https_enabled = true;
+    cfg.scim_token = "0123456789abcdef0123456789abcdef"; // 32 hex chars
+    std::string err;
+    CHECK(scim_boot_guard_ok(cfg, err));
+    CHECK(err.empty());
+}
+
+TEST_CASE("scim_boot_guard_ok: exactly 24 chars is the accepted floor (M1)",
+         "[scim][bootguard][m1]") {
+    Config cfg;
+    cfg.scim_enable = true;
+    cfg.https_enabled = true;
+    cfg.scim_token = std::string(24, 'a');
+    std::string err;
+    CHECK(scim_boot_guard_ok(cfg, err));
+}
+
+TEST_CASE("scim_boot_guard_ok: 23 chars fails the floor by one (M1)",
+         "[scim][bootguard][m1]") {
+    Config cfg;
+    cfg.scim_enable = true;
+    cfg.https_enabled = true;
+    cfg.scim_token = std::string(23, 'a');
+    std::string err;
+    CHECK_FALSE(scim_boot_guard_ok(cfg, err));
+}
+
+// ── H1 integration: real httplib::Server + Client (2026-07-08 review) ──────
+//
+// The TestRouteSink-based tests above dispatch directly into ScimRoutes'
+// registered handlers — they can never reproduce H1 (every /scim/v2/* call
+// 302-redirected to /login before ScimRoutes ever ran) because the sink has
+// no pre-routing middleware at all (#438's whole reason for existing). This
+// section spins up a REAL httplib::Server with a pre-routing handler that
+// mirrors server.cpp's production wiring (rate limiter, THEN
+// `is_login_exempt_path`, THEN a no-session-cookie 401/redirect fallback for
+// everything else), registers ScimRoutes against it, and drives it over the
+// wire with httplib::Client — the only way to prove the exemption + ordering
+// holds on a real request.
+//
+// NOTE (scope): server.cpp's production pre-routing handler does not yet
+// implement an on-behalf-of/ADR-0022 rejection — grepped repo-wide, the only
+// "on-behalf-of" text in the tree is the FUTURE-tense description in
+// docs/adr/0022-headless-platform-use-case-engines.md ("no engine principal
+// class exists... the server accepts no on-behalf-of assertion on any
+// surface"), not a shipped check. This harness therefore does not assert an
+// `X-Yuzu-On-Behalf-Of` 403 — there is nothing in the codebase yet for that
+// assertion to exercise. The ordering guarantee this harness DOES prove
+// (rate limiter runs before the exemption) is the same structural guarantee
+// that will keep an on-behalf-of check safe once ADR-0022 lands, since it
+// would be added to the SAME `if` block per the review's own instructions.
+//
+// SKIPPED UNDER ThreadSanitizer (#438) — same rationale as
+// test_security_headers.cpp's integration block: httplib::Server's threaded
+// acceptor crashes under TSan's interceptors with no usable report. The
+// TestRouteSink coverage above still exercises ScimRoutes' own logic under
+// TSan; only the on-the-wire pre-routing-handler wiring is gated here.
+#if defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define YUZU_SCIM_TSAN_BUILD 1
+#  endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#  define YUZU_SCIM_TSAN_BUILD 1
+#endif
+
+#ifndef YUZU_SCIM_TSAN_BUILD
+
+namespace {
+
+/// Wires ScimRoutes against a REAL httplib::Server whose pre-routing
+/// handler mirrors server.cpp's `set_pre_routing_handler` lambda closely
+/// enough to reproduce H1: `is_login_exempt_path` gates the login-redirect
+/// fallback, and a configurable RateLimiter runs BEFORE it (same ordering
+/// as production) — see the "Do NOT" warning in the review against wiring
+/// the SCIM exemption into an earlier early-return that skips the limiter.
+struct ScimIntegrationServer {
+    httplib::Server svr;
+    std::thread server_thread;
+    int port{0};
+    std::filesystem::path data_dir{yuzu::test::unique_temp_path("yuzu-scim-integration-")};
+    std::unique_ptr<AuthDB> auth_db;
+    auth::AuthManager auth_mgr;
+    std::unique_ptr<ScimStore> scim_store;
+    yuzu::test::TempDbFile audit_db_file{std::string_view{"yuzu-scim-integration-audit-"}};
+    std::unique_ptr<AuditStore> audit_store;
+    std::unique_ptr<ScimRoutes> routes;
+    RateLimiter rate_limiter;
+    const std::string token{"integration-test-scim-bearer-0123456789"};
+
+    explicit ScimIntegrationServer(int rate_per_second = 100) : rate_limiter(rate_per_second) {}
+
+    void start() {
+        std::filesystem::create_directories(data_dir);
+        auth_db = std::make_unique<AuthDB>(data_dir, /*cleanup_interval_secs=*/0);
+        REQUIRE(auth_db->initialize().has_value());
+        auth_mgr.set_auth_db(auth_db.get());
+
+        scim_store = std::make_unique<ScimStore>(data_dir / "auth.db");
+        REQUIRE(scim_store->is_open());
+        REQUIRE(scim_store->set_token(token, "test"));
+
+        audit_store = std::make_unique<AuditStore>(audit_db_file.path);
+        REQUIRE(audit_store->is_open());
+
+        // Mirrors server.cpp's pre-routing lambda: rate limiter FIRST, then
+        // the login-exempt-path decision, then a 401 (API-shaped path) or a
+        // redirect (page-shaped path) for anything unauthenticated that
+        // falls through. There is no session cookie anywhere in this
+        // harness — every non-exempt path is always "unauthenticated".
+        svr.set_pre_routing_handler(
+            [this](const httplib::Request& req, httplib::Response& res)
+                -> httplib::Server::HandlerResponse {
+                if (!rate_limiter.allow(req.remote_addr)) {
+                    res.status = 429;
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+                if (is_login_exempt_path(req.path))
+                    return httplib::Server::HandlerResponse::Unhandled;
+                if (req.path.starts_with("/api/") || req.path.starts_with("/scim/v2/")) {
+                    res.status = 401;
+                    res.set_content(R"({"error":{"code":401,"message":"unauthorized"}})",
+                                    "application/json");
+                } else {
+                    res.set_redirect("/login");
+                }
+                return httplib::Server::HandlerResponse::Handled;
+            });
+
+        routes = std::make_unique<ScimRoutes>();
+        routes->register_routes(svr, scim_store.get(), &auth_mgr, audit_store.get());
+
+        port = svr.bind_to_any_port("127.0.0.1");
+        REQUIRE(port > 0);
+        server_thread = std::thread([this]() { svr.listen_after_bind(); });
+        for (int i = 0; i < 100; ++i) {
+            if (svr.is_running())
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        REQUIRE(svr.is_running());
+    }
+
+    ~ScimIntegrationServer() {
+        svr.stop();
+        if (server_thread.joinable())
+            server_thread.join();
+        std::error_code ec;
+        routes.reset();
+        audit_store.reset();
+        scim_store.reset();
+        auth_db.reset();
+        std::filesystem::remove_all(data_dir, ec);
+    }
+};
+
+} // namespace
+
+TEST_CASE("H1 integration: /scim/v2/Users with a valid bearer provisions over real HTTP — "
+         "201, not a login redirect",
+         "[scim][routes][integration][h1]") {
+    ScimIntegrationServer ts;
+    ts.start();
+
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+
+    httplib::Headers auth_hdr{{"Authorization", "Bearer " + ts.token}};
+    auto r = cli.Post("/scim/v2/Users", auth_hdr, R"({"userName":"wire-user"})",
+                      "application/scim+json");
+    REQUIRE(r);
+    CHECK(r->status == 201);
+    CHECK(r->has_header("Location"));
+}
+
+TEST_CASE("H1 integration: a bogus bearer against /scim/v2/Users is 401, NEVER a 302 to /login",
+         "[scim][routes][integration][h1]") {
+    ScimIntegrationServer ts;
+    ts.start();
+
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+
+    httplib::Headers bogus{{"Authorization", "Bearer totally-wrong-token"}};
+    auto r = cli.Post("/scim/v2/Users", bogus, R"({"userName":"nope"})", "application/scim+json");
+    REQUIRE(r);
+    // Pre-fix, this exact request 302-redirected to /login (H1): the
+    // pre-routing handler's unauthenticated fallback only 401'd paths
+    // starting with "/api/"; /scim/v2/* does not, so it fell into the
+    // page-shaped redirect branch instead. Assert the negative explicitly
+    // so a regression back to that behavior is caught even if some future
+    // refactor produces a different non-401 status.
+    CHECK(r->status != 302);
+    CHECK(r->status == 401);
+    CHECK(r->get_header_value("WWW-Authenticate") == "Bearer");
+}
+
+TEST_CASE("H1 integration: a missing bearer against /scim/v2/Users is 401, not a redirect",
+         "[scim][routes][integration][h1]") {
+    ScimIntegrationServer ts;
+    ts.start();
+
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+
+    auto r = cli.Post("/scim/v2/Users", R"({"userName":"nope"})", "application/scim+json");
+    REQUIRE(r);
+    CHECK(r->status != 302);
+    CHECK(r->status == 401);
+}
+
+TEST_CASE("H1 integration: a non-exempt API path with no session still gets the ordinary "
+         "unauthenticated-API 401 (control — the SCIM exemption did not broaden beyond "
+         "/scim/v2/*)",
+         "[scim][routes][integration][h1]") {
+    ScimIntegrationServer ts;
+    ts.start();
+
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+
+    auto r = cli.Get("/api/v1/foo");
+    REQUIRE(r);
+    CHECK(r->status == 401);
+}
+
+TEST_CASE("H1 integration: rate limiting is RETAINED for /scim/v2/* despite the login "
+         "exemption (ordering: the limiter runs before the exempt-path check)",
+         "[scim][routes][integration][h1][ratelimit]") {
+    ScimIntegrationServer ts(/*rate_per_second=*/1);
+    ts.start();
+
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+
+    httplib::Headers auth_hdr{{"Authorization", "Bearer " + ts.token}};
+    auto r1 = cli.Get("/scim/v2/ServiceProviderConfig", auth_hdr);
+    REQUIRE(r1);
+    CHECK(r1->status == 200);
+
+    // Same client IP, immediately after — rate=1 leaves the bucket at 0
+    // tokens, so this MUST be rejected before it ever reaches ScimRoutes,
+    // proving the login exemption is not ALSO a rate-limit bypass.
+    auto r2 = cli.Get("/scim/v2/ServiceProviderConfig", auth_hdr);
+    REQUIRE(r2);
+    CHECK(r2->status == 429);
+}
+
+#endif // YUZU_SCIM_TSAN_BUILD

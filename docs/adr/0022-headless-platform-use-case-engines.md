@@ -89,6 +89,42 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 2. **Server-side NVD sync + CVE matching** (capability-map 9.4, shipped). In-server interpretation by Decision 2's test; grandfathered until re-homed into the first use-case module. The agent-side `vuln_scan` collection plugin is mechanism (Decision 2) and is NOT grandfathered — it stays core. Roadmap phases 18.1 (CVE lifecycle store), 18.2 (auditor-ready compliance bundles), and 18.5 (SBOM CVE linkage) are **boundary-affected**: on acceptance they must be re-evaluated against Decision 2 before implementation.
 3. Exceptions recorded after acceptance accrete here (the "exception ledger" the standing review question refers to).
 
+   - **2026-07-08 — SCIM v2 provisioning (`/scim/v2/*`, PR #2018).** REST-only,
+     no MCP twin, and absent from route discovery (A2/A3) — a "no" on
+     Decision 1/4's twin-surface requirement. Recorded rather than fixed
+     pre-merge because:
+     - **No MCP twin — tracked follow-up, not a permanent exception.**
+       Operator-side user lifecycle (list/deactivate/reactivate a
+       SCIM-provisioned account) is a plausible MCP tool, but SCIM's own
+       wire protocol (RFC 7644) is IdP-driven push, not an operator-invoked
+       action — the *twin* to build is an MCP-shaped view/administration
+       surface over the same underlying accounts, not a literal SCIM-over-MCP
+       mirror. Scoping and building that twin is out of scope for this slice;
+       tracked as **#2021** (SCIM Groups→role mapping, slice 2 — the natural
+       place to add an MCP-visible administration surface alongside it) and
+       **#2022** (API-token revocation on deprovision, which also touches the
+       same account-lifecycle surface). Until one of those lands with an MCP
+       twin, this row stands as the open exception.
+     - **RFC 7644 `scim+json` error schema instead of the A4 envelope —
+       correct by mandate, not a gap.** SCIM is a standardized protocol
+       consumed by third-party IdP connectors (Okta, Entra ID, OneLogin) that
+       parse `urn:ietf:params:scim:api:messages:2.0:Error` bodies and
+       specific `scim_type` values; returning an A4 envelope instead would
+       break every conformant connector's error handling. This is a
+       deliberate, permanent exception for this surface — SCIM is the one
+       place in the API where an external RFC, not Yuzu's own convention,
+       owns the wire shape.
+     - **Path shape `/scim/v2/*`, not `/api/v1/...` — RFC-mandated, permanent
+       exception.** RFC 7644 §3.2 fixes the SCIM base-path convention that
+       IdP connector wizards auto-discover against; nesting it under
+       `/api/v1/` would not be a conformant SCIM endpoint. Versioning for
+       this surface instead rides SCIM's own schema/discovery mechanism
+       (`ServiceProviderConfig`/`ResourceTypes`/`Schemas`).
+     - Full design/threat-model record:
+       `docs/security-reviews/scim-provisioning-2026-07-08.md`;
+       operator-facing behavior: `docs/user-manual/scim-provisioning.md`;
+       wire reference: `docs/user-manual/rest-api.md#scim-v2-provisioning`.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

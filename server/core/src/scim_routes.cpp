@@ -21,12 +21,28 @@ namespace yuzu::server {
 
 // ── Boot guard (S-BOOTGUARD-TEST) ───────────────────────────────────────────
 
+// M1 (2026-07-08 review): floor on the operator-supplied bearer token.
+// ScimStore stores it as unsalted single-round SHA-256 (S-BEARER-HASH) —
+// verify-only, but with no per-attempt slowdown, so a short/weak token is
+// brute-forceable against a leaked hash far faster than a properly-sized
+// credential. 24 chars is generous headroom over a 128-bit CSPRNG token
+// hex-encoded (32 chars) while still accepting a hand-typed high-entropy
+// passphrase.
+constexpr std::size_t kMinScimTokenLength = 24;
+
 bool scim_boot_guard_ok(const Config& cfg, std::string& err) {
     if (!cfg.scim_enable)
         return true;
     if (cfg.scim_token.empty()) {
         err = "--scim-enable requires --scim-token (or YUZU_SCIM_TOKEN) — refusing "
               "to start an unauthenticated provisioning surface.";
+        return false;
+    }
+    if (cfg.scim_token.size() < kMinScimTokenLength) {
+        err = "--scim-token must be at least " + std::to_string(kMinScimTokenLength) +
+              " characters (it is stored as an unsalted SHA-256 hash and is the sole "
+              "credential gating an account-provisioning surface) — refusing to start "
+              "with a short/low-entropy token.";
         return false;
     }
     if (!cfg.https_enabled) {
@@ -269,29 +285,57 @@ bool provenance_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
     return true;
 }
 
+/// H2 (2026-07-08 review, fail-open on a cold cache): read a user's role
+/// AUTHORITATIVELY from `AuthDB`, never `AuthManager::get_user_role`'s
+/// in-memory `users_` cache. That cache is populated lazily (login/upsert/
+/// reactivate call sites) and nothing preloads it at process start, so a
+/// freshly-booted server — or any process that has simply never touched
+/// this username yet — reads back `nullopt` from the cache even when the
+/// durable row is `admin`. The SCIM deprovision/revive guards previously
+/// treated that `nullopt` as "no elevation on file, allowed", which is
+/// fail-OPEN: a cold-cache process would deactivate a DB-elevated admin an
+/// IdP pushes `active:false` for. Returns `nullopt` only when the role
+/// genuinely cannot be determined (no `AuthDB` configured, or
+/// `AuthDB::get_user` errors / finds no active row for `username`) —
+/// every caller MUST treat `nullopt` as "refuse", never as "allowed"
+/// (S-ROLE-FAILCLOSED).
+std::optional<auth::Role> db_authoritative_role(auth::AuthManager* auth_mgr,
+                                                const std::string& username) {
+    AuthDB* db = auth_mgr ? auth_mgr->auth_db_ptr() : nullptr;
+    if (!db)
+        return std::nullopt;
+    auto entry = db->get_user(username);
+    if (!entry)
+        return std::nullopt;
+    return entry->role;
+}
+
 /// M-DEPROV-ROLE (sec MEDIUM): refuse to deprovision (deactivate/delete) an
 /// account whose CURRENT role is not `user` — an operator who elevated a
 /// SCIM-provisioned account to admin has taken its lifecycle out of SCIM's
 /// read-only ownership model; SCIM only ever tears down what it still
-/// recognises as its own. Checked only while the account is still ACTIVE:
-/// `AuthManager::get_user_role` reads the in-memory cache, which has no
-/// entry for an already-soft-deleted row, so this guard fires exactly on
-/// the live-to-inactive transition — where a prior role escalation would be
-/// visible. Returns true iff the deprovision may proceed. On refusal sends
-/// 404 (never 403 — matches the provenance guard's no-existence-oracle
-/// posture) and reuses `scim.user.provenance_denied` (same "SCIM does not
-/// own this account's lifecycle right now" refusal class).
+/// recognises as its own. Checked only while the account is still ACTIVE.
+/// Role is read via `db_authoritative_role` (H2) — the DB row, never the
+/// AuthManager in-memory cache, which can be cold on a freshly-started
+/// process. Returns true iff the deprovision may proceed; FAILS CLOSED
+/// (refuses) if the role cannot be determined at all, not just when it
+/// resolves to something other than `user`. On refusal sends 404 (never
+/// 403 — matches the provenance guard's no-existence-oracle posture) and
+/// reuses `scim.user.provenance_denied` (same "SCIM does not own this
+/// account's lifecycle right now" refusal class).
 bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
                         const httplib::Request& req, const std::string& username,
                         const std::string& scim_id, httplib::Response& res) {
-    auto role = auth_mgr->get_user_role(username);
-    if (role.has_value() && *role != auth::Role::user) {
-        spdlog::warn("SCIM: refusing to deprovision '{}' (scim_id={}) — role is not 'user' "
-                    "(an operator has elevated this account outside SCIM's ownership)",
+    auto role = db_authoritative_role(auth_mgr, username);
+    if (!role.has_value() || *role != auth::Role::user) {
+        spdlog::warn("SCIM: refusing to deprovision '{}' (scim_id={}) — role is not 'user' or "
+                    "could not be authoritatively determined (an operator may have elevated "
+                    "this account outside SCIM's ownership, or the DB-authoritative role read "
+                    "failed closed)",
                     username, scim_id);
         send_scim_error(res, 404, "resource not found");
         audit(auth_mgr, audit_store, req, "scim.user.provenance_denied", "denied", scim_id,
-             "role is not 'user' for username=" + username);
+             "role is not 'user' (or undetermined) for username=" + username);
         bump_provenance_denied(auth_mgr);
         return false;
     }
@@ -557,16 +601,19 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             // SCIM's model owns only read-only 'user' accounts, so do not
             // resurrect an out-of-band-elevated account through the revive
             // path. Checked AFTER reactivate_user() (not before): the
-            // tombstoned row is soft-deleted, so get_user_role's in-memory
-            // cache has no entry for it until reactivate_user() loads it —
-            // same reasoning as deprovision_role_ok's doc comment. On
-            // refusal, undo the reactivation (remove_user) so "refuse"
-            // actually means the account stays down, not just that this
-            // response says 404. Same posture as the deprovision role guard:
-            // 404 (never 403 — no existence oracle), scim.user.
-            // provenance_denied.
-            if (auto role = auth_mgr->get_user_role(input.user_name);
-                role.has_value() && *role != auth::Role::user) {
+            // tombstoned row is soft-deleted, so a plain cache read has no
+            // entry for it until reactivate_user() loads it. Role is read
+            // via `db_authoritative_role` (H2, consistency with
+            // deprovision_role_ok) — the DB row, never the AuthManager
+            // in-memory cache — and FAILS CLOSED (refuses) if the role
+            // cannot be determined at all, not just when it resolves to
+            // something other than 'user'. On refusal, undo the
+            // reactivation (remove_user) so "refuse" actually means the
+            // account stays down, not just that this response says 404.
+            // Same posture as the deprovision role guard: 404 (never 403 —
+            // no existence oracle), scim.user.provenance_denied.
+            if (auto role = db_authoritative_role(auth_mgr, input.user_name);
+                !role.has_value() || *role != auth::Role::user) {
                 spdlog::warn("ScimRoutes: refusing to revive '{}' via POST — role is not "
                             "'user' (an operator elevated this account before it was "
                             "tombstoned)",
@@ -966,6 +1013,33 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     // else: genuinely already inactive — true no-op, no audit.
                 }
 
+                // L3 (2026-07-08 review): externalId-only mutation. The
+                // active-transition branches above already re-verify both
+                // guards via deactivate()/reactivate(), but a PUT that
+                // leaves `active` unset/unchanged (or already reads false)
+                // reaches this write with NO guard check at all — re-verify
+                // provenance immediately before the mutating call so every
+                // mutation on this surface, including an externalId-only
+                // one, re-checks it (matches the doc's "every mutation
+                // re-verifies" claim). The role check is gated on
+                // `resource->active` (the CURRENT, post-transition state) —
+                // same posture as the DELETE handler's already-inactive
+                // branch: once the account is inactive there is nothing
+                // further being torn down for the role guard to protect,
+                // and `deprovision_role_ok` would otherwise fail closed on
+                // every inactive-but-legitimately-SCIM-owned account (its
+                // DB-authoritative read only resolves an ACTIVE row).
+                if (!provenance_ok(auth_mgr, audit_store, req, resource->username,
+                                   resource->scim_id, res)) {
+                    record_request(auth_mgr, "replace", res.status);
+                    return;
+                }
+                if (resource->active &&
+                    !deprovision_role_ok(auth_mgr, audit_store, req, resource->username,
+                                         resource->scim_id, res)) {
+                    record_request(auth_mgr, "replace", res.status);
+                    return;
+                }
                 if (!scim_store->update_resource(resource->scim_id, resource->username,
                                                  input.external_id)) {
                     send_scim_error(res, 500, "failed to update the SCIM resource mapping");
@@ -1093,6 +1167,25 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                   }
 
                   if (patch.external_id.has_value()) {
+                      // L3 (2026-07-08 review): same reasoning as the PUT
+                      // externalId-update path above — a PATCH carrying
+                      // only `externalId` (no `active` op) reached this
+                      // write with no guard check at all. Role check gated
+                      // on the CURRENT `resource->active`: matches the
+                      // DELETE handler's already-inactive posture (nothing
+                      // further being torn down once inactive, and
+                      // `deprovision_role_ok` only resolves an ACTIVE row).
+                      if (!provenance_ok(auth_mgr, audit_store, req, resource->username,
+                                        resource->scim_id, res)) {
+                          record_request(auth_mgr, "patch", res.status);
+                          return;
+                      }
+                      if (resource->active &&
+                          !deprovision_role_ok(auth_mgr, audit_store, req, resource->username,
+                                              resource->scim_id, res)) {
+                          record_request(auth_mgr, "patch", res.status);
+                          return;
+                      }
                       if (!scim_store->update_resource(resource->scim_id, resource->username,
                                                        *patch.external_id)) {
                           send_scim_error(res, 500, "failed to update the SCIM resource mapping");

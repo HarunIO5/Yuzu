@@ -138,6 +138,17 @@ has the same effect:
   `scim.user.deleted`), giving you a timestamped record for termination
   evidence (CC6.8).
 
+> **API/MCP tokens are not automatically revoked.** SCIM deprovisioning
+> terminates the user's login and revokes their active **sessions**, but it
+> does **not** revoke any API or MCP token that user previously generated for
+> themselves. A terminated employee who holds a long-lived personal API token
+> keeps the ability to authenticate with it until an admin revokes that token
+> by hand. If a deprovisioned user may have minted an API token, revoke it
+> manually from the dashboard (Settings → API Tokens) or via the REST API.
+> This is a pre-existing gap shared with the dashboard's manual "disable
+> user" path, not something specific to SCIM — tracked as
+> [#2022](https://github.com/Tr3kkR/Yuzu/issues/2022).
+
 **SCIM will not deactivate an account that has since been promoted.** If an
 admin later grants a SCIM-provisioned account a higher role (e.g. `admin`)
 through the dashboard, that account drops out of SCIM's reach — an IdP-side

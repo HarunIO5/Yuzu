@@ -146,13 +146,22 @@ follow-up).
 > three are recorded here rather than silently left as an inflated claim.
 
 - **API-token revocation on user delete/deactivate is a pre-existing,
-  shared gap — not new to SCIM.** SCIM's deactivate/delete path revokes the
-  user's **auth sessions** but does not revoke that user's live **API
-  tokens** (`ApiTokenStore` rows are not touched). This is not a SCIM-specific
+  shared gap — not new to SCIM — and a live limitation on this review's
+  CC6.8 (termination) claim.** SCIM's deactivate/delete path revokes the
+  user's **auth sessions** but does not revoke that user's live **API/MCP
+  tokens** (`ApiTokenStore` rows are not touched). Concretely: a terminated
+  employee who had previously minted a personal API token keeps the ability
+  to authenticate with it after SCIM deprovisions their account — the
+  termination evidence this review cites for CC6.8 covers session/login
+  access only, not token-based access. This is not a SCIM-specific
   omission: the dashboard's own manual "disable user" path has the same
-  gap today. Tracked as a shared follow-up against the API-token lifecycle,
-  not something this SCIM slice introduced or is uniquely responsible for
-  closing.
+  gap today. Tracked as
+  [#2022](https://github.com/Tr3kkR/Yuzu/issues/2022) (give `AuthManager` a
+  non-owning `ApiTokenStore*` and revoke-by-principal inside
+  `remove_user`, fixing both paths at once) — not something this SCIM slice
+  introduced or is uniquely responsible for closing. Operator-facing
+  guidance (manual token revocation until #2022 ships) is documented in
+  `docs/user-manual/scim-provisioning.md` "Deprovisioning and termination".
 - **The two-connection deactivate/reactivate path has an irreducible
   crash-window.** `ScimStore` and `AuthDB` are separate `sqlite3`
   connections onto the same `auth.db` file; a crash between "soft-delete

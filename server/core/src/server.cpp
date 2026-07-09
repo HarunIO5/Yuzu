@@ -752,11 +752,13 @@ public:
                           "provision/deprovision operator accounts",
                           "counter");
         metrics_.describe("yuzu_scim_audit_write_failures_total",
-                          "Total SCIM audit rows that failed to persist, by action. The "
-                          "companion metric that makes set-and-proceed defensible for the "
-                          "non-termination actions (provisioned/updated/list) — termination "
-                          "actions (deactivated/deleted/reactivated) fail the request closed "
-                          "instead (M-AUDIT-FAILCLOSED)",
+                          "Total SCIM audit rows that failed to persist, by action. Every "
+                          "action on this surface, including the three termination actions "
+                          "(deactivated/deleted/reactivated), is set-and-proceed: the mutation "
+                          "already committed, so a lost audit row does not roll it back. This "
+                          "metric is the CC6.8 evidence-integrity alert signal — a sustained "
+                          "non-zero rate means the SCIM audit trail has gaps, not that the "
+                          "mutation itself failed",
                           "counter");
         metrics_.describe("yuzu_scim_provenance_denied_total",
                           "Total SCIM mutations refused because the target account's "
@@ -4756,17 +4758,11 @@ private:
             // rationale to /auth/oidc/start + /auth/callback).  Without these
             // exemptions, a non-authenticated user trying to start SSO would be
             // redirected to /login before the SAML flow handler runs.
-            if (req.path == "/login" || req.path == "/login/mfa" ||
-                req.path == "/login/mfa/enroll" || req.path == "/health" ||
-                req.path == "/api/health" || req.path == "/auth/oidc/start" ||
-                req.path == "/auth/callback" || req.path == "/api/v1/openapi.json" ||
-                req.path == "/auth/saml/start" || req.path == "/saml/acs" ||
-                // PKI PR4: the CA root cert + CRL are public by design — clients
-                // and browsers need them to establish trust / check revocation
-                // before they have any session. Exact-match only; /api/v1/ca/issued
-                // and /api/v1/ca/revoke remain Security-gated below.
-                req.path == "/api/v1/ca/root" || req.path == "/api/v1/ca/crl" ||
-                req.path.starts_with("/static/")) {
+            // The exact exempt-path decision lives in `is_login_exempt_path`
+            // (web_utils.hpp) so it has direct unit coverage (H1, 2026-07-08
+            // SCIM review) — this call site runs AFTER the rate limiter
+            // above, so rate-limiting stays in effect for every exempt path.
+            if (is_login_exempt_path(req.path)) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
@@ -5192,8 +5188,15 @@ private:
                 // --scim-enable is set (opt-in, mirrors the ca_store pattern
                 // above); a failed open/migration would otherwise silently
                 // reject every /scim/v2/* request while /readyz reported
-                // "ready".
-                {"scim_store", !cfg_.scim_enable || (scim_store_ && scim_store_->is_open())},
+                // "ready". H3 (2026-07-08 review, defense-in-depth): also
+                // requires has_token() — the primary fix is that a failed
+                // set_token() at boot now sets startup_failed_ (server never
+                // reaches run()'s serve loop at all), but this term keeps
+                // /readyz honest on its own terms too, independent of that
+                // guard.
+                {"scim_store", !cfg_.scim_enable ||
+                                   (scim_store_ && scim_store_->is_open() &&
+                                    scim_store_->has_token())},
             };
 
             std::string failed_list;
@@ -10133,11 +10136,27 @@ private:
         if (cfg_.scim_enable) {
             scim_store_ = std::make_unique<ScimStore>(cfg_.db_dir() / "auth.db");
             if (!scim_store_->is_open()) {
+                // H3 (2026-07-08 review): previously logged-and-continued,
+                // which left /scim/v2/* permanently rejecting every request
+                // (require_bearer always fails against a closed store)
+                // while /readyz's "scim_store" check (below) reported
+                // green — an operator would have no signal that the
+                // surface never came up. Refuse to start instead, matching
+                // main.cpp's own "refuses to start without a token" fail-
+                // closed posture for this same feature.
                 spdlog::error("SCIM: failed to open auth.db for the SCIM resource/token store — "
-                             "the /scim/v2/* surface will reject every request.");
+                             "refusing to start.");
+                startup_failed_ = true;
             } else if (!scim_store_->set_token(cfg_.scim_token, "boot")) {
-                spdlog::error("SCIM: failed to store the configured --scim-token — the "
-                             "/scim/v2/* surface will reject every request.");
+                // H3: same reasoning — a persist failure here is just as
+                // fatal to the surface as a closed store (require_bearer
+                // has no token to validate against), but is_open() alone
+                // would still read true, so this branch needs its own
+                // fail-closed guard rather than relying on the store-open
+                // check above.
+                spdlog::error("SCIM: failed to store the configured --scim-token — "
+                             "refusing to start.");
+                startup_failed_ = true;
             }
             scim_routes_ = std::make_unique<ScimRoutes>();
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,

@@ -905,6 +905,21 @@ bool AuthManager::remove_user(const std::string& username) {
             spdlog::error("AuthDB remove_user failed for '{}'", username);
             return false;
         }
+
+        // In-memory cache/session cleanup is a best-effort side effect only —
+        // it must NOT gate the return value. On a cold-booted server users_
+        // may never have been warmed for this username even though the DB row
+        // existed and was just soft-deleted; returning the cache-erase result
+        // in that case falsely reports failure (SCIM deprovision fail-closed
+        // 500 loop on restart). The DB write is authoritative.
+        std::unique_lock lock(mu_);
+        users_.erase(username);
+        // Invalidate all active sessions belonging to this user
+        // to prevent deleted users from retaining access (CHAOS-T1-001)
+        std::erase_if(sessions_,
+                      [&](const auto& pair) { return pair.second.username == username; });
+
+        return *result;
     }
 
     std::unique_lock lock(mu_);
@@ -916,10 +931,8 @@ bool AuthManager::remove_user(const std::string& username) {
                       [&](const auto& pair) { return pair.second.username == username; });
     }
 
-    if (!auth_db_) {
-        lock.unlock();
-        save_config();
-    }
+    lock.unlock();
+    save_config();
 
     return erased;
 }

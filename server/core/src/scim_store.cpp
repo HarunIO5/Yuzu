@@ -216,7 +216,11 @@ std::optional<ScimResource> ScimStore::create_resource(const std::string& userna
     if (external_id.empty())
         sqlite3_bind_null(stmt, 2);
     else
-        sqlite3_bind_text(stmt, 2, external_id.c_str(), -1, SQLITE_TRANSIENT);
+        // L1 (2026-07-08 review): explicit length, not -1 — external_id is
+        // IdP-supplied and a value containing an embedded NUL would
+        // otherwise silently truncate at sqlite3_bind_text's strlen() scan.
+        sqlite3_bind_text(stmt, 2, external_id.c_str(),
+                          static_cast<int>(external_id.size()), SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 3, username.c_str(), -1, SQLITE_TRANSIENT);
 
     std::optional<ScimResource> result;
@@ -277,7 +281,10 @@ std::optional<ScimResource> ScimStore::find_by_external_id(const std::string& ex
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
         return std::nullopt;
-    sqlite3_bind_text(stmt, 1, external_id.c_str(), -1, SQLITE_TRANSIENT);
+    // L1 (2026-07-08 review): explicit length, not -1 — see the matching
+    // comment in create_resource().
+    sqlite3_bind_text(stmt, 1, external_id.c_str(), static_cast<int>(external_id.size()),
+                      SQLITE_TRANSIENT);
 
     std::optional<ScimResource> result;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -372,7 +379,10 @@ bool ScimStore::update_resource(const std::string& scim_id, const std::string& u
     if (external_id.empty())
         sqlite3_bind_null(stmt, 2);
     else
-        sqlite3_bind_text(stmt, 2, external_id.c_str(), -1, SQLITE_TRANSIENT);
+        // L1 (2026-07-08 review): explicit length, not -1 — see the matching
+        // comment in create_resource().
+        sqlite3_bind_text(stmt, 2, external_id.c_str(),
+                          static_cast<int>(external_id.size()), SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 3, scim_id.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
