@@ -38,8 +38,6 @@ template <typename F> ScopeExit(F) -> ScopeExit<F>;
 } // namespace
 
 TEST_CASE("ThreadPool contains a throwing task and keeps running", "[thread_pool]") {
-    ThreadPool pool(4);
-
     std::mutex m;
     std::condition_variable cv;
     int completed = 0;
@@ -52,6 +50,11 @@ TEST_CASE("ThreadPool contains a throwing task and keeps running", "[thread_pool
         }
         cv.notify_all();
     };
+
+    // Declared AFTER the state the tasks capture so ~ThreadPool joins the workers
+    // before m/cv are destroyed — otherwise a worker could still touch a
+    // destroyed mutex/cv during teardown (UB; TSan would flag it).
+    ThreadPool pool(4);
 
     // A task that throws a std::exception — must be contained by the firewall.
     REQUIRE(pool.submit([] { throw std::runtime_error("boom (std)"); }));
@@ -85,24 +88,11 @@ TEST_CASE("ThreadPool runs every submitted task", "[thread_pool]") {
 TEST_CASE("ThreadPool applies backpressure when the queue is full", "[thread_pool]") {
     constexpr std::size_t kWorkers = 4;
     constexpr std::size_t kQueueCap = 2;
-    ThreadPool pool(kWorkers, kQueueCap);
 
     std::mutex m;
     std::condition_variable cv;
     int entered = 0; // workers currently parked inside a blocking task
     bool release = false;
-
-    // Guarantee the parked workers are released even if a REQUIRE below throws
-    // (e.g. a wait_for timeout on a loaded runner). Declared after m/cv/release
-    // so it destructs before ~ThreadPool joins — otherwise the whole test binary
-    // would hang instead of failing cleanly (qa-B1).
-    ScopeExit release_on_exit{[&] {
-        {
-            std::lock_guard lock(m);
-            release = true;
-        }
-        cv.notify_all();
-    }};
 
     auto blocker = [&] {
         {
@@ -113,6 +103,23 @@ TEST_CASE("ThreadPool applies backpressure when the queue is full", "[thread_poo
         std::unique_lock lock(m);
         cv.wait(lock, [&] { return release; });
     };
+
+    // Pool declared AFTER m/cv/release/blocker so ~ThreadPool joins the workers
+    // before that state is destroyed (workers touch m/cv until they return —
+    // destroying those first is UB, which TSan would flag).
+    ThreadPool pool(kWorkers, kQueueCap);
+
+    // ScopeExit declared AFTER the pool so on scope exit — including a REQUIRE
+    // unwind — it destructs BEFORE ~ThreadPool: release+notify happens-before the
+    // join, so the parked workers are freed and the join can't hang (qa-B1),
+    // while the join still completes before m/cv die.
+    ScopeExit release_on_exit{[&] {
+        {
+            std::lock_guard lock(m);
+            release = true;
+        }
+        cv.notify_all();
+    }};
 
     // Occupy every worker so nothing drains the queue. Submit one blocker at a
     // time and wait until it is actually running before submitting the next —
