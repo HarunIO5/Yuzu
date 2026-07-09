@@ -2840,6 +2840,26 @@ public:
 
         start_web_server();
 
+        // M/H3 follow-up (2026-07-10 review): start_web_server() can set
+        // startup_failed_ (SCIM boot failure) and return before launching
+        // the web listener, but by this point the agent/management gRPC
+        // listeners are already live (BuildAndStart above). Re-check here,
+        // before spinning up any more threads or reaching
+        // agent_server_->Wait() below, so a SCIM boot failure genuinely
+        // halts the process instead of serving on the gRPC ports with a
+        // broken web/SCIM surface. stop() is safe to call this early — every
+        // thread/store it joins or resets is joinable()/nullptr-guarded, and
+        // it also runs from ~ServerImpl (guarded against double-entry by
+        // stop_entered_), so calling it here and letting the destructor run
+        // again afterward is a deliberate no-op the second time.
+        if (startup_failed_) {
+            spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
+                         "(SCIM boot failure); stopping the already-started agent/management "
+                         "gRPC listeners.");
+            stop();
+            return;
+        }
+
         // Start certificate hot-reload watcher
         if (cfg_.cert_reload_enabled && cfg_.https_enabled && web_server_) {
             CertReloader::Params reload_params;
@@ -10141,9 +10161,14 @@ private:
                 // (require_bearer always fails against a closed store)
                 // while /readyz's "scim_store" check (below) reported
                 // green — an operator would have no signal that the
-                // surface never came up. Refuse to start instead, matching
-                // main.cpp's own "refuses to start without a token" fail-
-                // closed posture for this same feature.
+                // surface never came up. Set startup_failed_ instead; the
+                // guard immediately below this block aborts start_web_server()
+                // before the web listener launches, and run() (after its
+                // start_web_server() call) stops the already-started
+                // agent/management gRPC listeners and returns, so main.cpp
+                // exits non-zero on startup_failed() — matching main.cpp's
+                // own "refuses to start without a token" fail-closed posture
+                // for this same feature.
                 spdlog::error("SCIM: failed to open auth.db for the SCIM resource/token store — "
                              "refusing to start.");
                 startup_failed_ = true;
@@ -10153,7 +10178,8 @@ private:
                 // has no token to validate against), but is_open() alone
                 // would still read true, so this branch needs its own
                 // fail-closed guard rather than relying on the store-open
-                // check above.
+                // check above. See the comment on the is_open() branch above
+                // for how startup_failed_ actually halts serving.
                 spdlog::error("SCIM: failed to store the configured --scim-token — "
                              "refusing to start.");
                 startup_failed_ = true;
@@ -10161,6 +10187,23 @@ private:
             scim_routes_ = std::make_unique<ScimRoutes>();
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
                                           audit_store_.get());
+        }
+
+        // M/H3 follow-up (2026-07-10 review): a SCIM boot failure above set
+        // startup_failed_, but nothing checked it here — start_web_server()
+        // continued registering every other route and unconditionally
+        // launched the web listener thread below, and run() went on to
+        // agent_server_->Wait() with no re-check. The server ended up
+        // SERVING (agent gRPC + web) despite "refusing to start". Abort now:
+        // skip the rest of route registration and never launch the web
+        // listener. run() re-checks startup_failed_ immediately after its
+        // start_web_server() call and stops the already-started agent/
+        // management gRPC listeners before reaching agent_server_->Wait().
+        if (startup_failed_) {
+            spdlog::critical(
+                "start_web_server(): aborting — SCIM boot failure above set startup_failed_; "
+                "the web listener will not be started.");
+            return;
         }
 
         // -- A2 discovery surface (roadmap Issue 17.1): /api/v1/discover/* --------

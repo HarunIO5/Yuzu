@@ -369,16 +369,18 @@ bool deactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* 
     // deactivated but the SCIM resource still reports active=true — fail
     // closed (500) so the IdP retries. The DB-level write inside
     // remove_user() is idempotent (its `UPDATE ... is_active = 0` re-applies
-    // cleanly against an already-inactive row); remove_user()'s bool
-    // *return value* is NOT — it reflects the in-memory `users_.erase()`
-    // result, which is false on a second call against an already-evicted
-    // entry, not "no-op success". The actual retry safety comes from the
-    // handler's re-fetch-and-skip at every call site (`deactivate()` is only
-    // invoked when the freshly-fetched `resource->active` is still true —
-    // see the PATCH/PUT/DELETE call sites), not from remove_user() itself
-    // being a true no-op. The irreducible window between the two writes (a
-    // crash/kill exactly between them) is a documented residual — reconciled
-    // by the IdP's next full sync.
+    // cleanly against an already-inactive row), and its bool *return value*
+    // now agrees: AuthDB::remove_user's `RETURNING 1` matches on
+    // `WHERE username = ?` alone, so it fires — and the return value reads
+    // true — for any extant row regardless of `is_active`, i.e. idempotent-
+    // true on a second call too, not "no-op success" vs. false. Retry safety
+    // therefore does NOT rest on this return value distinguishing first vs.
+    // repeat calls — it comes from the handler's re-fetch-and-skip at every
+    // call site (`deactivate()` is only invoked when the freshly-fetched
+    // `resource->active` is still true — see the PATCH/PUT/DELETE call
+    // sites). The irreducible window between the two writes (a crash/kill
+    // exactly between them) is a documented residual — reconciled by the
+    // IdP's next full sync.
     if (!scim_store->set_active(resource.scim_id, false)) {
         spdlog::error("ScimRoutes: ScimStore::set_active(false) failed for scim_id={} after the "
                      "underlying account was already deactivated — inconsistent state, failing "
