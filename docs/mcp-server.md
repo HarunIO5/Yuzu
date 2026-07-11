@@ -120,3 +120,4 @@ Additional task-native prompts are exposed through `prompts/list`: `ceo_demo_age
 ## Phase 3 (Planned)
 
 - Cross-surface / durable approval-ticket state (today the ticket lives in the shared `ApprovalManager` store, which is durable, but the MCP recall is stateless — no per-worker session).
+- **MCP Streamable HTTP transport** (`Mcp-Session-Id` session lifecycle, GET SSE channel with `Last-Event-ID` resume, `notifications/progress` for long-running tools) — committed platform direction, ADR-0022 execution plan **Decision 15 / track 2f** (five-rung PR ladder; design commitments including the security pre-commitments live in that decision entry).
