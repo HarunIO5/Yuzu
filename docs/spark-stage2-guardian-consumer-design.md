@@ -5,7 +5,7 @@ owner: Dave Rae
 scope: agent — Guardian detection cutover onto SparkEngine; server — spark/guard health surface
 adr: 0021 (Sparks as sole detection layer); amends Decisions 3 & 11
 tracks: #1939 (Stage-2 readiness checklist), #2011, #2014, #1938, #1929, #1933, #1936, #2015
-governance: reviewed bbe55cc9 (9-agent pipeline, 2026-07-11); hardening round folds all findings below
+governance: 9-agent /governance pipeline, 2026-07-11 (report local, not committed to git); hardening round folds all findings below
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
@@ -22,7 +22,9 @@ Guardian still runs its own detection: one dedicated OS thread per armed rule,
 built by `GuardianEngine::start_guard_for_rule_locked()`
 (`agents/core/src/guardian_engine.cpp`) into
 `std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_`
-(`guardian_engine.hpp:170`). Stage 2 retires that per-rule-thread detection and
+(`agents/core/include/yuzu/agent/guardian_engine.hpp:170`). Stage 2 begins the
+cutover away from that per-rule-thread detection (both paths stay compiled through
+rung 4; the `IGuard` files are deleted only at rung 5) and
 re-homes all three guard types onto the shared, multiplexed mechanisms —
 Guardian's first real use of SparkEngine, and the point at which the old and
 new detection worlds first coexist on a running agent.
@@ -134,7 +136,7 @@ rung-2 parity assertion — not assumed from the mechanism's edge behavior.
 
 ## Enforce path (ADR-0021 Decision 3 amendment)
 
-**All Stage-2 enforce runs on the Guardian queued-consumer thread, not inline.**
+**Once the rung-3 enforce cutover lands, all Guardian enforce runs on the queued-consumer thread, not inline** (rung 2 is observe-only — see §Kill-switch for what enforces during the rung-2 window).
 
 Today, service remediation (`StartServiceW`/`ControlService` on Windows; systemd
 is observe-only today) runs synchronously on the guard's own per-unit watch
@@ -176,12 +178,21 @@ pressure could re-enforce a stale run-state (the dequeue re-gate below checks
 lane something to collapse against under a storm, bounding growth. (UP-12.)
 
 **Enforce is re-gated at dequeue, not enqueue.** An edge can sit queued while the
-rule is undeployed, its Baseline un-pushed, its scope revoked, or its approval
-withdrawn. The consumer re-checks the enforce gate **at dequeue** —
-`BaselineStore::deployed_member_rule_ids()` (deployed snapshot),
-`dangerous_enforce_in_spec`, and the Decision-9 digest-bound approval — mirroring
-the deployment-engine "re-authorize every tick" pattern. A stale queued edge for a
-rule no longer in the deployed/approved set is dropped, never enforced.
+rule is undeployed, its Baseline un-pushed, or its scope revoked. The agent
+consumer re-checks the gate **at dequeue** against its **local deployed-rule
+cache** — the last `GuaranteedStatePush`, persisted under the `__guardian__`
+KvStore namespace — plus the rule's own `enforcement_mode`. A stale queued edge for
+a rule the local cache no longer shows as deployed-and-enforce-armed is dropped,
+never enforced. The server-side gates — `deployed_member_rule_ids()` (deployed
+snapshot), `dangerous_enforce_in_spec`, and the Decision-9 digest-bound approval —
+are validated **at push time on the server** (all three symbols are server-only;
+`agents/` links none of them), and their result is what the pushed rule set
+encodes. **Approval withdrawn *after* the last push** reaches the agent only via a
+fresh `GuaranteedStatePush` that disarms/stops the rule (server-mediated) — the
+pushed `GuaranteedStateRule` carries no approval digest (its integrity fields are
+`enforcement_mode` + a *deferred* `signature` only), so the agent **cannot**
+re-check post-push approval-withdrawal at dequeue without a new proto field. That
+field is **out of scope for Stage 2** — the wire stays byte-compatible (§Scope).
 (security-guardian, compliance.)
 
 **ADR-0021 Decision 3 wording** described the inline tier as the home of Guardian
@@ -202,7 +213,7 @@ under the ops lock (`spark_engine.hpp:358-361` warns a hung SCM RPC stalls it
 
 ## Health / status surface — the #1939 checklist
 
-Per ADR-1005 (headless platform) a new capability lands on REST **and** MCP, or
+Per ADR-0022 (headless platform) a new capability lands on REST **and** MCP, or
 records an exception. The spark/guard health signal lands on both, carries the A4
 error envelope and A2/A3 discovery metadata (enumerable via `/api/v1/openapi.json`
 and MCP `tools/list`), and enforces RBAC + audit at the API layer — not a
@@ -216,9 +227,10 @@ dashboard fragment. This section ticks every #1939 item.
   emitted) **plus** `queued_dropped_total`, `consumer_errors_total`, and the
   inline-watchdog fields — the queue-drop/consumer-error counters are load-bearing
   for the never-drop-enforce guarantee and must be surfaced, not just the mech
-  counters (sre F1). Pin the tag-key literals with a `static_assert` mirroring the
-  `kNetTag*` pin (the agent-side pin comment is `agent.cpp:1765`; the assertion
-  itself lives in `tests/unit/server/test_network_perf_model.cpp:38-44`). Omit the
+  counters (sre F1). **Rung-1 task:** introduce `kSparkTag*` tag-key constants
+  (none exist yet) and pin them with a `static_assert` in a new `test_spark_*`
+  test, mirroring the `kNetTag*` pin precedent (`test_network_perf_model.cpp`) —
+  this doc does not reuse the net pin's own location. Omit the
   tags entirely when the kill-switch is set, so fleet rollups reflect genuine state
   (the `--dex-disable` posture).
 - **Server:** mirror the net-gauge block in `AgentHealthStore::recompute_metrics`
@@ -304,10 +316,21 @@ feeds the page-worthy `mech_quarantined`/`armed_faulted` alerts, whereas a
 cross-platform Baseline reaching a Linux agent is a *routine, expected* condition —
 tagging it `errored` would light up health alerts for benign cross-platform deploys
 (architect S3, reversing the earlier draft's recommendation). Likewise a
-`mech_watch_rejected` (watch-cap) rule surfaces per-rule `errored` on the status
-surface, not only a fleet-rate alert (UP-14). Both are visible on the same REST +
-MCP status surface, never a silent never-evaluate — and both ship at **rung 2**
-(arming begins there), not deferred to rung 4 (UP-6).
+`mech_watch_rejected` (watch-cap) rule surfaces per-rule `errored`, not only a
+fleet-rate alert (UP-14). **Sequencing (UP-6):** the terminal *state* is reached at
+**rung 2** — arming begins there and rung 2 ships the platform-rejection state
+(§ladder) — and is operator-visible from rung 2 via the **rung-1 fleet gauges**
+(`yuzu_fleet_spark_*`, `armed_faulted` / rejection counters). The **per-rule REST +
+MCP status surface** that makes each rule's state individually queryable lands at
+**rung 4** (§ladder); through rungs 2–3 the "never a silent never-evaluate"
+guarantee is carried by the fleet metrics, not per-rule REST/MCP. **Vocabulary
+wiring (rung-4 task):** `unsupported` is a *new* terminal token — until the status
+vocabulary is extended (the `guaranteed_state.proto` status comment, the
+`guaranteed_state_store` vocab, the OpenAPI enum, the MCP output schema, the ingest
+parser branch, and a fold-guard test), the REST route folds any unrecognized state
+to `pending` (`rest_api_v1.cpp:7555-7563`), so `unsupported` would surface
+indistinguishably from a genuinely-unreported rule. Wire the token in the same rung
+that fills the surface.
 
 ### Inert-mechanism distinguishability
 A mechanism whose bus/SCM connection never opened at `start()` (non-systemd host,
@@ -348,7 +371,13 @@ guards and the switch becomes a hard on/off for spark detection.
 (safe, detection-only); the **enforce and deletion rungs (3, 5)** default to the
 legacy path until burn-in, so a first-customer fleet is not switched onto new
 enforcement by default (enterprise-readiness). The default is recorded explicitly
-in each rung's PR.
+in each rung's PR. **What enforces during the rung-2 default window:** with the
+spark path selected in observe-only mode and the legacy `IGuard` not instantiated,
+Guardian at rung 2 **detects but does not enforce** (spark enforce arrives at
+rung 3). An operator who needs continued enforcement during rung-2 burn-in flips to
+`--spark-disable`, selecting the legacy path (which still enforces). This is a
+deliberate, greenfield-acceptable detect-only burn-in window, not an accidental
+enforcement gap.
 
 ## Dependencies & issue dispositions
 
@@ -457,8 +486,12 @@ Each rung is an independently-governed PR on `dev`, run through the full
 
 ## Verification
 
-- Rung acceptance tests as listed; full agent suite green Linux + Windows (DGRHP)
-  after each rung.
+- Rung acceptance tests as listed; full agent suite green on Linux, Windows
+  (DGRHP), **and macOS/Darwin** after each rung. The Darwin suite is mandatory
+  (`docs/darwin-compat.md`) because Stage 2 adds macOS-specific behaviour — the
+  no-Service `unsupported` path (§Platform-rejection) and the `--spark-disable`
+  selection — so a macOS-only regression in exactly that path must not pass the
+  per-rung gate.
 - Parity: Guardian §24 invariant tests pass unchanged; scripted-scenario event
   streams within tolerance (zero-tolerance for enforce types). The
   re-arm/initial-eval contract is a rung-2 parity assertion (offline-drift-caught,
