@@ -115,7 +115,7 @@ Additional task-native prompts are exposed through `prompts/list`: `ceo_demo_age
 
 - **5 write tools shipped:** `set_tag`, `delete_tag`, `approve_request`, `reject_request`, `quarantine_device` (dispatch handlers + `tools/list` entries + RBAC/tier mapping).
 - **Approval workflow re-dispatch shipped** — supervised-tier (and operator-tier `delete_tag`) execution after admin approval, via the ticket-then-recall flow (`kApprovalRequired` → approve → recall with `approval_id`; one-time consumption). Documented under **Error envelope** above.
-- **SSE streaming for execution progress** is already satisfied by the shipped `GET /api/v1/events` endpoint (sprint W5.1) — an agentic worker bridges `execute_instruction`'s returned `execution_id` to that SSE stream (see the `execute_instruction` row in `docs/user-manual/mcp.md`). No MCP-specific streaming transport is planned.
+- **SSE streaming for execution progress** is available today via the shipped `GET /api/v1/events` endpoint (sprint W5.1) — an agentic worker bridges `execute_instruction`'s returned `execution_id` to that SSE stream (see the `execute_instruction` row in `docs/user-manual/mcp.md`); that bridge remains supported. **Direction change (2026-07-11):** a spec-compliant MCP **Streamable HTTP** transport (sessions, GET SSE channel, `notifications/progress` for long-running tools) is now a committed platform requirement — ADR-0022 execution plan **Decision 15 / track 2f** supersedes the earlier "no MCP-specific streaming transport is planned" stance recorded here.
 
 ## Phase 3 (Planned)
 
