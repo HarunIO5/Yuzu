@@ -412,6 +412,18 @@ state, schema, and contract consistency. Check:
    behavior; are RBAC and audit enforced at the API layer (not only
    in the UI)? A dashboard fragment is not an API twin.
 
+9. **A5 agentic context contract** (exec-plan Decision 16) — for any
+   new or materially changed MCP tool: standard spec annotations
+   (`title`/`readOnlyHint`/`destructiveHint`/`idempotentHint`/
+   `openWorldHint`; destructive/idempotent semantics machine-readable,
+   never prose-only), decision-grade description (when to use, workflow
+   chaining, empty-result meaning), bounded documented input schema,
+   typed output schema for stable shapes, honest `retry_after_ms` on
+   retryable errors; if the PR adds a tool family or reshapes the
+   operating model, the `initialize.instructions` blob is updated in
+   the same PR. Contract text: `docs/agentic-first-principle.md` §A5.
+   security-guardian co-checks annotation truthfulness against tier.
+
 ## Output format
 
 Findings with severity (BLOCKING / SHOULD / NICE), file:line,
