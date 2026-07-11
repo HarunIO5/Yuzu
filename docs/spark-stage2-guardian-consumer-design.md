@@ -30,7 +30,8 @@ Guardian's first real use of SparkEngine, and the point at which the old and
 new detection worlds first coexist on a running agent.
 
 This document is the design; implementation follows as a governed PR ladder
-(bottom of this doc). It also carries two ADR-0021 amendments (§Landing, §Enforce).
+(bottom of this doc). It also carries two ADR-0021 amendments — Decision 3
+(§Enforce path) and Decision 11 (§Parity, §24, and gates).
 
 ## Scope
 
@@ -173,27 +174,61 @@ telemetry).** Edges for one `spark_key` are delivered to the consumer in FIFO
 order; a burst is **coalesced to the latest terminal state per key**, never
 reordered. This is load-bearing for Service: `service_classify_edge` depends on
 running→stopped→running ordering, and a reordered stop-then-start under queue
-pressure could re-enforce a stale run-state (the dequeue re-gate below checks
-*authorization*, not *edge recency*). Coalesce-to-latest also gives the enforce
+pressure could re-enforce a stale run-state (the dequeue re-gate below re-checks
+local deployment/enforce-arm state, not *edge recency*). Coalesce-to-latest also gives the enforce
 lane something to collapse against under a storm, bounding growth. (UP-12.)
 
 **Enforce is re-gated at dequeue, not enqueue.** An edge can sit queued while the
 rule is undeployed, its Baseline un-pushed, or its scope revoked. The agent
-consumer re-checks the gate **at dequeue** against its **local deployed-rule
-cache** — the last `GuaranteedStatePush`, persisted under the `__guardian__`
-KvStore namespace — plus the rule's own `enforcement_mode`. A stale queued edge for
-a rule the local cache no longer shows as deployed-and-enforce-armed is dropped,
-never enforced. The server-side gates — `deployed_member_rule_ids()` (deployed
-snapshot), `dangerous_enforce_in_spec`, and the Decision-9 digest-bound approval —
-are validated **at push time on the server** (all three symbols are server-only;
-`agents/` links none of them), and their result is what the pushed rule set
-encodes. **Approval withdrawn *after* the last push** reaches the agent only via a
-fresh `GuaranteedStatePush` that disarms/stops the rule (server-mediated) — the
-pushed `GuaranteedStateRule` carries no approval digest (its integrity fields are
-`enforcement_mode` + a *deferred* `signature` only), so the agent **cannot**
-re-check post-push approval-withdrawal at dequeue without a new proto field. That
-field is **out of scope for Stage 2** — the wire stays byte-compatible (§Scope).
-(security-guardian, compliance.)
+consumer re-checks the gate **at dequeue** against an **in-memory snapshot of the
+deployed-rule set** (rule_id → `enabled`/`enforcement_mode`) that the consumer
+maintains, refreshed write-through on every `GuaranteedStatePush` (the push write
+and the dequeue read are synchronized under the consumer's `mtx_` — the discipline
+`apply_rules` already uses — but the lock is read → copy the enforce decision →
+**released before** the blocking SCM/systemd call, never held across it, or a slow
+remediation would head-of-line-block the very disarm push meant to stop it; the
+resulting sub-ms read-to-enforce TOCTOU is the same residual window as approval
+withdrawal below). **This is an
+in-memory read, never a per-edge SQLite hit:** the `__guardian__` KvStore is the
+durable backing for the snapshot (persisted **before** the in-memory update — the
+same persist-before-arm order `apply_rules` uses, so a crash rebuilds from the
+persisted set, never a stale snapshot; read once at start/re-arm for restart continuity),
+never queried per dequeued edge — a synchronous DB read on the enforce-dequeue path
+would, under an enforce storm, let `__guardian__` lock/disk latency throttle the
+consumer and inflate `queued_dropped_total`, converting an *authorized* enforce into
+a spurious "loud degradation" (sre, UP-6). A stale queued edge for a rule the
+snapshot no longer shows as deployed-and-enforce-armed is dropped, never enforced.
+If the snapshot cannot be built at start/re-arm (corrupt/format-skewed `__guardian__`),
+the affected rule fails **closed** — marked `errored`, never enforced off a stale or
+absent snapshot, never silently skipped (UP-4, mirroring the arm-time posture above).
+
+The server-side gates — `deployed_member_rule_ids()` (deployed snapshot),
+`dangerous_enforce_in_spec`, and the Decision-9 digest-bound approval — are validated
+**at push time on the server** (all three symbols are server-only; `agents/` links
+none of them), and their result is what the pushed rule set encodes. **Approval
+withdrawn *after* the last push** reaches the agent only via a fresh
+`GuaranteedStatePush` that disarms the rule (server-mediated) — the pushed
+`GuaranteedStateRule` carries no approval digest (its integrity fields are
+`enforcement_mode` + a *deferred* `signature` only), so the agent **cannot** re-check
+post-push approval-withdrawal at dequeue without a new proto field. **Trigger
+contract (LOAD-BEARING, rung 3):** because `Push` is a human-gated step distinct from
+`Write` (Baseline model), withdrawal is NOT auto-propagated — the enforce-cutover rung
+MUST make approval-withdrawal *enqueue* a disarm push that **reconciles the agent's
+armed set + snapshot** — today only a `full_sync` reconciles (it calls
+`stop_all_guards_locked()` then re-arms); a *delta* `enabled=false` currently
+persists the rule but `apply_rules`→`start_guard_for_rule_locked` re-arms it
+unconditionally (no `enabled()` gate on the delta path), so the `enabled=false`
+route needs a **new per-rule teardown-on-delta in `apply_rules`** at this rung.
+Either way it must not merely re-gate
+future dequeues (a rule with a live watcher but no queued edge would otherwise enforce
+on its next drift). Until that lands, the residual window (a de-authorized rule keeps
+enforcing until the next push/reconcile) is the **same window today's per-rule
+`IGuard` already has** — not a Stage-2 regression — but unbounded absent the
+disarm-on-withdrawal contract. The permanent close (an on-agent, dequeue-time approval
+check) needs the deferred approval-digest proto field, tracked as a Guardian-wide
+follow-up issue; adding it now is **out of scope for Stage 2** — the wire stays
+byte-compatible (§Scope). (security-guardian, architect, compliance, unhappy-path
+UP-1/2/13.)
 
 **ADR-0021 Decision 3 wording** described the inline tier as the home of Guardian
 enforce with a "µs-bounded" guarantee. As shipped (spark.hpp header, owner
@@ -227,7 +262,19 @@ dashboard fragment. This section ticks every #1939 item.
   emitted) **plus** `queued_dropped_total`, `consumer_errors_total`, and the
   inline-watchdog fields — the queue-drop/consumer-error counters are load-bearing
   for the never-drop-enforce guarantee and must be surfaced, not just the mech
-  counters (sre F1). **Rung-1 task:** introduce `kSparkTag*` tag-key constants
+  counters (sre F1). **Add `mech_unsupported_total{os,mechanism}` (new — not in
+  `SparkEngineStats` yet):** a platform-rejected rule never arms, so none of the
+  fault/watch counters count it; this dedicated counter backs the `unsupported`-state
+  never-silent guarantee at rungs 2–3 (§Platform-rejection) and gives the denominator
+  to distinguish "no rules of this type deployed" from "rules deployed, rejected by
+  platform" (sre, consistency, happy-path). **Shape (rung-1, sre):** the agent
+  exports flat key→value heartbeat tags (`kNetTag*`-style scalars), and every sibling
+  `SparkEngineStats` counter is a flat scalar summed across mechanisms — so the
+  `{os,mechanism}` breakdown is realized as **separate per-type scalar counters**
+  (file / registry / service), each **pre-seeded to 0** per the bounded-label
+  convention (`docs/observability-conventions.md`), not a single labelled series.
+  Also emit `yuzu.spark_enforce_active` (rung 2, the detect-only-vs-enforcing signal,
+  §Kill-switch). **Rung-1 task:** introduce `kSparkTag*` tag-key constants
   (none exist yet) and pin them with a `static_assert` in a new `test_spark_*`
   test, mirroring the `kNetTag*` pin precedent (`test_network_perf_model.cpp`) —
   this doc does not reuse the net pin's own location. Omit the
@@ -236,17 +283,24 @@ dashboard fragment. This section ticks every #1939 item.
 - **Server:** mirror the net-gauge block in `AgentHealthStore::recompute_metrics`
   (`agent_registry.cpp:1290`) into `yuzu_fleet_spark_*` gauges. Use the
   `clear_gauge_family` → repopulate idiom (`:1300`) so an unreported metric goes
-  **absent, not fake-zero**. Carry an **`os` label** (Registry is Windows-only,
-  systemd Service Linux-only, File cross-platform — an unlabelled aggregate
+  **absent, not fake-zero**. Carry an **`os` label** (Registry and File are
+  **Windows-only** — non-Windows `make_*_mechanism()` returns `nullptr`; Service is
+  Windows-SCM **+** Linux-systemd, the only two-platform mechanism; **macOS has zero
+  working mechanisms today** — so an unlabelled aggregate
   conflates "healthy, nothing armed on this OS" with "mechanism never connected",
   `docs/observability-conventions.md`) and a `yuzu_fleet_spark_reporting`
-  denominator gauge mirroring `yuzu_fleet_net_reporting`. (sre F2.)
+  denominator gauge mirroring `yuzu_fleet_net_reporting`. The `yuzu_fleet_spark_*`
+  family includes `yuzu_fleet_spark_unsupported` (from the per-type
+  `mech_unsupported_total`) and `yuzu_fleet_spark_enforce_active` (the rung-2
+  detect-only-vs-enforcing signal, §Kill-switch). (sre F2.)
 - **Alerts (#2011 + sre F1):** `mech_watch_rejected_total` rate > 0
   (denial-of-detection), `mech_quarantined_total > 0` (page-worthy, should stay 0),
   `mech_slow_op_total` rate (stalled watcher), an `armed_faulted` gauge, and a
   `queued_dropped_total` rate > 0 on the Guardian consumer (dropped enforce = a
   silent compliance failure). The last two ship with rung 1/3, not deferred to the
-  per-rule surface.
+  per-rule surface. Alert expressions **must preserve the `os` label** (never
+  `sum without(os)`) — a cross-OS aggregate is meaningless when a mechanism is
+  single-platform, mirroring the gauge rationale above (sre).
 
 ### Per-rule health (the REST + MCP surface)
 - **Ingest:** implement the `action == "status"` branch in
@@ -298,36 +352,52 @@ dashboard fragment. This section ticks every #1939 item.
   template — reuse its A4 envelope + audit posture.
 - **MCP:** add a `get_guardian_status` tool alongside `get_guardian_schemas`
   (`mcp_server.cpp:352` def table, `:760` security `{GuaranteedState, Read}`,
-  `:2922` dispatch), honoring the tier-check-before-RBAC ordering and kill-switch
-  coverage (`--mcp-disable`/`--mcp-read-only`) that `docs/mcp-server.md` requires,
+  `:2922` dispatch), honoring the tier-check-before-RBAC ordering, kill-switch
+  coverage (`--mcp-disable`/`--mcp-read-only`), **and audit coverage of the status
+  read** — via the MCP audit path (`try_persist_audit`, **set-and-proceed**), NOT
+  REST's fail-closed `emit_behavioral_audit`/503; the failure posture is deliberately
+  per-surface (CLAUDE.md: REST fail-closed 503, MCP set-and-proceed), so the MCP tool
+  must not copy REST's fail-closed branch — that `docs/mcp-server.md` requires,
   with `JObj`/`JArr` output. **Align with the UCE workstream's planned full MCP SSE
   streaming — this is a request/response status read, not a new streaming surface;
   live health streams ride the UCE stream when it lands, not a parallel channel
   built here.**
 
 ### Platform-rejection surfacing
-On a host with no Service mechanism (macOS, or Linux without libsystemd),
-`make_service_mechanism()` returns `nullptr` and `arm()` returns a typed
-`std::expected` rejection. A rule authored against `service-status-change` on such
-a host surfaces as a **distinct terminal state — `unsupported`, NOT reason-tagged
-`errored`** (one status token, not two): `errored` already means "failed to
-arm/evaluate" and
-feeds the page-worthy `mech_quarantined`/`armed_faulted` alerts, whereas a
-cross-platform Baseline reaching a Linux agent is a *routine, expected* condition —
-tagging it `errored` would light up health alerts for benign cross-platform deploys
-(architect S3, reversing the earlier draft's recommendation). Likewise a
+**Any rule whose mechanism is unavailable on the host** — not just Service. Per the
+corrected os-matrix (§Fleet metrics): Registry and File rules reject on **Linux and
+macOS** (both Windows-only), Service rules reject on **macOS / Linux-without-libsystemd**,
+and **every** mechanism rejects on **macOS**. In each case the factory returns
+`nullptr` and `arm()` returns a typed `std::expected` rejection. Such a rule surfaces
+as a **distinct terminal state — `unsupported`, NOT reason-tagged `errored`** (one
+status token, not two): `errored` already means "failed to arm/evaluate" and feeds
+the page-worthy `mech_quarantined`/`armed_faulted` alerts, whereas a cross-platform
+Baseline reaching a host that structurally lacks the mechanism is a *routine,
+expected* condition — tagging it `errored` would light up health alerts for benign
+cross-platform deploys (architect S3, cross-platform, reversing the earlier draft's
+recommendation). **Discriminator (not string-matching):** `unsupported` vs `errored`
+is decided by *whether a mechanism is registered for the rule's type on this host* (a
+pre-arm capability check), never by pattern-matching the `arm()` rejection string —
+`arm()` returns an untyped `std::expected<…, std::string>`, so the consumer must not
+parse the message to classify the terminal state. Likewise a
 `mech_watch_rejected` (watch-cap) rule surfaces per-rule `errored`, not only a
 fleet-rate alert (UP-14). **Sequencing (UP-6):** the terminal *state* is reached at
 **rung 2** — arming begins there and rung 2 ships the platform-rejection state
-(§ladder) — and is operator-visible from rung 2 via the **rung-1 fleet gauges**
-(`yuzu_fleet_spark_*`, `armed_faulted` / rejection counters). The **per-rule REST +
-MCP status surface** that makes each rule's state individually queryable lands at
-**rung 4** (§ladder); through rungs 2–3 the "never a silent never-evaluate"
-guarantee is carried by the fleet metrics, not per-rule REST/MCP. **Vocabulary
-wiring (rung-4 task):** `unsupported` is a *new* terminal token — until the status
-vocabulary is extended (the `guaranteed_state.proto` status comment, the
-`guaranteed_state_store` vocab, the OpenAPI enum, the MCP output schema, the ingest
-parser branch, and a fold-guard test), the REST route folds any unrecognized state
+(§ladder) — and is operator-visible from rung 2 via the **rung-1 fleet gauge**
+`mech_unsupported_total{os,mechanism}` (§Fleet metrics) — deliberately NOT
+`armed_faulted`/`errored`, which the paragraph above keeps the `unsupported` state
+out of. The **per-rule REST + MCP status surface** that makes each rule's state
+individually queryable lands at **rung 4** (§ladder); through rungs 2–3 the "never a
+silent never-evaluate" guarantee is carried by the fleet metrics, not per-rule
+REST/MCP — i.e. **fleet-loud but per-rule-silent**: an operator sees the aggregate
+count ("N unsupported on macOS") but cannot identify *which* rule on *which* device
+until the per-rule surface lands at rung 4 (unhappy-path). **Vocabulary wiring
+(rung-4 task):** `unsupported` is a *new* terminal
+token — a new string *value* in the existing `status` field, not a new proto field
+(byte-compat holds). Until the status vocabulary is extended (the
+`guaranteed_state.proto` status comment, the `guaranteed_state_store` vocab, the
+OpenAPI enum, the MCP output schema, the ingest parser branch, and a fold-guard
+test), the REST route folds any unrecognized state
 to `pending` (`rest_api_v1.cpp:7555-7563`), so `unsupported` would surface
 indistinguishably from a genuinely-unreported rule. Wire the token in the same rung
 that fills the surface.
@@ -377,7 +447,18 @@ Guardian at rung 2 **detects but does not enforce** (spark enforce arrives at
 rung 3). An operator who needs continued enforcement during rung-2 burn-in flips to
 `--spark-disable`, selecting the legacy path (which still enforces). This is a
 deliberate, greenfield-acceptable detect-only burn-in window, not an accidental
-enforcement gap.
+enforcement gap. **This window MUST be operator-visible, not doc-only (UP-7,
+compliance, enterprise-readiness):** the agent emits a boot log naming the active
+detection path and its enforcement posture — at rung 1 the legacy `IGuard` path
+still enforces (no consumer yet) so it simply names the active path, and from
+rung 2's spark-observe-only default it WARNs that enforcement is suppressed (e.g.
+"Guardian: spark path OBSERVE-ONLY — enforcement suppressed for spark-managed rules;
+--spark-disable restores the enforcing legacy path"). Rung 2 also emits a distinct fleet signal
+(`yuzu_fleet_spark_enforce_active` gauge / heartbeat tag) separating "configured
+enforce, actually enforcing" from "configured enforce, downgraded to observe" — the
+same "loud, never silent" bar the enforce-lane drop already holds (§Enforce path).
+A rung-2 build also ships a `changelog.d` fragment + `docs/user-manual/guaranteed-state.md`
+upgrade note for this enforcement-posture default change (not deferred to rung 5).
 
 ## Dependencies & issue dispositions
 
@@ -416,7 +497,10 @@ posture once a pilot customer is deployed — from the first customer, protocol 
 cutover changes must support rolling upgrade. The wire protocol staying unchanged
 (§Scope) keeps a mixed-version fleet safe across the multi-week ladder. **Each rung
 runs the full 8-gate `/governance` pipeline** (not an abbreviated review); each
-rung's report is retained as change-management evidence (SOC 2 Workstream F).
+rung's report is retained as change-management evidence (SOC 2 Workstream F) by
+posting it as a **GitHub PR review (`gh pr review`) on that rung's PR** — a durable
+artifact mapping onto Workstream F's "PR review records" category, never a bare git
+commit hash (which can orphan, as this doc's own prior `bbe55cc9` did).
 
 Gates, applied at the marked rungs:
 - **Parity:** Guardian §24 invariants verbatim — `Push` seed stays Guardian-only,
@@ -452,22 +536,33 @@ Each rung is an independently-governed PR on `dev`, run through the full
 1. **Instantiate + observe** — SparkEngine constructed in `agent.cpp` behind
    `--spark-disable`; `yuzu.spark_*` heartbeat tags (incl. queue-drop/consumer-error
    + inert-mechanism signal) + `yuzu_fleet_spark_*` os-labelled gauges + reporting
-   denominator + alerts. No consumer yet; proves the engine runs and reports at rest.
+   denominator + alerts, `mech_unsupported_total{os,mechanism}`, and the boot log
+   naming the active detection path (legacy `IGuard` still enforcing at rung 1). No
+   consumer yet; proves the engine runs and reports at rest.
 2. **Guardian detection consumer** — the queued consumer + arm-per-rule (with the
    `spark_key→rule` index, refcounted shared watchers, and the re-arm/initial-eval
    contract), detection only (observe mode), behind the switch, both paths compiled
-   in. **Ships audit-on-arm, platform-rejection state, and the mutual-exclusion
-   invariant.** Gates: event-stream equivalence parity + the resource gate.
+   in. **Ships audit-on-arm, platform-rejection state, the mutual-exclusion
+   invariant, the `yuzu_fleet_spark_enforce_active` enforce-suppressed signal, and a
+   `changelog.d` fragment + `guaranteed-state.md` upgrade note for the rung-2
+   enforcement-posture default change** (detect-only by default; `--spark-disable`
+   keeps the enforcing legacy path). Gates: event-stream equivalence parity + the resource gate.
 3. **Enforce cutover** — Service/Registry remediation on the consumer thread;
-   never-drop enforce lane; dequeue-time re-gate; #2014 policy enforced; resilience
-   preserved; Service-arm-latency ceiling met. Parity (zero-tolerance for enforce
-   event types) + resource + evidence-continuity gates.
+   never-drop enforce lane; dequeue-time re-gate; the withdrawal disarm-push trigger
+   contract (reconcile the armed set — `full_sync` today, or a new per-rule
+   teardown-on-delta in `apply_rules`; §Enforce path); #2014 policy enforced;
+   resilience preserved; Service-arm-latency ceiling met. Parity (zero-tolerance for
+   enforce event types) + resource + evidence-continuity gates.
 4. **Health surface** — `action == "status"` ingest, `guard_healthy` persistence
    (unknown-default, PG-ladder-coordinated), REST status stubs filled,
-   `get_guardian_status` MCP tool, presume-dead liveness, trust-boundary
-   corroboration. Doc: rewrite the `docs/user-manual/guaranteed-state.md` "the
-   `/status` endpoint returns placeholder zeros — do not consume" caveat, now that
-   it is live (enterprise-readiness).
+   `get_guardian_status` MCP tool (audited via the MCP set-and-proceed path, not REST
+   fail-closed — §Health/MCP), presume-dead liveness,
+   trust-boundary corroboration, **and the `unsupported` status-token wiring** (proto
+   comment, store vocab, OpenAPI enum, MCP output schema, ingest parser, fold-guard
+   test — §Platform-rejection). Doc: rewrite the `docs/user-manual/guaranteed-state.md`
+   "the `/status` endpoint returns placeholder zeros — do not consume" caveat, and add
+   `unsupported` to the published status vocab in `docs/user-manual/rest-api.md` +
+   `guaranteed-state.md`, now that it is live (enterprise-readiness, docs-writer).
 5. **Legacy deletion** — remove `guard_service.cpp` / `guard_systemd.cpp` /
    `guard_registry.cpp` / `guard_file.cpp` and the `guards_` map; the switch
    becomes hard on/off. Ships a `changelog.d` **"Breaking"** fragment (the flag
@@ -483,15 +578,29 @@ Each rung is an independently-governed PR on `dev`, run through the full
   (42,991) — trim it in the same rung before adding the row.
 - `docs/user-manual/mcp.md` carries a pre-existing gap (missing `get_guardian_schemas`);
   rung 4 documents `get_guardian_status` and closes both.
+- **Rung 1:** document `--spark-disable` / `YUZU_AGENT_SPARK_DISABLE` (the per-rung
+  default table + the boot-restart requirement) in `docs/user-manual/guaranteed-state.md`
+  — a CLI flag is `--help`-discoverable but the posture/defaults are customer-facing
+  (enterprise-readiness).
+- **Rung 2:** add an interim caveat to `docs/user-manual/guaranteed-state.md` — a
+  cross-platform Baseline against an unsupported mechanism (macOS; Linux-without-libsystemd
+  for Service; any non-Windows host for File/Registry) shows `pending` through rung 3;
+  disambiguate from a non-reporting agent via the fleet gauge / audit-on-arm trail,
+  not device liveness (enterprise-readiness).
+- **Rung 4:** add `unsupported` to the published status vocab in
+  `docs/user-manual/rest-api.md` (`/status`, `/status/{agent_id}`, `/device-compliance`
+  `guards[].status`) and `docs/user-manual/guaranteed-state.md`, alongside the
+  placeholder-zeros caveat rewrite already noted in the ladder (docs-writer).
 
 ## Verification
 
 - Rung acceptance tests as listed; full agent suite green on Linux, Windows
   (DGRHP), **and macOS/Darwin** after each rung. The Darwin suite is mandatory
   (`docs/darwin-compat.md`) because Stage 2 adds macOS-specific behaviour — the
-  no-Service `unsupported` path (§Platform-rejection) and the `--spark-disable`
-  selection — so a macOS-only regression in exactly that path must not pass the
-  per-rung gate.
+  no-mechanism `unsupported` path (§Platform-rejection — all three mechanisms are
+  absent on macOS, so File/Registry/Service rules all reject there) and the
+  `--spark-disable` selection — so a macOS-only regression in exactly that path must
+  not pass the per-rung gate.
 - Parity: Guardian §24 invariant tests pass unchanged; scripted-scenario event
   streams within tolerance (zero-tolerance for enforce types). The
   re-arm/initial-eval contract is a rung-2 parity assertion (offline-drift-caught,
@@ -501,5 +610,6 @@ Each rung is an independently-governed PR on `dev`, run through the full
 - Health surface: `yuzu_fleet_spark_*` os-labelled gauges visible in UAT
   `recompute_metrics`; REST `/guaranteed-state/status[/{agent_id}]` and the
   `get_guardian_status` MCP tool return real per-rule health; a
-  `service-status-change` rule on macOS surfaces as `unsupported`, not silent; a
-  killed system bus flips its rules to `errored` within the liveness bound.
+  `service-status-change` rule (and, being Windows-only, a File/Registry rule) on
+  macOS surfaces as `unsupported`, not silent; a killed system bus flips its rules to
+  `errored` within the liveness bound.
