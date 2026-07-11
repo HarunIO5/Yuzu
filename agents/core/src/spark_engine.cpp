@@ -44,6 +44,28 @@ bool params_match_type(const SparkSpec& spec) {
     return false;
 }
 
+// Call a mechanism's watch() and convert an escaping throw into a returned
+// std::unexpected. A mechanism MUST report failure by returning std::unexpected,
+// but the real ones can throw (spark_file's watch() → fs::current_path() on a
+// relative path). BOTH arm paths — the live arm_impl and the pre-start replay in
+// start() — route through here so the exception boundary and its message text
+// live in exactly one place and cannot drift apart (#2019 review). Each caller
+// keeps its OWN failure handling: arm_impl rolls the whole key back; the replay
+// faults in place (its subscribers already hold ids). This boundary contains a
+// mechanism's domain throw; it is NOT a defence against std::bad_alloc (the
+// message concat below can itself throw under OOM — accepted, matching the class
+// throughout start()).
+[[nodiscard]] std::expected<void, std::string>
+watch_guarded(ISparkMechanism* mech, const std::string& key, const SparkParams& params) {
+    try {
+        return mech->watch(key, params);
+    } catch (const std::exception& e) {
+        return std::unexpected(std::string("watch mechanism threw: ") + e.what());
+    } catch (...) {
+        return std::unexpected(std::string("watch mechanism threw a non-std exception"));
+    }
+}
+
 } // namespace
 
 bool SparkEngine::is_event_driven(SparkType type) noexcept {
@@ -490,21 +512,10 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
         // CWD). An escaping throw would unwind PAST the rollback below, leaving
         // a zombie armed_ entry with no watcher and no id ever returned to the
         // caller — an std::expected-contract violation the caller can neither
-        // observe nor disarm (governance UP-7). Treat a throw exactly like a
-        // returned failure: fall into the whole-key teardown.
-        std::string watch_err;
-        bool watch_ok = false;
-        try {
-            auto w = mech->watch(key, watch_params);
-            watch_ok = w.has_value();
-            if (!watch_ok)
-                watch_err = w.error();
-        } catch (const std::exception& e) {
-            watch_err = std::string("watch mechanism threw: ") + e.what();
-        } catch (...) {
-            watch_err = "watch mechanism threw a non-std exception";
-        }
-        if (!watch_ok) {
+        // observe nor disarm (governance UP-7). watch_guarded() turns a throw
+        // into a returned failure so it falls into the whole-key teardown.
+        auto w = watch_guarded(mech, key, watch_params);
+        if (!w) {
             // Tear down the ENTIRE key, not just our own subscription (governance
             // B1): between our unlock above and here, a concurrent arm() of an
             // equal spec may have deduped ONTO this key (adding its own sub with
@@ -521,7 +532,7 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
                 armed_.erase(it);
             }
             return std::unexpected(std::string("watch mechanism failed to arm '") + key +
-                                   "': " + watch_err);
+                                   "': " + w.error());
         }
     }
 
@@ -657,7 +668,13 @@ void SparkEngine::start() {
             if (!armed_.contains(r.key))
                 continue; // disarmed before its pre-start replay could run
         }
-        auto w = r.mech->watch(r.key, r.params);
+        // An escaping throw here would unwind out of the void start() AFTER
+        // running_ is latched and the wheel + mechanisms are up, leaving this
+        // spark in armed_/sub_keys_ with no watcher — the exact "armed == a
+        // watcher is running" violation UP-7 closed on the live arm_impl path.
+        // watch_guarded() turns a throw into a returned failure; unlike arm_impl
+        // we fault in place (subscribers already hold ids — do NOT roll back).
+        auto w = watch_guarded(r.mech, r.key, r.params);
         if (!w) {
             // Pre-start replay failure leaves the spark armed-without-watcher —
             // mark it faulted so the drift is observable (B1) rather than a

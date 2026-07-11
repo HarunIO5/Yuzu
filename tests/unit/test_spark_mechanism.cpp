@@ -74,6 +74,8 @@ public:
     std::expected<void, std::string> watch(const std::string& key, const SparkParams&) override {
         std::lock_guard lk(mu_);
         ++watch_calls_;
+        if (throw_watch_nonstd_)
+            throw 42; // non-std throw → exercises watch_guarded()'s catch(...) arm
         if (throw_watch_)
             throw std::runtime_error("forced watch throw"); // contract-violating mechanism (UP-7)
         if (fail_watch_)
@@ -140,6 +142,10 @@ public:
         std::lock_guard lk(mu_);
         throw_watch_ = b;
     }
+    void set_throw_watch_nonstd(bool b) {
+        std::lock_guard lk(mu_);
+        throw_watch_nonstd_ = b;
+    }
 
 private:
     std::mutex mu_;
@@ -149,6 +155,7 @@ private:
     bool started_{false};
     bool fail_watch_{false};
     bool throw_watch_{false};
+    bool throw_watch_nonstd_{false};
     int watch_calls_{0};
     int unwatch_calls_{0};
     int stop_calls_{0};
@@ -621,6 +628,7 @@ TEST_CASE("File spark: a mechanism that THROWS from watch() rolls the arm back c
     std::expected<SparkEngine::SubscriptionId, std::string> sub;
     REQUIRE_NOTHROW(sub = engine.arm(*c, file_spec("/etc/hosts"))); // throw is caught, not propagated
     CHECK_FALSE(sub.has_value());
+    CHECK(sub.error().find("watch mechanism threw:") != std::string::npos); // catch(std::exception&) text
     CHECK(engine.stats().armed_sparks == 0); // no zombie armed entry
     CHECK(engine.stats().subscriptions == 0);
 
@@ -629,6 +637,30 @@ TEST_CASE("File spark: a mechanism that THROWS from watch() rolls the arm back c
     auto ok = engine.arm(*c, file_spec("/etc/hosts"));
     CHECK(ok.has_value());
     CHECK(engine.stats().armed_sparks == 1);
+    engine.stop();
+}
+
+TEST_CASE("File spark: a mechanism that throws a NON-std exception from watch() is still contained "
+          "(watch_guarded catch(...))",
+          "[spark][mechanism]") {
+    // watch_guarded() has two catch arms; the std::exception arm is covered by
+    // the tests above. A mechanism throwing a non-std type (here `throw 42;`)
+    // must hit the catch(...) arm and be contained exactly the same way — never
+    // propagate out of arm(). One test on the live path suffices: both arm sites
+    // share the single watch_guarded() boundary.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    fake->set_throw_watch_nonstd(true);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    std::expected<SparkEngine::SubscriptionId, std::string> sub;
+    REQUIRE_NOTHROW(sub = engine.arm(*c, file_spec("/etc/hosts"))); // non-std throw caught, not propagated
+    CHECK_FALSE(sub.has_value());
+    CHECK(sub.error().find("non-std exception") != std::string::npos); // catch(...) text, wire-locked
+    CHECK(engine.stats().armed_sparks == 0); // no zombie armed entry
+    CHECK(engine.stats().subscriptions == 0);
     engine.stop();
 }
 
@@ -652,6 +684,60 @@ TEST_CASE("File spark: a pre-start replay watch failure marks the spark faulted,
     CHECK_FALSE(fake->is_watching(key));       // watch never came up
     CHECK(engine.stats().armed_sparks == 1);   // entry retained (ids outstanding)
     CHECK(engine.stats().armed_faulted == 1);  // …but flagged deaf, not silent
+    CHECK(engine.stats().watch_faults_total == 1);
+    engine.stop();
+}
+
+TEST_CASE("File spark: a pre-start replay watch that THROWS faults the spark, never escapes start() "
+          "(#1994 UP-7 symmetric)",
+          "[spark][mechanism]") {
+    // The pre-start replay path is the symmetric twin of arm_impl: a real
+    // mechanism can THROW from watch() (spark_file's fs::current_path() on a
+    // relative path). start() is void — an escaping throw would unwind AFTER
+    // running_ is latched and the wheel + mechanisms are up, leaving the spark
+    // armed-without-watcher (the exact UP-7 hazard). The replay must catch the
+    // throw and fault in place (subscribers hold ids → no rollback), exactly
+    // like a returned failure — start() must never propagate the exception.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    const auto spec = file_spec("/etc/hosts");
+    const std::string key = spark_key(spec);
+    REQUIRE(engine.arm(*c, spec).has_value()); // armed before start (watch deferred)
+    fake->set_throw_watch(true);               // the start() replay watch will THROW
+
+    REQUIRE_NOTHROW(engine.start());           // throw is caught, not propagated
+    CHECK(eventually([&] { return fake->watch_calls() == 1; }));
+    CHECK_FALSE(fake->is_watching(key));       // watch never came up
+    CHECK(engine.stats().armed_sparks == 1);   // entry retained (ids outstanding)
+    CHECK(engine.stats().armed_faulted == 1);  // …but flagged deaf, not silently armed
+    CHECK(engine.stats().watch_faults_total == 1);
+    engine.stop();
+}
+
+TEST_CASE("File spark: a pre-start replay watch that throws a NON-std exception faults, never escapes "
+          "start()",
+          "[spark][mechanism]") {
+    // Replay-path twin of the catch(...) coverage: the live-path test above proves
+    // watch_guarded()'s catch(...) arm on arm(); this proves the SAME boundary on
+    // the pre-start replay in start(). A non-std throw (`throw 42;`) must fault in
+    // place (subscribers hold ids → no rollback) and never propagate out of the
+    // void start().
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    const auto spec = file_spec("/etc/hosts");
+    const std::string key = spark_key(spec);
+    REQUIRE(engine.arm(*c, spec).has_value()); // armed before start (watch deferred)
+    fake->set_throw_watch_nonstd(true);        // the start() replay watch will throw a non-std type
+
+    REQUIRE_NOTHROW(engine.start());           // non-std throw is caught, not propagated
+    CHECK(eventually([&] { return fake->watch_calls() == 1; }));
+    CHECK_FALSE(fake->is_watching(key));
+    CHECK(engine.stats().armed_sparks == 1);   // entry retained (ids outstanding)
+    CHECK(engine.stats().armed_faulted == 1);  // …flagged deaf
     CHECK(engine.stats().watch_faults_total == 1);
     engine.stop();
 }
