@@ -31,6 +31,15 @@
 
 namespace yuzu::server {
 
+/// Canonical `users.provisioning_source` values (auth.db migration v7). Every
+/// read/write site MUST go through these constants rather than a raw string
+/// literal — a typo in either fails the SCIM provenance guard OPEN (S-PROV-
+/// CONST, consistency S2): a mismatched write would tag a fresh account with
+/// an unrecognised source (never revivable by SCIM), and a mismatched read in
+/// `provenance_ok` would refuse to recognise a legitimately SCIM-owned row.
+inline constexpr std::string_view kProvisioningSourceScim = "scim";
+inline constexpr std::string_view kProvisioningSourceLocal = "local";
+
 // ── Error Types ──────────────────────────────────────────────────────────────
 
 // Explicit underlying type — locks ABI/serialization width so adding new
@@ -107,6 +116,40 @@ public:
         auth::Role role
     );
 
+    /// Auto-provision (or refresh) a durable row for an SSO-authenticated
+    /// principal (#1852). The gate is `is_valid_principal` — a SUPERSET of
+    /// `is_valid_username`: it accepts EITHER a strict local username OR a
+    /// `"oidc:"`/`"saml:"`/`"ad:"`-reserved-prefixed identity; it does NOT
+    /// require the reserved prefix (a bare local-shaped string is also
+    /// accepted — rejected only when neither shape matches, InvalidUsername).
+    /// `source` is NOT validated against `{oidc,saml,ad}` — it is written
+    /// verbatim into `identity_source`, so a caller can construct a row
+    /// with any `identity_source` string (a security test deliberately does
+    /// this, passing `source="local"`, to build a legacy-shaped attack row
+    /// for the elevate handler's source-scope guard — see
+    /// `docs/security-reviews/sso-durable-identity-2026-07-03.md`).
+    /// TODO(#1915): tighten this seam to enforce a reserved prefix
+    /// on `principal` and `source ∈ {oidc,saml,ad}` — this call site is the
+    /// ONLY intended caller (the OIDC callback), so today's looseness is
+    /// latent, not actively exploitable, but it is a landmine for any future
+    /// caller.
+    /// On first login this INSERTs a row with `password_hash`/`salt_hex` = ''
+    /// (never resolvable on the local login path — see file header note),
+    /// `role='user'`, `elevation_eligible=0`. On every subsequent login the
+    /// `ON CONFLICT` arm refreshes ONLY `display_name`/`last_seen_at`/
+    /// `is_active` — it deliberately does NOT touch `role` or
+    /// `elevation_eligible`, so an admin's standing role grant and JIT-
+    /// elevation eligibility for this principal survive re-login. Call from
+    /// the OIDC callback AFTER minting the session (independent auth.db I/O,
+    /// not under AuthManager's `mu_`); a failure here degrades to "this
+    /// principal cannot elevate", never "cannot log in" (fail-soft — see
+    /// `AuthManager::provision_sso_identity`).
+    std::expected<void, AuthDBError> upsert_sso_identity(const std::string& principal,
+                                                          const std::string& iss,
+                                                          const std::string& sub,
+                                                          const std::string& display_name,
+                                                          const std::string& source);
+
     /// Get a user by username. Returns UserEntry on success.
     std::expected<auth::UserEntry, AuthDBError> get_user(const std::string& username);
 
@@ -153,6 +196,65 @@ public:
     /// malformed input.
     std::expected<bool, AuthDBError> is_elevation_eligible(const std::string& username);
 
+    /// Set the provenance marker for a user (SCIM v2 provisioning, slice 1 —
+    /// storage layer only). Distinct from `identity_source` (v6, how a user
+    /// authenticates): this is the security seam that lets a future SCIM
+    /// deprovisioning path refuse to deactivate/delete a user it did not
+    /// create. `source` is caller-supplied ("local" | "scim") — this
+    /// storage-layer accessor does not itself enforce the enum; the SCIM
+    /// route layer is the trusted caller. Single UPDATE ... RETURNING (no
+    /// sqlite3_changes() — #1033). UserNotFound when no active row matched,
+    /// InvalidUsername for malformed input. Never touches credentials or role.
+    std::expected<void, AuthDBError> set_provisioning_source(const std::string& username,
+                                                              const std::string& source);
+
+    /// Read the provenance marker for a user. UNLIKE most accessors on this
+    /// class, this deliberately reads REGARDLESS of `is_active` (soft-deleted
+    /// rows included) — the SCIM provenance guard must be able to approve a
+    /// PATCH/PUT active=true reactivation while the row is still inactive,
+    /// i.e. exactly the moment before `reactivate_user` flips it back.
+    /// UserNotFound only when no row (active or not) matched; InvalidUsername
+    /// for malformed input.
+    std::expected<std::string, AuthDBError>
+    get_provisioning_source(const std::string& username);
+
+    /// Set the `identity_source` marker (auth.db migration v6) directly —
+    /// distinct from `set_provisioning_source` (WHO manages the account's
+    /// lifecycle) — this is HOW the account authenticates, the same column
+    /// `upsert_sso_identity` writes for OIDC rows and the Settings user list
+    /// reads to render the "SSO" badge (S-IDENTITY-SRC). SCIM provisioning is
+    /// its own login surface (IdP-driven, no local password usable — see
+    /// `scim_routes.cpp`), so it gets its own value rather than being rendered
+    /// as `'local'`-login-capable. `source` is caller-supplied; this storage-
+    /// layer accessor does not itself enforce an enum. Single UPDATE ...
+    /// RETURNING (no sqlite3_changes() — #1033). UserNotFound when no active
+    /// row matched, InvalidUsername for malformed input. Never touches
+    /// credentials, role, or provisioning_source.
+    std::expected<void, AuthDBError> set_identity_source(const std::string& username,
+                                                          const std::string& source);
+
+    /// Reactivate a soft-deleted (`is_active = 0`) user row — the SCIM v2
+    /// PATCH/PUT `active: true` (un-suspend) path, and the only writer of
+    /// `is_active = 1` on an EXISTING row (every other UPDATE in this file
+    /// filters `WHERE ... AND is_active = 1`, and `upsert_user` is INSERT ...
+    /// ON CONFLICT DO NOTHING — neither can revive a soft-deleted row).
+    /// Single UPDATE ... RETURNING (no sqlite3_changes() — #1033).
+    ///
+    /// Semantics (deliberate, do not "improve" without a fresh security
+    /// review): clears `failed_login_count` / `last_failed_login_at` /
+    /// `locked_until` — a returning user must not inherit a stale lockout
+    /// from before they were deprovisioned. Does NOT touch
+    /// `mfa_totp_secret` / MFA enrollment state — `remove_user` wiped that
+    /// deliberately on deactivation (see its header comment) and this does
+    /// NOT restore it; the user re-enrolls per the configured MFA
+    /// enforcement mode. Does NOT touch `provisioning_source` or `role` —
+    /// both stay whatever they were before deactivation.
+    ///
+    /// UserNotFound when no row (active OR inactive) matched `username`,
+    /// InvalidUsername for malformed input. Reactivating an ALREADY-active
+    /// user is a harmless no-op (still returns success).
+    std::expected<void, AuthDBError> reactivate_user(const std::string& username);
+
     // ── Session Operations ───────────────────────────────────────────────
     //
     // v1 status: AuthManager retains its in-memory `sessions_` map and does
@@ -184,7 +286,10 @@ public:
     /// Destroy a single session (logout).
     std::expected<void, AuthDBError> invalidate_session(const std::string& token);
 
-    /// Destroy all sessions for a user (logout all devices).
+    /// Destroy all sessions for a user (logout all devices). `username` is
+    /// validated with `is_valid_principal` (governance round cons-S1) — a
+    /// target-lookup DELETE, so a durable SSO principal (`oidc:<iss>#<sub>`)
+    /// is accepted alongside a strict local username.
     std::expected<void, AuthDBError> invalidate_all_sessions(const std::string& username);
 
     /// Remove expired sessions. Returns count of sessions removed.
@@ -433,6 +538,34 @@ private:
 /// Validate username format.
 /// Rules: 1-64 chars, alphanumeric + . _ - only, no ':' (config injection).
 bool is_valid_username(const std::string& username);
+
+/// True iff `username` begins with a reserved SSO-principal namespace prefix
+/// (`oidc:`, `saml:`, `ad:`; case-insensitive). Defense-in-depth for the
+/// LOCAL-user CREATE path only — `is_valid_username`'s existing ':' rejection
+/// already makes the exact stable-principal string `oidc:<iss>#<sub>`
+/// unconstructable as a local username, but an explicit reservation
+/// documents the intent and survives a future loosening of that charset.
+/// Without it, an admin could otherwise create a local user that collides
+/// with (or is later made to collide with) an SSO-derived principal — that
+/// local user's row would supply the eligibility/TOTP an SSO principal
+/// deliberately lacks (#1837), re-opening the elevation-borrow hazard.
+/// Deliberately NOT folded into `is_valid_username` (used at ~20 sites; its
+/// contract must stay charset-only). Callers apply this ONLY at user-creation
+/// chokepoints, never at target-lookup/validation sites for existing users.
+bool is_reserved_identity_prefix(const std::string& username);
+
+/// Validate a value that may be EITHER a strict local username OR a durable
+/// SSO principal (`"oidc:"`/`"saml:"`/`"ad:"` + issuer + `#` + subject,
+/// #1852). A strict superset of `is_valid_username`: anything the strict
+/// validator accepts is accepted here unchanged; a reserved-prefixed string
+/// is additionally accepted after a narrow control-byte / SQL-metacharacter
+/// blocklist (permits `: # / . _ - @ ~ % |` — the IdP issuer URL + opaque
+/// sub alphabet), capped at 255 bytes. Use ONLY at target-lookup/validation
+/// chokepoints for an EXISTING user (elevation eligibility, session revoke)
+/// — never at user-creation chokepoints, which must keep using
+/// `is_valid_username` (+ `is_reserved_identity_prefix` to reserve the SSO
+/// namespace) so a local account can never be created inside it.
+bool is_valid_principal(const std::string& s);
 
 /// Validate that `username` is usable as the hardened-mode break-glass account:
 /// a syntactically valid username naming an existing ACTIVE user that has MFA

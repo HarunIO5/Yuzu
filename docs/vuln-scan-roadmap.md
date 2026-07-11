@@ -2,8 +2,24 @@
 
 **Status:** working roadmap for the vuln_scan / CAVM workstream (owner: Andy / @lesault).
 **Created:** 2026-06-30.
-**Last reconciled:** 2026-07-01 — against ADR-0018 (D1 wire-format correction, no-exceptions
+**Last reconciled:** 2026-07-08 — against ADR-0022 (headless platform; placement note below, extended for ADR-4001).
+Previously 2026-07-01 — against ADR-0018 (D1 wire-format correction, no-exceptions
 KEV-pre-filter strike, Lane 1/2/3 routing) and ADR-0019 (tri-state findings + coverage dimension).
+
+> **Placement note (2026-07-07/08, ADR-0022 reconciliation).** The in-server home of this ladder's
+> correlation work is **interim**: vulnerability management's long-term home is the first
+> use-case-engine module (ADR-0022 + `docs/adr-0022-execution-plan.md`), and the ADR-0023 stack
+> (M1a/M1b scope: engine, findings store, triggers, securable, findings routes) is absorbed into
+> ADR-0022's grandfathered surface #2 — re-homed and eventually deleted by that plan's Phase-7
+> strangler — as is the ADR-4001 `/vuln` dashboard lens + `attack_path_engine` (2026-07-08, same
+> terms; ADR-4002's scoring substrate is NOT absorbed and faces its own boundary review). Each further in-server PR on this ladder grows that deletion scope; milestones beyond
+> M1a/M1b (M2 enrichment onward, M3–M6 graph/CAVM scoring) face ADR-0022 Decision 2's boundary
+> test fresh before implementation. Milestone vocabularies collide: this ladder's M1a/M1b + M2–M6
+> ≠ the execution plan's UCE M1–M4 — always qualify which ladder a bare "M-number" means.
+> Sequencing within M1a/M1b remains this roadmap's call; beyond it, scheduling is contingent on
+> the ADR-0022 Decision-2 boundary test, adjudicated by the maintainer through governance — not
+> by either document. Details: execution plan § "Relationship to ADR-0023 and ADR-4001"; ADR-0023's and
+> ADR-4001's own placement notes.
 
 This roadmap is the **canonical sequencing** for the workstream. It reconciles three views into
 one ordered plan:
@@ -47,7 +63,7 @@ still cites "Epic N", read the milestone here instead.
 |---|---|
 | Agent matching | ~40 **hard-coded** CVEs (`cve_rules.hpp`); substring product match + naive comparator. Runs on-demand, emits pipe-delimited findings. |
 | Agent inventory | `name\|version` only; duplicate collector (vuln_scan vs `installed_apps`). No source/arch/EVR — target is a typed `PackageIdentity`/`AppIdentity` record (ADR-0018), not PURL. |
-| Server NVD | `nvd_client`+`nvd_db`+`nvd_sync` **wired**. Store **reshaped to normalized `cve` + `cve_match` with full CPE version ranges** (`versionStart/EndIncluding/Excluding`) + an NVD-grade comparator — the schema half of M1a landed, **on SQLite** (born-on-PG deferred per owner decision; see `postgres-migration-ladder.md`). Still **keyword-scoped** (full-catalog backfill pending) and identity is **product-name based** (vendor-precise CPE matching pending ADR-0018). `/api/nvd/match` does real range matching; still consumed only by the topology vuln overlay (the agent plugin doesn't query it yet). |
+| Server NVD | `nvd_client`+`nvd_db`+`nvd_sync` **wired**. Store **reshaped to normalized `cve` + `cve_match` with full CPE version ranges** (`versionStart/EndIncluding/Excluding`) + an NVD-grade comparator — the schema half of M1a landed, **on SQLite** (born-on-PG deferred per owner decision; see `postgres-migration-ladder.md`). The **full-catalog newest-first backfill has landed** (configurable `--nvd-backfill-years`, resumable across restarts, then periodic freshness re-checks), still **on SQLite**; identity is still **product-name based** (vendor-precise CPE matching pending ADR-0018). `/api/nvd/match` does real range matching; still consumed only by the topology vuln overlay (the agent plugin doesn't query it yet). |
 | OVAL / EPSS / KEV / CVSS-vector | **None** (design-doc only). |
 | Topology graph | `FleetTopologyStore` — observed graph, in-memory 60s, no persistence, no vuln attach. |
 | Asset value / crown jewels | **None.** |
@@ -187,3 +203,19 @@ export — is a server-side derivation, never emitted by the agent). No server b
 yet, so it's cleanly reviewable and independently testable. Server M1a pieces (NVD reshape →
 comparator → engine → findings store → dispatch rewire) follow on subsequent PRs. Cut this PR
 fresh off current `dev` — `feat/vuln-scan-v1-inventory` is stale (see Open decisions #2).
+
+## Fast-follow — NVD mirror stale-empty hardening (tracked as #1906, from #1889 review r5)
+
+The initial backfill now HOLDS + re-confirms a suspicious empty published-date window
+after real data has landed (a stale cache/proxy can't skip a populated range and falsely
+report complete), and `parse_response` fails a self-contradictory `totalResults>0`-but-empty
+page. Two known residuals to harden later:
+
+- **Freshness trusts an NVD `totalResults==0` modified-window at face value** (unlike the
+  backfill hold — empty modified windows are normal, so holding would stall freshness). A
+  stale cache serving `totalResults==0` for a window that *did* have `lastModified` changes
+  is a missed *update* (not a missed CVE; recovered if the CVE is modified again). Consider a
+  bounded re-confirm keyed to "the prior freshness pass saw non-empty windows".
+- **The backfill accept-after-K heuristic** (`kSuspiciousEmptyConfirmations`) could still
+  accept a window a proxy keeps empty for ≥K ticks. K is a compile-time constant; consider
+  making it configurable, or cross-checking a second NVD endpoint/mirror for high-value ranges.

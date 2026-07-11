@@ -206,7 +206,9 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   be eligible **and** present a mandatory second factor **and** pass a fresh MFA
   step-up. The mandatory second factor is **local TOTP enrollment** for a local
   session, or a **fresh IdP-attested MFA `amr` proof** for an OIDC session when
-  `--jit-oidc-amr-elevation` is enabled (see "OIDC-amr elevation" below). This
+  `--jit-oidc-amr-elevation` is enabled (OIDC elevation is **restored** by #1852's
+  durable SSO identity provisioning — an OIDC session's stable principal now has a
+  `users` row to key eligibility on; see "OIDC-amr elevation" below). This
   requirement is mandatory **unconditionally** here, NOT gated on
   `--mfa-enforcement`: elevation is the privilege-crossing boundary (non-admin →
   full admin), so — unlike the other step-up sites where the actor is already
@@ -255,17 +257,33 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   tokens resolve through `synthesize_token_session` (no cookie, no
   `elevated_until`), so a long-lived automation credential can **never** be
   elevated.
-- **OIDC-amr elevation (shipped follow-up).** An OIDC operator whose SSO
+- **OIDC-amr elevation — RESTORED by durable SSO identity (#1852).** As of the
+  `oidc:<iss>#<sub>` principal re-key (#1837/#1857), an OIDC session's principal
+  is not a local-charset `users` username (it contains `:`/`#`), and before #1852
+  the OIDC login path wrote **no `users` row at all** — so `is_elevation_eligible`
+  fail-closed and OIDC operators could not JIT-elevate. #1852 auto-provisions a
+  durable `users` row for the stable principal (`AuthDB::upsert_sso_identity`,
+  migration v6 — see "Durable SSO identity" below), and the elevate route's
+  target-lookup chokepoints now validate through `is_valid_principal` (a strict
+  superset of `is_valid_username` that additionally accepts a reserved-prefixed
+  `oidc:`/`saml:`/`ad:` principal), so an admin can grant `elevation_eligible`
+  against the SSO principal and the eligibility gate passes. This does **not**
+  resurrect the pre-#1837 accident where an SSO display name that coincidentally
+  equalled a *local* username borrowed that local user's eligibility + TOTP — the
+  principal is now the immutable `oidc:<iss>#<sub>`, bound to its own provisioned
+  row.
+- **OIDC-amr elevation (design).** An OIDC operator whose SSO
   session was authenticated with IdP MFA — asserted via the OIDC `amr` claim
   at `/auth/callback`, which seeds `Session::mfa_verified_at` when
   `amr_asserts_mfa(claims.amr)` is true (see `docs/auth-mfa-design.md` "OIDC
   interop") — CAN elevate without local TOTP enrollment. **Prerequisite:**
-  eligibility and MFA status are both keyed on the `users` table row, and the
-  OIDC login path does **not** create one; a federated-only identity must
-  already have a Yuzu `users` row (e.g. provisioned via `POST /api/v1/users`)
-  before an admin can grant it `elevation_eligible` at all — see the "AuthDB
-  — persistent authentication store" section below and `.claude/agents/authdb.md`.
-  The mandatory-second-factor check at
+  eligibility is keyed on the `users` table row, which the OIDC login path now
+  **auto-provisions** for the stable principal (`upsert_sso_identity`, #1852 —
+  see "Durable SSO identity" below); an admin grants `elevation_eligible` against
+  that SSO principal directly, no manual `POST /api/v1/users` step. MFA status is
+  **not** consulted for an OIDC session — its second factor is the IdP `amr`
+  proof, checked below, never a local TOTP secret. The mandatory-second-factor
+  check at
   `POST /api/v1/elevate` (`auth_routes.cpp`) branches EXPLICITLY on identity
   source, not a single "skip the local check" flag:
   ```cpp
@@ -293,7 +311,9 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   seeded amr proof with the toggle on) and never consult the `users` MFA
   column at all. This seam remains the ONLY place that unconditionally blocks
   a single-factor (no-amr) OIDC session from elevating — `require_mfa_step_up`
-  alone cannot, per the note above.
+  alone cannot, per the note above. **SAML** sessions carry no `amr` equivalent
+  yet: they are provisioned but cannot elevate (no local TOTP to check either;
+  SAML-MFA is a future workstream).
   A seeded-but-stale proof still falls through to the **same**
   `elevation_step_up` freshness gate every other session goes through — never
   a silent grant. The granted audit row records which factor source was used:
@@ -315,6 +335,29 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   A one-time INFO log line is emitted at boot when OIDC is configured and the
   toggle is on, so an incident responder can discover the posture without
   reading source or an individual audit row.
+- **`--mfa-step-up-window-secs` governs the OIDC-elevation proof-freshness
+  bound too.** The elevate route's shared `elevation_step_up` gate (which
+  every session — local and OIDC — must additionally clear after the
+  unconditional enrolled/amr checks above) floors its window to
+  `cfg.mfa_step_up_window_secs` (default 300 s; floored to 300 s even if the
+  operator has globally disabled step-up via `<= 0`, so the privilege
+  boundary always requires a fresh proof). For an OIDC session this is the
+  same `Session::mfa_verified_at` freshness check the local branch uses —
+  there is no separate OIDC-specific timer; an operator narrows the window
+  operator-wide with the one flag.
+- **Incident response for a compromised SSO operator (no reaper/SCIM yet —
+  #1859, tracked).** Until a deprovisioning sweep ships, stopping a
+  compromised SSO operator's privileged access is two manual levers, both
+  immediate: (1) `POST /api/v1/users/{principal}/elevation-eligibility
+  {"eligible":false}` — stops future JIT elevation and drops any
+  currently-active elevation window (`AuthManager::revoke_user_elevations`);
+  (2) `DELETE /api/v1/sessions?username=<principal>` — force-logs-out the
+  operator's current cookie session(s). Neither lever deactivates the
+  `auth.db` row itself or stops the IdP from minting the operator a fresh
+  session on next login (that requires IdP-side deprovisioning today); (1)+
+  (2) together are the full standing-access kill switch available in this
+  slice. #1859 will add a durable-side deactivation/reaper so a stale IdP
+  removal ages the row out even without an admin doing this manually.
 - **Step-down** — `POST /api/v1/elevate/revoke` clears the window
   (`role.elevation.revoked`). **Passive expiry on lapse is now audited too
   (follow-up A, shipped)** — `role.elevation.expired` — but LAZILY, not via a
@@ -506,6 +549,281 @@ Implementation: `RbacStore::reconcile_idp_memberships` /
 `tests/unit/server/test_rbac_store.cpp`, `test_oidc_provider.cpp`. SAML group
 sync is out of scope here (dropped in #1827; will ride this same reconcile
 path once #1826 merges).
+
+## Stable principal vs. display name (#1837)
+
+`Session` carries two separate identity fields with different jobs:
+
+- **`username`** — the STABLE authorization principal. `check_permission`,
+  `reconcile_idp_memberships`, elevation eligibility, and every audit
+  `principal` field key on this value. It must be immutable for the
+  lifetime of the identity it represents.
+- **`display_name`** — a human-readable label for UI/audit-DETAIL
+  rendering ONLY. Never consulted for authorization; safe to change on
+  every login.
+
+**Why this split exists.** Before #1837, `create_oidc_session` keyed
+`username` on `claims.name` (falling back to `claims.email`) — an
+IdP-editable, non-unique display label. Two different SSO users who
+happened to share a display name (a common collision in orgs with
+duplicate names, or after a legal name change re-used an old name)
+collided onto ONE authorization principal. Once #1832 shipped
+`reconcile_idp_memberships` — which deletes a principal's un-reasserted
+IdP-sourced group memberships on every login — that collision became
+destructive: user B's login could silently delete user A's group
+memberships (and, in the group-membership window between the two
+logins, inherit A's roles).
+
+**The fix.** OIDC sessions now key `username` on:
+
+```
+"oidc:" + iss + "#" + sub
+```
+
+`sub` (the OIDC subject claim) is only guaranteed unique **per issuer**
+(RFC 7519) — a bare `sub` from two different IdPs (or two tenants of the
+same IdP product) could theoretically collide, so `iss` (the token
+issuer) scopes it. This is an OPAQUE id — never render it as a human
+name. `display_name` is set to `claims.name` (falling back to
+`claims.email`), exactly as `username` used to be computed, and is
+free to change on every login without touching the stable principal or
+the RBAC memberships/roles bound to it.
+
+`sub` is now authorization-load-bearing (it is half of the RBAC
+principal), so `OidcProvider::validate_claims` — the same chokepoint that
+already rejects `iss`/`aud`/`exp`/`nonce` mismatches — also rejects a
+token whose `sub` is empty, contains a control character (byte `< 0x20`
+or `== 0x7F`, including CR/LF/tab), or exceeds 255 bytes, and rejects an
+empty `iss` defensively. Without this, an IdP token that omits `sub`
+would collapse every such login onto the single principal `oidc:<iss>#`
+(destructive under the #1832 reconcile), and a control/newline byte in
+`sub` would corrupt the audit `principal` column. Rejection is
+fail-closed — the login is denied (`auth.oidc_login_failed`), no session
+minted.
+
+**Recovering a human name without a live session.** There is no
+persistent principal→display-name directory. The audit `principal`
+column is the authoritative stable id (`oidc:<iss>#<sub>`) for every SSO
+audit row; the human name for that same login is carried alongside it in
+that row's `detail` field (`display=<sanitized name>;email=<sanitized
+email>` — see `/auth/callback`'s `audit_log_for_principal` calls, which
+attach this to every SSO audit action: `auth.oidc_login`,
+`auth.oidc_login_failed`, `auth.sso_group_provision`). A live session's
+`Session::display_name` is the other source, for the currently-signed-in
+user only. Rendering a principal for which no session is live and no
+audit row is being inspected (e.g. an admin-facing user list keyed on raw
+`username` strings) has no name to show today — a durable
+principal→display-name directory (persistent, survives restart, joinable
+outside an audit row) is tracked as a fast-follow in **issue #1852**. An
+earlier revision of this section documented an in-memory
+`AuthManager::sso_identities_` resolution map upserted on every
+`create_oidc_session` call; it had zero production callers (every render
+site used a live session or an audit-row detail instead) and was removed
+as dead code in the #1837 governance hardening round.
+
+**Render sites.** `GET /api/me` (the legacy dashboard nav-bar
+"who am I", consumed by every page's `nav-user`/`context-user` JS) and
+`GET /api/v1/me` both now return `display_name` alongside the stable
+`username`; the dashboard JS shows `display_name`, falling back to
+`username` for a legacy/local session predating this field.
+
+**SAML is unaffected this slice.** `create_saml_session` still keys
+`username` on the raw NameID (`display_name` is set to the same value,
+purely for render-site parity) — SAML does not sync to `rbac_store` yet
+(dropped in #1827), so the collision this fix closes is dormant there.
+Keying SAML on `entity_id#NameID` is a tracked fast-follow, to land
+alongside SAML group sync.
+
+**Audit-detail-field injection defense (`sanitize_detail_value`).** Every
+IdP-supplied value that reaches an audit `detail` string or an
+`emit_event` JSON attribute — `name`/`email`/`sub` (and the derived
+`display`) — is untrusted: a hostile or misconfigured IdP, or a
+user-editable IdP profile field, controls it. `detail` is a flat
+`"k=v;k=v"` string parsed by SIEM tooling, so an unsanitised value could
+inject `;`/`=` to forge additional fields or `\r`/`\n`/other control
+bytes to inject fake log lines. `detail::sanitize_detail_value`
+(`auth_routes.hpp`/`.cpp`) is the single chokepoint that neutralises
+this: it replaces `;`, `=`, `\r`, `\n`, and any control byte (incl. DEL)
+with `_`, then truncates to 128 bytes on a UTF-8 code-point boundary.
+Every `display=`/`email=`/`oidc_sub`/`name` value attached in
+`/auth/callback` is run through it before concatenation. **It is
+audit-detail-field-injection defense only — it does NOT strip HTML
+markup and is not a stored-XSS defense by itself.** A value with no
+control bytes (e.g. a display name containing `<script>`) passes through
+unchanged; if that value is later rendered into HTML, the render layer's
+own escaping (`html_escape`) is what neutralises it. See the docstring on
+`detail::sanitize_detail_value` in `auth_routes.hpp` for the full contract.
+
+**Migration.** `RbacStore` schema v3 deletes every `group_members` row
+belonging to an IdP-sourced group (`groups.source != 'local'`) on
+upgrade — those rows were keyed on the OLD display-name principal and
+would otherwise be BOTH orphaned (never re-referenced by the new
+stable-keyed principal) AND a resurrected confused-deputy hazard: a
+LOCAL user who later takes the old display name as their username would
+silently inherit whatever roles the stale row's group grants. The purge
+is additive/safe — only `group_members` rows for non-local groups are
+removed; `groups`/`roles`/`role_permissions`/local memberships are
+untouched, and IdP membership re-populates under the new stable key on
+each affected user's next SSO login via `reconcile_idp_memberships`.
+
+**Resolved — durable SSO identity restores OIDC JIT admin elevation
+(#1852).** `AuthDB::set_elevation_eligible`/`is_elevation_eligible` key on
+`users.username` and were gated through `is_valid_username`, which allows
+only alphanumerics plus `. _ -` and explicitly rejects `:` (comment:
+"prevent config file format injection"). The stable OIDC principal shape
+(`oidc:<iss>#<sub>`) contains both `:` and `#`, so it failed that check
+unconditionally — `POST /api/v1/users/{name}/elevation-eligibility` 400'd
+before reaching the store, and `is_elevation_eligible(session->username)`
+for a live OIDC session returned `InvalidUsername`, treated as
+fail-closed/denied by the caller. Widening `is_valid_username`'s charset
+alone would not have been sufficient: an OIDC login provisioned **no
+`users` row at all** — `elevation_eligible` is a column on `users`, and
+there was no row for an SSO principal to set it on. Both halves are now
+fixed:
+
+- **Durable identity row.** `/auth/callback` calls
+  `AuthManager::provision_sso_identity` immediately after
+  `create_oidc_session` mints the session — a new, independent call, not
+  folded into `create_oidc_session` itself (that method holds `mu_` for the
+  in-memory session map; provisioning does unrelated `auth.db` I/O that must
+  not serialize behind it). It forwards to `AuthDB::upsert_sso_identity`
+  (auth.db migration v6: `users` gains `identity_source`, `external_iss`,
+  `external_sub`, `display_name`, `last_seen_at`, all nullable/defaulted so
+  every existing row survives without backfill), which `INSERT ... ON
+  CONFLICT(username) DO UPDATE`s a row for the stable principal —
+  `password_hash`/`salt_hex` are `''` (never resolvable on the local login
+  path — see the constant-time-compare note at the top of this document),
+  `role` defaults `'user'` on first insert only. The `ON CONFLICT` refresh
+  arm updates **only** `display_name`/`last_seen_at`/`is_active` — it
+  deliberately never touches `role` or `elevation_eligible`, so a standing
+  admin grant and elevation eligibility survive every re-login. **Fail-soft
+  by design:** a provisioning error is logged and the login still succeeds
+  (a login must never fail because a secondary bookkeeping write failed);
+  the principal simply cannot elevate until a later successful login
+  provisions it. IdP-side deprovisioning has no push signal into Yuzu today
+  — a removed IdP account's row goes stale, aged by `last_seen_at`; a
+  reaper/SCIM-driven sweep of long-unseen SSO rows is a tracked follow-up,
+  not built in this slice.
+- **`is_valid_principal` at the elevation-cluster target-lookup
+  chokepoints.** A strict SUPERSET of `is_valid_username` (any string the
+  strict validator accepts is accepted unchanged) that additionally accepts
+  a reserved-prefixed (`oidc:`/`saml:`/`ad:`) principal after a narrow
+  control-byte/SQL-metacharacter blocklist (rejects `< 0x20`, `0x7F`, `;`,
+  `=`, `\`, `'`, `"`, `` ` ``, space; caps at 255 bytes; permits `: # / . _
+  - @ ~ % |` — the alphabet a real issuer URL + opaque sub actually need).
+  Replaces `is_valid_username` at exactly four call sites, all
+  target-lookups on an EXISTING row, never a create path:
+  `AuthDB::set_elevation_eligible`, `AuthDB::is_elevation_eligible`, the
+  `POST /api/v1/users/{name}/elevation-eligibility` target parameter, and
+  `DELETE /api/v1/sessions?username=`'s target parameter. Every other
+  `is_valid_username` call site — local user create (`upsert_user`),
+  delete, role-change, `mfa_status`, account-unlock (a lockout-domain
+  action; SSO logins never accumulate lockout state, so there is nothing to
+  unlock), and all password/lockout sites — is deliberately left untouched.
+- **The elevate route's mandatory-MFA gate branches on `auth_source`.**
+  See "JIT admin elevation" above for the local-vs-OIDC split and the
+  dedicated unconditional amr-proof gate that prevents the restoration from
+  accidentally granting elevation to a never-MFA'd SSO login under the
+  default `--mfa-enforcement=optional`.
+- **Settings → Users surfaces SSO rows.** `AuthDB::list_users` now selects
+  `identity_source`; the fragment renders an `SSO` badge and suppresses the
+  Remove button for a non-local row (`DELETE
+  /api/settings/users/:username` stays on the strict validator, so it would
+  always 400 against a `oidc:<iss>#<sub>` target — there is no local-delete
+  equivalent for a durable SSO identity; its lifecycle is IdP-driven).
+  Revoke-sessions stays available (principal-keyed, per the previous
+  bullet).
+- **A side effect, not the goal: `users.display_name` is now a durable
+  record for a provisioned principal.** The "Recovering a human name
+  without a live session" gap described above is *narrowed* by this — a
+  future render site could join `users.display_name` by principal instead
+  of relying only on a live session or an audit-row `detail` field — but no
+  such render site is wired in this slice; that remains a fast-follow.
+
+**Governance hardening round (2026-07-03) — see
+`docs/security-reviews/sso-durable-identity-2026-07-03.md` for the full
+record.** Four fixes on top of the base restoration above:
+
+- **Source-scope guard on the eligibility grant.** `is_elevation_eligible`
+  keys on the raw principal string alone, which is a landmine: a crafted SAML
+  NameID equal to a provisioned OIDC principal, or a legacy
+  `identity_source='local'` row that happens to be named `oidc:<iss>#<sub>`
+  with `elevation_eligible=1`, would otherwise let a session borrow a grant
+  never made against its own identity source. The elevate handler now fetches
+  the target row's `identity_source` (`AuthDB::get_user`, which selects it)
+  immediately after the eligibility check and requires it EQUAL the session's
+  `auth_source` — a direct mapping (`local`↔`local`, `oidc`↔`oidc`,
+  `saml`↔`saml`), not "oidc-or-else-local" — denying with
+  `role.elevation.denied` / `detail=identity-source mismatch` otherwise.
+- **`upsert_sso_identity` no longer resurrects a deactivated row.** The
+  `ON CONFLICT` refresh arm dropped `is_active = 1` from its `SET` clause — a
+  re-login against a row a future deprovisioning sweep (#1859) had
+  soft-deleted no longer silently reactivates it.
+- **`AuthDB::invalidate_all_sessions` moved to `is_valid_principal`.** Force-
+  logging-out an SSO principal via `DELETE /api/v1/sessions?username=`
+  previously hit `InvalidUsername` at this inner call even though the REST
+  layer had already accepted the principal — corrupting the audit trail with
+  `result="partial"`/`db_error=true` for an action that fully succeeded (OIDC
+  sessions are never persisted to `sessions`, so 0 matched rows IS success).
+- **Settings → Users "Revoke sessions" URL-encodes the principal.** The
+  button previously built its `hx-delete` URL with `html_escape` alone, which
+  does not touch `#` — a durable SSO principal's `#` was silently truncated
+  by the browser's URL-fragment parsing before the request left the client.
+
+SAML is unaffected by this restoration: `create_saml_session` still keys
+`username` on the raw NameID (no reserved-prefix stable principal — see
+"SAML is unaffected this slice" above), so `is_valid_principal` does not
+recognise it as an SSO principal and `provision_sso_identity` is not called
+from the SAML ACS handler. A SAML session is therefore provisioned nowhere
+and cannot elevate — not because of a missing MFA proof specifically, but
+because there is no durable identity row to hold `elevation_eligible` on in
+the first place. Keying SAML on `entity_id#NameID` (the tracked fast-follow
+noted above) is a prerequisite for extending this restoration to SAML.
+
+**This is not a regression of a previously-supported flow.** Before #1837,
+`Session::username` for an OIDC session was the mutable display name
+(`claims.name`, falling back to `claims.email`), and `is_elevation_eligible`
+looked that string up directly in `users.username`. Elevation for an SSO
+operator therefore only ever "worked" by accident, and only when **both**
+of two coincidences held: the IdP-asserted display name had to consist
+solely of `is_valid_username`'s narrow charset (no space, no `@` — so most
+real display names/emails already failed this silently), **and** it had to
+exactly match an existing *local* `users.username`. When both held, the SSO
+login's principal silently **borrowed that local principal's
+`elevation_eligible` flag and `mfa_totp_secret` enrollment** — a latent
+cross-principal grant with zero cryptographic binding between the SSO
+identity and the local account it happened to name-collide with: anyone
+the IdP would authenticate under that same display name inherited that
+local account's admin-elevation path. #1837 severs this borrowing as a
+direct, correct consequence of closing the display-name collision it rode
+on (see above) — it is closing an unsafe accident, not breaking a supported
+capability. #1852 is the deliberate, durable restoration.
+
+**Session-revocation-by-username is a narrower, structurally different
+gap.** The operationally-critical kill step
+(`AuthManager::invalidate_user_sessions`'s in-memory sweep, keyed by plain
+string equality over `sessions_`) carries no `is_valid_username` gate and
+revokes any principal string, `oidc:<iss>#<sub>` included — there is no
+missing-row problem here, unlike elevation. `DELETE
+/api/v1/sessions?username=`'s own query-parameter check does still run
+`is_valid_username` at the REST layer, so an admin typing the literal
+`oidc:<iss>#<sub>` string still gets a 400 today from that endpoint — but
+that charset-only validator predates #1837 and would already have rejected
+most OIDC display-name-keyed usernames (spaces, `@`) before this change
+too, so this is a narrow, pre-existing, easily-widened validator gap, not a
+new #1837 regression and not gated on #1852. Separately, the
+`auth.db`-persisted half of revocation
+(`AuthDB::invalidate_all_sessions`'s `DELETE FROM sessions`, surfaced as
+`db_persisted=false` for an SSO target) was **already** a no-op for OIDC
+before #1837 too: `AuthDB::create_session` is never called for an OIDC
+login — SSO sessions have always been in-memory-only and were never
+written to `auth.db`'s `sessions` table in the first place.
+
+Implementation: `Session::username`/`display_name`
+(`auth.hpp`), `AuthManager::create_oidc_session` (`auth.cpp`), the
+stable-id construction and per-audit-row `display=`/`email=` detail
+attachment in `auth_routes.cpp` `/auth/callback`, `RbacStore` migration
+v3 (`rbac_store.cpp`). Tests: `tests/unit/server/test_oidc_principal_key.cpp`.
 
 ## SAML 2.0 SP
 
@@ -731,16 +1049,381 @@ for the IdP cert in this release.
   flags or environment variables; there is no dashboard panel for it in this
   slice. A server restart is required to change the configuration.
 
+## SCIM v2 provisioning (SOC 2 CC6.2/CC6.8)
+
+`/auth-and-authz` skill gap matrix P1 #7. RFC 7643 (Core Schema) / RFC 7644
+(Protocol) — lets an enterprise IdP (Okta/Entra/OneLogin) auto-provision and
+auto-deprovision Yuzu operators via its SCIM connector, rather than an admin
+managing accounts by hand. **Users-only slice — Groups→role mapping is a
+deferred follow-up** (see below); every SCIM-provisioned account is the
+fixed, floor-privilege `user` role.
+
+### Configuration (fail-closed)
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--scim-enable` | `YUZU_SCIM_ENABLE` | Enable the `/scim/v2/*` route surface. Default `false` — SCIM is entirely inert when disabled (no routes registered, no boot-log line). |
+| `--scim-token` | `YUZU_SCIM_TOKEN` | The bearer credential the IdP's SCIM connector authenticates with. Secret — treat like a password. |
+
+**Prefer `YUZU_SCIM_TOKEN` over `--scim-token`.** A value passed on argv is
+visible to any local user via `ps`/`/proc/<pid>/cmdline`; the environment
+variable does not appear there. `YUZU_SCIM_TOKEN` is the recommended
+delivery method — the flag remains supported for parity with the other
+`--scim-*` options and local/manual testing.
+
+Two fail-closed startup guards, both refusing to start (`EXIT_FAILURE`):
+
+- **`--scim-enable` without `--scim-token`.** There is no way to gate the
+  surface without a credential, so the server does not boot rather than
+  expose an unauthenticated provisioning API.
+- **`--scim-enable` together with `--no-https`.** The bearer token is a
+  long-lived, high-privilege credential (it can create/delete operator
+  accounts); it must never cross the wire in plaintext. This mirrors the
+  `--auth-mode=sso-only` boot posture — a security-relevant flag combination
+  is rejected at boot, not silently degraded.
+
+The active SCIM posture (enabled/disabled, and — if enabled — that a token is
+configured) is logged **once at boot** as CC6.2 evidence, the same pattern as
+the `sso-only` boot-posture banner.
+
+### Auth
+
+Every `/scim/v2/*` route — **including the discovery endpoints** — requires
+`Authorization: Bearer <token>`, validated **constant-time** (`CRYPTO_memcmp`)
+against the SHA-256 hash stored at `--scim-enable` time (mirrors
+`ApiTokenStore`'s token-hashing pattern). A missing, malformed, or invalid
+token is a `401` + `WWW-Authenticate: Bearer` — the same envelope regardless
+of *why* it failed (no oracle distinguishing "wrong token" from "no token
+configured"). SCIM tokens are their **own credential type**, entirely
+distinct from operator API tokens and session cookies — there is no cookie,
+no session, no shared token store. Every authenticated SCIM request maps to
+a fixed `scim-service` audit principal (there is no notion of "which
+operator" made a SCIM call; it is the IdP connector, always).
+
+### Endpoints
+
+All responses (and the accepted PATCH/PUT bodies) use
+`Content-Type: application/scim+json`.
+
+`ServiceProviderConfig` advertises **`etag.supported: false`** — there is no
+conditional-write enforcement (`If-Match`/`If-None-Match` are not honored);
+the `ETag`/`meta.version` a client sees back is informational only, not a
+concurrency-control token.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /scim/v2/ServiceProviderConfig` | Discovery — capability document |
+| `GET /scim/v2/ResourceTypes` | Discovery — describes the User resource type |
+| `GET /scim/v2/Schemas` | Discovery — the core User schema |
+| `POST /scim/v2/Users` | Provision a new user |
+| `GET /scim/v2/Users/{id}` | Read a single user (`404` if unknown) |
+| `GET /scim/v2/Users?filter=userName eq "x"&startIndex=&count=` | Existence check + pagination (SCIM `ListResponse`) |
+| `PUT /scim/v2/Users/{id}` | Replace (`externalId`, `active`) |
+| `PATCH /scim/v2/Users/{id}` | Primary lifecycle path — deactivate / reactivate |
+| `DELETE /scim/v2/Users/{id}` | Deprovision |
+
+### Provisioning model
+
+`POST /scim/v2/Users` creates the account at the **fixed, read-only `user`
+role** with a discarded CSPRNG-generated password — a SCIM-provisioned user
+never authenticates with a local password; they sign in via the IdP/SSO. A
+duplicate `userName` is rejected `409` (`scim_type=uniqueness`) rather than
+silently upserting. Success is `201` + `Location` (the resource's canonical
+URL) + `ETag` (the resource's `etag_version`, bumped on every mutation).
+
+**Reprovisioning a returning employee works.** If the `userName` collision is
+against an existing SCIM-provisioned account that is currently **deactivated**,
+`POST` revives that account rather than rejecting `409` — this is the
+"left, then rejoined" case an IdP connector replays automatically when a
+person is re-added and re-assigned the app. The `409 uniqueness` rejection is
+reserved for a `userName` collision against a **currently-active** account.
+
+### `userName` charset — must be a slug, not an email address
+
+Yuzu account usernames are slug-shaped: alphanumeric plus `.`, `_`, `-`
+only — **no `@`**. Stock Okta/Entra provisioning defaults `userName` to the
+user's email address, which contains `@` and is rejected `400` at
+`POST /scim/v2/Users` (and at any subsequent identity-touching `PUT`/`PATCH`).
+**Operators must remap `userName` to a non-email slug attribute** in the
+IdP's provisioning/attribute-mapping configuration before assigning any
+users — the `400` response carries an error-message hint calling out the
+rejected character(s) to speed up this diagnosis. Native support for an
+email-shaped `userName` (deriving a slug server-side) is a planned follow-up
+— see Deferred below.
+
+`GET .../Users?filter=userName eq "x"` is the connector's standard
+existence-check-before-create call. **Only the `userName eq "..."` filter is
+supported** (attribute + operator case-insensitive, value double-quoted);
+any other attribute or operator is rejected `400` (`scim_type=invalidFilter`)
+rather than silently ignored or partially matched.
+
+`PUT /scim/v2/Users/{id}` replaces the mutable identity fields (`externalId`,
+`active`). A `userName` change is rejected `400`
+(`scim_type=mutability`) — **rename is out of scope this slice**; deleting
+and re-provisioning is the only supported path for a IdP-side username
+change today.
+
+### Deprovision and reactivation
+
+`PATCH /scim/v2/Users/{id}` is the primary lifecycle path (both the pathless
+`{"value":{"active":false}}` and explicit `{"path":"active","value":false}`
+PatchOp forms are accepted). **`PUT /scim/v2/Users/{id}` triggers the
+identical deactivate/reactivate semantics** whenever its body's `active`
+value differs from the account's current state — some IdP connectors issue a
+full `PUT` rather than a `PATCH` for lifecycle changes, and that path gets
+the same audit behavior described below, not a silent no-op:
+
+- **`active:false` deprovisions** — soft-deletes the underlying auth account
+  and **cascades session revocation** (an in-flight session for a
+  just-terminated employee does not outlive the IdP's deprovisioning call).
+- **`active:true` reactivates** — restores the account and **clears any
+  stale lockout** (`failed_login_count`/`locked_until`), so a re-hire isn't
+  stuck behind a lockout window from before their termination. **MFA is
+  NOT restored** — a reactivated user re-enrolls TOTP from scratch on next
+  login, the same posture as any other de-enrolled account; SCIM never
+  resurrects a stale second factor.
+
+`DELETE /scim/v2/Users/{id}` is the equivalent one-shot deprovision (`204`),
+for IdPs that issue a hard delete rather than a PATCH/PUT-to-inactive.
+
+**All lifecycle audit writes are set-and-proceed; evidence integrity is
+enforced by an alert on the failure metric.** Every action (provision,
+update, deactivate, reactivate, delete) completes even if its audit write
+fails, and each failure unconditionally bumps
+`yuzu_scim_audit_write_failures_total`. A fail-closed `500` on a
+*termination* audit-write failure was considered and **rejected**: because
+the account is already mutated, the IdP's retry re-reads the terminated
+post-state, takes the non-termination (no-op / `404`) branch, and never
+re-attempts the missing audit — the `500` fails the request without ever
+re-landing the evidence row it was meant to guarantee. The correct CC6.8
+control is therefore an **alert on `yuzu_scim_audit_write_failures_total`**
+(same-day follow-up on a missed termination record); deploy that rule when
+you enable SCIM.
+
+### 🔴 Provenance guard (the load-bearing security invariant)
+
+**SCIM may only ever mutate accounts that SCIM itself provisioned, and only
+while they are still floor-privilege.** Every deactivate / reactivate /
+delete / update re-verifies **both**
+`provisioning_source == "scim"` (a new `users` column,
+`AuthDB::set_provisioning_source`/`get_provisioning_source`, auth.db
+migration **v7**) **and** `role == "user"` **immediately before** touching
+the auth account — not at lookup time, at the mutation site. Either mismatch
+(the target `scim_id` maps to a username whose `provisioning_source` is
+`local` or anything else, **or** whose `role` has since been elevated, e.g.
+by a dashboard admin promoting a former SCIM user) refuses with **`404`,
+never `403`** — a `403` would be an existence oracle (it confirms the
+resource exists but is protected); a `404` is indistinguishable from "no
+such SCIM resource" — plus a `scim.user.provenance_denied` audit row so the
+attempt is still recorded even though the caller sees a plain not-found.
+
+This is the invariant that makes it safe to point a third-party IdP
+connector at this endpoint at all: **a locally-created admin account, or the
+`--break-glass-user` break-glass account, can never be deactivated by an IdP
+push** — even if an attacker who compromises the IdP (or a misconfigured
+connector) knows or guesses that account's SCIM-facing `id`. The `role`
+half of the check adds a second belt: **an operator-elevated SCIM account is
+not SCIM's to tear down** — once a SCIM-provisioned account has been
+promoted (e.g. to `admin`) by a human through the dashboard, it drops out of
+SCIM's write authority entirely, the same as if it had never been
+SCIM-provisioned. Separately, **SCIM-provisioned accounts are always
+`role=user` at creation time** (see Provisioning model above) — there is no
+code path from a SCIM request to `role=admin`, so a compromised IdP cannot
+create an admin, and (via this guard) cannot remove one either, whether that
+admin was always local or was originally SCIM-provisioned and later
+promoted.
+
+### Audit actions
+
+Audit `result` is one of **`success` | `failure` | `denied`** — not
+`ok`/`error`. `success` is a completed mutation; `denied` is a guard
+refusing an otherwise-well-formed request (409 uniqueness, provenance/role
+mismatch, bad bearer token); `failure` is an internal error after the
+request was otherwise accepted (e.g. an audit-write or transaction failure
+that triggers a `500`).
+
+| Action | Result | When |
+|---|---|---|
+| `scim.user.provisioned` | `success` | `POST /scim/v2/Users` succeeds (new account, or a revived reprovision) |
+| `scim.user.provisioned` | `denied` | `POST` rejected `409` — `userName` collision against a currently-active account |
+| `scim.user.provisioned` | `failure` | `POST` rolls back after a `500` (e.g. the account-creation transaction fails) |
+| `scim.user.updated` | `success` / `failure` | `PUT /scim/v2/Users/{id}` succeeds / fails `500` |
+| `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write could not persist |
+| `scim.user.reactivated` | `success` / `failure` | `PATCH` or `PUT` sets `active:true`; `failure` (set-and-proceed) on an audit-write error |
+| `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed) |
+| `scim.user.provenance_denied` | `denied` | A deactivate/reactivate/delete/update targets an account whose `provisioning_source != "scim"`, **or** whose current `role != "user"` |
+| `scim.auth.denied` | `denied` | Bearer-auth validation fails (missing/malformed/wrong token) on any `/scim/v2/*` route, including discovery |
+
+All rows carry `principal = "scim-service"`, `principal_role = "scim-service"`,
+`target_type = "User"`.
+
+### Metrics
+
+Prometheus counters (all in the `yuzu_scim_*` namespace):
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `yuzu_scim_requests_total` | `op`, `status` | Every `/scim/v2/Users` request, by operation (`op` = `create`\|`get`\|`list`\|`replace`\|`patch`\|`delete` — the literal wire values `scim_routes.cpp` passes to `record_request`) and outcome bucket (`status` = `2xx`\|`4xx`\|`5xx`). The three discovery documents (`ServiceProviderConfig`/`ResourceTypes`/`Schemas`) are NOT counted here (they carry no lifecycle op) — a rejected bearer against them still surfaces via `yuzu_scim_auth_failures_total`. |
+| `yuzu_scim_auth_failures_total` | — | Bearer-auth failures on any `/scim/v2/*` route; pairs with `scim.auth.denied` audit rows. |
+| `yuzu_scim_audit_write_failures_total` | — | An audit-log write itself failed. All lifecycle actions (provision, update, deactivate, reactivate, delete) are set-and-proceed on this failure mode — the SCIM call still succeeded and the bump is the only record that the evidence row is missing; alert on this counter rather than expecting a `500` (see "All lifecycle audit writes are set-and-proceed" above). |
+| `yuzu_scim_provenance_denied_total` | — | Provenance- or role-guard refusals; pairs with `scim.user.provenance_denied` audit rows. |
+
+### Storage
+
+SCIM's resource-mapping table (`scim_resources` — the IdP-facing `id`/
+`externalId` ↔ Yuzu `username` mapping) and its bearer-token table
+(`scim_tokens` — sha256 hashes only) live **inside `auth.db`**, under their
+own `MigrationRunner` component (`"scim"`, independent of AuthDB's own
+`"auth_db"` migration track on the same underlying file) — **not** a new,
+separate store. `ScimStore` opens its own `sqlite3` connection to the same
+db file `AuthDB` manages. This keeps user identity on one substrate and lets
+SCIM's tables ride `auth.db`'s eventual Postgres migration (ADR-0006) rather
+than needing a second migration path.
+
+**ADR-0006 exception note.** The 2026-06-22 update to ADR-0006 commits every
+server store to Postgres, with no *new* server-side SQLite store absent an
+explicit exception. `scim_resources`/`scim_tokens` are a deliberate,
+eyes-open exception: they ride the existing `auth.db` SQLite file (their own
+`"scim"` `MigrationRunner` component) rather than standing up a new Postgres
+store, so identity state — accounts, sessions, provenance, and now SCIM's
+id/token mapping — stays on one substrate until `auth.db` itself makes its
+Postgres/`SecretCodec` cutover (`docs/postgres-migration-ladder.md` Wave 3,
+`auth DB (auth_db.{hpp,cpp})` row). Recorded as a dated ADR-0006 exception bullet in
+`docs/postgres-migration-ladder.md` "Notes" — the same place, and in the
+same eyes-open-override style, as the existing `NvdDatabase` SQLite
+carve-out — rather than a fresh standalone exception ADR.
+
+### Residual risks / deferred (next slice)
+
+- **Crash-window non-atomicity in the two-connection deactivate/reactivate
+  path.** `ScimStore` and `AuthDB` open separate `sqlite3` connections onto
+  the same `auth.db` file; a deactivate that soft-deletes the auth account
+  and revokes sessions is not one atomic transaction across both. A crash
+  between the two steps is an **irreducible** window given the two-connection
+  design — it is reconciled by the IdP's own periodic re-sync (a deactivated
+  user whose session survived the crash gets a follow-up deactivate call on
+  the next sync cycle), not by a code-level fix in this slice.
+- **No per-route SCIM rate limit.** SCIM calls share the server's global
+  rate-limit only — there is no SCIM-specific throttle tuned to expected IdP
+  connector call patterns.
+- **`userName` is email-incompatible.** Yuzu usernames are slug-shaped
+  (alnum, `.`, `_`, `-` — no `@`); a stock Okta/Entra `userName=email`
+  mapping 400s. Operators must remap `userName` to a slug attribute (see
+  above). Native email-shaped `userName` support is a planned follow-up.
+- **Groups→role mapping.** SCIM Group resources (`/scim/v2/Groups`) and a
+  group→role mapping mechanism (mirroring the OIDC `--oidc-admin-group` /
+  SAML `--saml-admin-group` pattern) are not implemented — every
+  SCIM-provisioned user is `role=user` at creation regardless of IdP group
+  membership (see the provenance/role guard above for what happens if a
+  human promotes one after the fact).
+- **`userName` rename via `PUT`.** Rejected `400 mutability` this slice;
+  delete + re-provision is the only path for a username change.
+- **At-rest encryption of the SCIM token.** The token is stored as a sha256
+  hash (verify-only, like `ApiTokenStore`), not a reversible encrypted blob —
+  there is nothing to decrypt, so this is a lower-urgency follow-up than the
+  TOTP-secret case. It rides `auth.db`'s future Postgres/`SecretCodec`
+  migration (ADR-0010) alongside the TOTP-secret-at-rest follow-up, should a
+  reversible form ever be needed.
+
+Implementation: `server/core/include/yuzu/server/scim_store.hpp` +
+`server/core/src/scim_store.cpp` (storage layer), `server/core/include/yuzu/
+server/scim_json.hpp` + `server/core/src/scim_json.cpp` (JSON codec +
+discovery documents), `server/core/src/scim_routes.{hpp,cpp}` (HTTP routes).
+Tests: `tests/unit/server/test_scim_store.cpp`,
+`test_scim_json.cpp`, `test_scim_routes.cpp`.
+
 ## Granular RBAC (Phase 3)
 
 - 6 roles, 19 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
+## On-behalf-of assertions rejected (ADR-0022 Interim rules)
+
+Until server-verifiable delegation ships (ADR-0022 auth follow-up), the server
+accepts **no** on-behalf-of assertion on **any** ingress surface — any such
+header or metadata key is **rejected, not ignored**. Five names are reserved
+(case-insensitive; source of truth `server/core/src/on_behalf_guard.hpp`, and
+the list only ever grows): `On-Behalf-Of`, `X-On-Behalf-Of`,
+`X-Yuzu-On-Behalf-Of`, `X-Yuzu-Delegated-Operator`,
+`X-Yuzu-Delegation-Artifact`.
+
+Enforcement: **HTTP** — checked in the pre-routing chokepoint (`server.cpp`)
+before auth, the allowlist, and the rate limiter, so REST, MCP, dashboard
+fragments, and static files all reject with `403` + the A4 error envelope.
+**Recorded exception (the only one):** the four liveness/readiness probe
+paths (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt — a
+mesh/SSO proxy that stamps a reserved header on every request must not be
+able to fail the probes and crash-loop the server (governance CH-3/UP-5); a
+probe performs no identity-bearing action and nothing consumes the header on
+that path. This exception is recorded in ADR-0022's exception ledger on
+acceptance. **gRPC** — a single server interceptor on the
+one `ServerBuilder` (`grpc_on_behalf_interceptor.hpp`) covers the agent,
+management, and gateway-upstream services and every future RPC method by
+construction; a call carrying a reserved metadata key is cancelled via
+`ServerContext::TryCancel()` (client observes `CANCELLED`). `TryCancel()`
+alone does not stop a handler from running, so it is paired with an
+enforcement seam (`grpc_on_behalf_enforce.hpp`): the first statement of every
+RPC handler on `AgentServiceImpl` and `GatewayUpstreamServiceImpl`
+independently re-derives the same reserved-key check from
+`context->client_metadata()` (not `ServerContext::IsCancelled()` — its
+propagation from `TryCancel()` is not synchronous with handler dispatch,
+confirmed by an end-to-end test) — the call is a true no-op on that surface,
+not merely a wrong status code on an already-committed side effect. **Gateway
+note:** the Erlang gateway's
+own agent-facing listener reads only its known metadata keys and mints fresh
+upstream calls, so a reserved key sent to the gateway is dropped rather than
+rejected — tracked as a follow-up (Erlang-side reject, #1974) rather than an
+exception. **Consequence for `GatewayUpstreamServiceImpl`'s own enforcement:**
+today's gateway never forwards the agent's original gRPC metadata onward, so
+an agent cannot smuggle a reserved key through it — the `ProxyRegister`/etc.
+handlers' `onbehalf::enforce()` guard is currently defense-in-depth against
+the gateway's own client, not a proven end-to-end control against relayed
+agent metadata. If a future change adds metadata passthrough (e.g. for
+tracing), it must re-derive the reserved-key check against the forwarded
+metadata explicitly — the guard does not do this automatically. Rejections
+are counted in
+`yuzu_onbehalf_rejected_total{surface,event="security"}`; there is
+deliberately **no audit row** (the rejection fires pre-auth, so there is no
+resolved principal to attribute — the metric is the signal). **Accepted
+evidence limit:** the warn log is sampled (1 per 100 rejections per surface,
+a deliberate pre-rate-limiter flood defence), so the counter proves *how
+many* attempts occurred while only ~1% carry a forensic log line with
+timestamp/source — state this plainly if asked "can you show every attempt". When delegation
+ships it will use a **server-issued artifact**, never a client-asserted
+header, so these names stay rejected on client ingress permanently.
+
 ## API tokens and automation
 
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
 - **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; the global `admin` role is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
+
+## Engine principals & delegation (ADR-1005 — design)
+
+- **Design doc:** `docs/auth-engine-principals-design.md` (execution-plan item
+  2b, feeds Phases 4–5). Not yet implemented — nothing below is a shipped
+  surface.
+- Third principal class (`engine`) for use-case-engine hosts: dedicated
+  born-on-Postgres `EnginePrincipalStore` (named human owner, justification,
+  soft-retained after revoke), reserved `engine:` id namespace, per-module
+  granularity.
+- Token sessions branch on a persisted `ApiToken.principal_kind`
+  (`human`|`engine`) — an engine token attributes to the engine principal
+  itself (`auth_source="engine_token"`), never to its creating human.
+- Authorization model: scoped role assignments `(principal, role, scope)`
+  for **all** principal classes, evaluated permissions ∩ scope through
+  ADR-0017's `authorize_list_read` chokepoint for list/fan-out reads and
+  the per-device scoped-permission path for single-target operations
+  (ADR-0017 PR-A is a named prerequisite, its charter to be amended or
+  extended for the `engine` principal type). Engine principals are
+  default-deny, structurally barred from `admin`.
+- Delegation (Phase 5): RFC 8693 token-exchange shape — server-issued
+  opaque, audience-bound, short-TTL artifact; effective authority = engine
+  principal's assignments ∩ operator's assignments ∩ operator's scope
+  (decision-level intersection — a delegation only ever narrows);
+  self-asserted delegation stays rejected permanently.
+- Engine credentials: 90-day ceiling, overlap-pair rotation (≤2 active),
+  MCP tier hard-locked `readonly` for v1.
 
 ## Agent enrollment (3 tiers)
 

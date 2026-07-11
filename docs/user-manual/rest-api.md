@@ -8,6 +8,8 @@ This document covers every HTTP endpoint exposed by the Yuzu server. Endpoints a
 
 The Yuzu REST API uses path-based versioning. Understanding the distinction between versioned and legacy endpoints is important for building stable integrations.
 
+> **Formal policy:** the binding cross-surface versioning & deprecation policy — covering REST **and** MCP tools, the additive-vs-breaking test, the deprecation cycle (announcement channels + minimum window), and MCP tool naming on breaking changes — is [`docs/api-versioning-policy.md`](../api-versioning-policy.md). This section is the REST summary.
+
 ### Versioned API (`/api/v1/`)
 
 All endpoints under the `/api/v1/` prefix are the **stable, versioned API**. These endpoints:
@@ -25,7 +27,7 @@ Endpoints under `/api/` without the `v1` prefix are **legacy endpoints** that pr
 - Remain available for backward compatibility
 - Do **not** use the standard v1 JSON envelope
 - May return inconsistent error formats
-- Are **deprecated** and will be removed in a future major release
+- Are **deprecated** and will be removed per the deprecation cycle in [`docs/api-versioning-policy.md`](../api-versioning-policy.md) (a feature release, after the announced window)
 - Should be migrated to their v1 equivalents where available
 
 ### Migration Guidance
@@ -104,6 +106,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Dashboard TAR](#dashboard-tar)
 - [MCP (Model Context Protocol)](#mcp-model-context-protocol)
 - [Authentication Endpoints](#authentication-endpoints)
+- [SCIM v2 Provisioning](#scim-v2-provisioning)
 - [Health](#health)
 - [Metrics](#metrics)
 
@@ -122,6 +125,17 @@ Every request must be authenticated using one of three methods:
 Unauthenticated browser requests are redirected to `/login`. Unauthenticated API requests receive a `401 Unauthorized` response.
 
 API tokens are created via `POST /api/v1/tokens` and can be scoped to the creating user's permissions. The raw token value is returned exactly once at creation time.
+
+**Reserved headers — do not send.** Five header names are reserved for future
+server-verifiable delegation and are **rejected on every endpoint** (sole
+exception: the four unauthenticated health-probe paths, which ignore them —
+see `docs/auth-architecture.md`) with `403` + the standard error envelope
+(ADR-0022): `On-Behalf-Of`, `X-On-Behalf-Of`,
+`X-Yuzu-On-Behalf-Of`, `X-Yuzu-Delegated-Operator`,
+`X-Yuzu-Delegation-Artifact` (case-insensitive). A client must never assert
+that it acts on another principal's behalf via a header; see
+`docs/auth-architecture.md` ("On-behalf-of assertions rejected") for rationale
+and the evolution path.
 
 ---
 
@@ -760,7 +774,9 @@ The admin route emits two distinct 400 bodies — operators scripting the endpoi
 }
 ```
 
-The `username` parameter is validated with the same character set used at user creation (`is_valid_username`). NUL bytes, control characters, and newlines are rejected — passing them through to the SQL bind would silently truncate at the NUL while the audit log records the full string, producing a target/effect mismatch (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
+The `username` parameter accepts either a strict local username OR a durable SSO principal (`is_valid_principal`, #1852) — in practice this means an **OIDC** principal (`oidc:<iss>#<sub>`), so an admin can force-log-out an SSO operator authenticated via OIDC today. Local usernames stay on the strict alphanumeric/`._-` charset; an SSO principal permits the `: # / . _ - @ ~ % |` alphabet a real IdP issuer URL and opaque subject need. NUL bytes, control characters, newlines, and shell/SQL metacharacters (`;`, `=`, `\`, quotes, backtick, space) are rejected in both cases — passing them through to the SQL bind would silently truncate/diverge from the audited target string (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
+
+**SAML is NOT force-loggable today.** A SAML session's `Session::username` is the raw IdP-supplied NameID (`create_saml_session` sets it verbatim, never a `saml:<idp>#<nameid>` shape) — a NameID is commonly an email address, and `@` fails `is_valid_principal` (it lacks the `saml:` reserved prefix that would unlock the wider SSO charset). A SAML operator's NameID therefore typically 400s against this endpoint, and there is no other revocation lever for a SAML session. This is a tracked gap, not an intentional restriction — see #1859/#1860.
 
 **Error (403) -- caller lacks `UserManagement:Write`:**
 
@@ -870,15 +886,27 @@ Grant or revoke a user's **JIT-admin-elevation eligibility** — who may activat
 
 **Side effect:** setting `eligible=false` immediately terminates any in-flight elevation for that user.
 
+Two route forms, same handler:
+
+- **Path form** — `POST /api/v1/users/{username}/elevation-eligibility` — **local usernames only** in practice: both forms validate the target with `is_valid_principal` (#1852), but a path segment cannot carry the `/` and `#` an SSO principal contains, so only a local username reaches the handler this way.
+- **Query form** — `POST /api/v1/users/elevation-eligibility?username=<principal>` — **required for a durable SSO principal** (`oidc:<iss>#<sub>`). A path segment cannot carry the `/` (in the issuer URL) and `#` an SSO principal contains — the server percent-decodes the path and strips the URL fragment before route matching, so the path form 404s for every real IdP identity. The query form accepts the same shapes as `DELETE /api/v1/sessions` above (`is_valid_principal`, #1852): a strict local username, or an SSO principal (URL-encode the `#` as `%23`; `/` does not need escaping in a query value).
+
+This is an `UPDATE`-only operation against an existing `users` row, never an `INSERT` — an SSO principal only has a row once the operator has **logged in at least once** (first login auto-provisions it). Granting eligibility against a principal with no row yet returns `404`, which for an SSO principal specifically means "this operator has never signed in" rather than "no such user was ever created".
+
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
   -H "Content-Type: application/json" -d '{"eligible":true}' \
   "https://yuzu.example.com/api/v1/users/alice/elevation-eligibility"
+
+# SSO principal — MUST use the query form; note the URL-encoded '#' (%23):
+curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+  -H "Content-Type: application/json" -d '{"eligible":true}' \
+  'https://yuzu.example.com/api/v1/users/elevation-eligibility?username=oidc:https://idp.example.com/%23sub-4821'
 ```
 
 **Response (200):** `{"status":"ok"}`.
 
-**Errors:** `400` — invalid username or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found; `503` — no `auth.db` (`--data-dir` unset).
+**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found (for an SSO principal: the operator has never logged in); `503` — no `auth.db` (`--data-dir` unset).
 
 **Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` on a 403).
 
@@ -4857,13 +4885,57 @@ Returns recent analytics events. Accepts `limit` as a query parameter (default 5
 
 Returns the status of the NVD (National Vulnerability Database) sync.
 
-Response fields: `enabled`, `syncing`, `last_sync_time`, `last_error`, and
-`total_cves`. **`total_cves` is a count of distinct CVEs** in the local store.
+Response fields: `enabled`, `syncing`, `last_sync_time`, `last_error`,
+`total_cves`, `backfill_complete`, and `backfill_oldest_published`.
+`enabled` reflects whether NVD **sync** is configured on (i.e. `--no-nvd-sync` was
+*not* passed) — not merely whether the local mirror DB is open. Under `--no-nvd-sync`
+the mirror stays queryable (`/api/nvd/match` still works against seeded/previously-synced
+data) but `enabled` is `false` and `POST /api/nvd/sync` returns an error. Only `enabled`
+and `total_cves` are guaranteed present; the sync-progress fields (`syncing`,
+`last_sync_time`, `last_error`, `backfill_complete`, `backfill_oldest_published`) are
+omitted when sync is disabled, and the whole body is `{"enabled":false}` when the mirror
+DB is closed.
+**`total_cves` is a count of distinct CVEs** in the local store.
 (Prior to the CPE-range-matching change it counted one row per affected
 product, so a multi-product CVE inflated the figure — after upgrade the number
 reads lower even once fully synced, and reads near-zero briefly after the
 one-time schema migration until the next sync repopulates the mirror. This is
 expected, not data loss.)
+
+`backfill_complete` (boolean) reports whether the newest-first catalog backfill
+has reached its configured floor **and the catalog holds real NVD-sourced CVEs** —
+the built-in fallback rules seeded at startup do **not** count, so `total_cves` can
+be non-zero while `backfill_complete` is still `false`. A mirror with no NVD CVEs is
+never reported complete, so a fresh or rate-limited deployment (or one whose upstream
+NVD fetches have not yet returned data) shows `false` with the cursor at the floor
+until real NVD data lands. That is expected, not a stall.
+`backfill_oldest_published` (ISO 8601 string)
+is the progress cursor — the `published` date of the oldest CVE fetched so far,
+walking backwards. During the initial backfill `total_cves` climbs continuously
+and `last_sync_time` advances after **every** successful fetch window — so a
+non-empty `last_sync_time` does **not** mean the mirror is complete. Use
+`backfill_complete` (with the `backfill_oldest_published` cursor for progress) as
+the authoritative "initial mirror built" signal, not `last_sync_time`.
+
+`last_error` (string, present only while sync is enabled) surfaces the most recent
+sync-health problem and is cleared at the start of the next sync tick — a non-empty
+value is a transient, self-healing condition, not a product bug. Values you may see:
+a transient fetch failure (`NVD backfill fetch failed (<reason>) — retrying (mirror
+incomplete)` or `NVD freshness fetch failed (<reason>) — retrying`, where `<reason>` is
+one of `connection`/`http_429`/`http_403`/`http_other`/`parse` — cleared once a fetch
+succeeds; a persistent `http_403` means a bad/revoked `--nvd-api-key`, so rotate it, and
+`http_429` is expected rate-limiting that self-heals via backoff); a local persist failure
+(`NVD backfill window persist failed — mirror
+incomplete` / `NVD freshness window persist failed` — a disk/DB issue; the mirror holds
+its cursor and stays `backfill_complete: false` rather than dropping the fetched CVEs);
+a prolonged upstream outage (`NVD returning empty responses — mirror not populated`); and
+re-confirmation of a suspicious empty window (`re-confirming a suspicious empty NVD window
+(n/N)` — an older published-date window returned empty *after* real data had already
+landed; the backfill holds, staying `backfill_complete: false`, and re-checks it before
+trusting it, so a stale cache/proxy serving an empty page can't make it skip a populated
+range and falsely report complete).
+These are operational states, not product bugs — the mirror recovers automatically
+once the underlying condition clears.
 
 #### `POST /api/nvd/sync`
 
@@ -5624,7 +5696,7 @@ Promote the **current cookie session** to admin for a bounded window. The sessio
 **Permission:** an authenticated **cookie** session only (a Bearer/MCP-token caller gets `401` — automation credentials can never elevate); the caller must be `elevation_eligible` (eligibility is keyed on a `users` table row — an OIDC identity with no such row is denied here, not later; provision it first via `POST /api/v1/users`). A second factor is mandatory, branched strictly on the session's identity source (never a local namesake's enrollment for an OIDC caller):
 
 - **Local session:** MFA must be enrolled (unconditionally, not gated on `--mfa-enforcement`) and a fresh MFA step-up (TOTP) is required.
-- **OIDC session:** a seeded `amr`-asserted MFA proof from the *current* IdP login satisfies the second-factor requirement — no local TOTP enrollment is consulted (default `--jit-oidc-amr-elevation=true`). A single-factor (no-`amr`) OIDC session is denied (`"no MFA in SSO login"`), and a seeded-but-stale proof still triggers the step-up challenge rather than a silent grant. With `--no-jit-oidc-amr-elevation`, OIDC sessions cannot elevate at all (`"OIDC-amr elevation is disabled"`) — they cannot present a local TOTP step-up (their step-up challenge is re-SSO), so the operator must switch to a local-authenticated session with local TOTP.
+- **OIDC session:** ⚠️ **temporarily unavailable** — since the `oidc:<iss>#<sub>` identity re-key (#1837/#1857), an OIDC session has no local `users` row and is denied at the eligibility gate (`403`, `"eligibility read failed"`); restoration is tracked in #1852. *The `amr` behaviour described here is the intended path #1852 restores:* a seeded `amr`-asserted MFA proof from the *current* IdP login satisfies the second-factor requirement — no local TOTP enrollment is consulted (default `--jit-oidc-amr-elevation=true`). A single-factor (no-`amr`) OIDC session is denied (`"no MFA in SSO login"`), and a seeded-but-stale proof still triggers the step-up challenge rather than a silent grant. With `--no-jit-oidc-amr-elevation`, OIDC sessions cannot elevate at all (`"OIDC-amr elevation is disabled"`) — they cannot present a local TOTP step-up (their step-up challenge is re-SSO), so the operator must switch to a local-authenticated session with local TOTP.
 
 **Body:** `{"justification": "<string, required>", "duration_secs": <int, optional>}`. `justification` must be non-empty (control bytes are sanitised to space; capped to 1 KiB). `duration_secs` defaults to `--jit-max-elevation-secs` when absent or `0`; a value above the cap is clamped; a negative value is a `400`.
 
@@ -5664,6 +5736,158 @@ Begin the SAML 2.0 SP-initiated login flow. Builds an `<samlp:AuthnRequest>` and
 #### `POST /saml/acs`
 
 SAML Assertion Consumer Service endpoint. The IdP POSTs the `<samlp:Response>` here after authentication (HTTP-POST binding). The server validates the signed assertion (signature, audience, recipient, expiry, `InResponseTo` single-use) and mints a session cookie on success. On validation failure, the browser is redirected to `/login` with an error. Available only when SAML is enabled (see `GET /auth/saml/start`).
+
+---
+
+## SCIM v2 Provisioning
+
+RFC 7643/7644. A **separate protocol surface** from the `/api/v1/` JSON API
+above — its own RFC-defined schema (`application/scim+json`), its own
+bearer-token credential, and its own `scim-service` audit principal. Full
+design detail (provenance guard, deprovision/reactivation semantics, storage
+decision, deferred items) is in `docs/auth-architecture.md` "SCIM v2
+provisioning"; operator setup walkthrough is
+[docs/user-manual/scim-provisioning.md](scim-provisioning.md). This section
+is the wire-level endpoint reference.
+
+**Enablement:** entirely inert (routes not registered) unless
+`--scim-enable` (`YUZU_SCIM_ENABLE`) is set; requires `--scim-token`
+(`YUZU_SCIM_TOKEN`) and HTTPS, or the server refuses to start. **Prefer the
+`YUZU_SCIM_TOKEN` env var over `--scim-token`** — an argv value is visible
+to any local user via `ps`; the env var is not.
+
+**Permission:** every endpoint below, including the three discovery
+endpoints, requires `Authorization: Bearer <scim-token>` — validated
+constant-time against the configured token's hash. Missing/invalid → `401`
++ `WWW-Authenticate: Bearer`. This is unrelated to session cookies, API
+tokens, or RBAC — there is no `role`/permission check on these routes, only
+the bearer credential.
+
+#### `GET /scim/v2/ServiceProviderConfig`
+
+Discovery — static capability document (patch/filter/bulk support flags).
+
+#### `GET /scim/v2/ResourceTypes`
+
+Discovery — a SCIM `ListResponse` describing the `User` resource type.
+
+#### `GET /scim/v2/Schemas`
+
+Discovery — a SCIM `ListResponse` describing the core `User` schema.
+
+#### `POST /scim/v2/Users`
+
+Provision a new user. Body: a SCIM User resource (only `userName` and
+`externalId` are read; other fields real IdPs send — `name`, `emails`, etc. —
+are tolerated and ignored).
+
+> **`userName` must be a slug, not an email address.** Yuzu usernames are
+> alphanumeric plus `.`/`_`/`-` — no `@`. Stock Okta/Entra provisioning
+> defaults `userName` to the user's email and will `400` here; remap
+> `userName` to a non-email slug attribute in the IdP's attribute-mapping
+> config before assigning users. The `400` body's error message calls out
+> the offending character(s).
+
+**Responses:**
+
+| Status | Condition | Body |
+|---|---|---|
+| `201` + `Location` + `ETag` | Created | SCIM User representation |
+| `409` (`scim_type=uniqueness`) | `userName` already provisioned on a **currently-active** account | SCIM error envelope |
+
+Created at the fixed `role=user` with a discarded CSPRNG password — the
+account authenticates via SSO, never a local password. If the `userName`
+instead matches an existing SCIM-provisioned account that is currently
+**deactivated**, `POST` revives that account (a returning-employee
+reprovision) rather than `409`ing.
+
+#### `GET /scim/v2/Users/{id}`
+
+Read a single provisioned user by its SCIM `id`.
+
+| Status | Condition |
+|---|---|
+| `200` | Found — SCIM User representation |
+| `404` | Unknown `id` |
+
+#### `GET /scim/v2/Users?filter=userName eq "x"&startIndex=&count=`
+
+Existence check + pagination, the standard "does this user already exist"
+call a connector makes before create. **Only `userName eq "value"` is
+supported** (case-insensitive attribute/operator, double-quoted value); any
+other filter expression is rejected `400` (`scim_type=invalidFilter`).
+Response is a SCIM `ListResponse` envelope; `startIndex` is 1-based per RFC
+7644 §3.4.2.
+
+#### `PUT /scim/v2/Users/{id}`
+
+Replace the mutable identity fields (`externalId`, `active`). **If `active`
+differs from the account's current state, this triggers the identical
+deactivate/reactivate semantics documented under `PATCH` below** — some IdP
+connectors issue `PUT` rather than `PATCH` for lifecycle changes.
+
+| Status | Condition |
+|---|---|
+| `200` | Replaced — SCIM User representation |
+| `400` (`scim_type=mutability`) | Body includes a `userName` change — rename is out of scope this slice |
+| `404` | Unknown `id`, or the provenance/role guard rejects the target (see below) |
+
+#### `PATCH /scim/v2/Users/{id}`
+
+The primary lifecycle path. Both the pathless `{"value":{"active":false}}`
+and explicit `{"path":"active","value":false}` PatchOp forms are accepted.
+
+- **`active:false`** deprovisions — soft-deletes the auth account and
+  cascades session revocation.
+- **`active:true`** reactivates — restores the account and clears any stale
+  lockout. MFA is **not** restored; the user re-enrolls on next login.
+
+| Status | Condition |
+|---|---|
+| `200` | Applied — SCIM User representation |
+| `404` | Unknown `id`, or the provenance/role guard rejects the target (see below) |
+
+#### `DELETE /scim/v2/Users/{id}`
+
+Deprovision (equivalent to `PATCH`/`PUT active:false` for IdPs that issue a
+hard delete). `204` on success; `404` if unknown or guard-rejected.
+
+#### Provenance guard
+
+Every deactivate/reactivate/update/delete call above re-verifies **both**
+`provisioning_source == "scim"` **and** `role == "user"` on the target
+account immediately before mutating it, and refuses with **`404` — never
+`403`** (a `403` would confirm the resource exists; `404` is indistinguishable
+from "no such SCIM resource") plus a `scim.user.provenance_denied` audit row.
+This is what makes it safe to point an IdP's SCIM connector at this surface
+at all: a locally-created admin, or the `--break-glass-user` account, can
+never be deactivated by a SCIM call; SCIM-provisioned accounts are always
+`role=user` at creation so a compromised IdP cannot create an admin; and the
+`role` check means an operator-elevated former-SCIM account (later promoted
+by a human via the dashboard) also drops out of SCIM's write authority. See
+`docs/auth-architecture.md` "SCIM v2 provisioning" for the full threat
+discussion.
+
+#### Audit actions
+
+Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
+
+| Action | Result | When |
+|---|---|---|
+| `scim.user.provisioned` | `success` / `denied` / `failure` | `POST` succeeds (incl. a revived reprovision) / rejected `409` against an active account / rolls back `500` |
+| `scim.user.updated` | `success` / `failure` | `PUT /scim/v2/Users/{id}` succeeds / fails `500` |
+| `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write itself could not persist |
+| `scim.user.reactivated` | `success` / `failure` | `PATCH`/`PUT` sets `active:true`; `failure` on an audit-write error (set-and-proceed) |
+| `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed) |
+| `scim.user.provenance_denied` | `denied` | A mutating call targets an account failing the provenance or role guard |
+| `scim.auth.denied` | `denied` | Bearer-auth validation fails on any `/scim/v2/*` route, including discovery |
+
+#### Metrics
+
+`yuzu_scim_requests_total{op,status}`, `yuzu_scim_auth_failures_total`,
+`yuzu_scim_audit_write_failures_total`, `yuzu_scim_provenance_denied_total`.
+Full description: `docs/auth-architecture.md` "SCIM v2 provisioning" §
+Metrics.
 
 ---
 

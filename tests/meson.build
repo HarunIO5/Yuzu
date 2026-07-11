@@ -150,6 +150,10 @@ agent_test_exe = executable(
     'unit/test_dex_linux_sysfs.cpp',
     'unit/test_dex_rate_limiter.cpp',
     'unit/test_resilience_strategy.cpp',
+    'unit/test_thread_pool.cpp',
+    'unit/test_spark_disk.cpp',
+    'unit/test_spark_engine.cpp',
+    'unit/test_spark_mechanism.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
     'unit/test_agent_csr.cpp',
@@ -160,6 +164,7 @@ agent_test_exe = executable(
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
     'unit/test_installed_apps_registry_utf8.cpp',
+    'unit/test_service_binpath.cpp',
     'unit/test_installed_apps_inventory.cpp',
   ),
   include_directories: [
@@ -169,8 +174,15 @@ agent_test_exe = executable(
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
   ],
-  cpp_args: test_partial_init_args,
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep],
+  # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
+  # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
+  # as agents/core/meson.build gates guard_systemd.cpp/spark_service.cpp.
+  cpp_args: test_partial_init_args + agent_platform_args,
+  # catch2_nomain_dep (#1648 diagnostic): yuzu_agent_tests supplies its own main()
+  # via unit/test_runner_main.cpp, so it links Catch2 without Catch2Main.
+  # spdlog_dep (brings fmt): test_thread_pool.cpp instantiates spdlog logging in
+  # thread_pool.hpp directly in the test TU, so it needs fmt symbols linked here.
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
@@ -193,6 +205,8 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('wintrust') # tar_module_etw.cpp WinVerifyTrust
   tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CryptQueryObject
   tar_test_deps += cxx.find_library('version')  # tar_proc_perf.cpp GetFileVersionInfoW
+  tar_test_deps += cxx.find_library('wevtapi')  # tar_netconn_win.cpp EvtQuery/EvtRender
+  tar_test_deps += cxx.find_library('ws2_32')   # winsock2 symbols the iphlpapi/netioapi headers in tar_netqual_boot.cpp pull in
   tar_test_deps += cxx.find_library('mpr')      # tar_mapdrive_collector.cpp WNet outbound
   tar_test_deps += cxx.find_library('netapi32') # tar_mapdrive_collector.cpp NetSessionEnum inbound
 elif host_machine.system() == 'darwin'
@@ -214,6 +228,7 @@ tar_test_exe = executable(
   'yuzu_tar_tests',
   files(
     'unit/test_tar_diff.cpp',
+    'unit/test_tar_netconn.cpp',
     'unit/test_tar_software.cpp',
     'unit/test_tar_store.cpp',
     'unit/test_tar_schema_registry.cpp',
@@ -241,6 +256,8 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_proc_etw.cpp',
     '../agents/plugins/tar/src/tar_proc_es.cpp',
     '../agents/plugins/tar/src/tar_module_etw.cpp',
+    '../agents/plugins/tar/src/tar_netqual_boot.cpp',
+    '../agents/plugins/tar/src/tar_netconn_win.cpp',
     '../agents/plugins/tar/src/tar_mapdrive_collector.cpp',
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
@@ -263,6 +280,7 @@ if build_server
       'unit/server/test_auth_routes.cpp',
       'unit/server/test_auth_routes_mfa.cpp',
       'unit/server/test_auth_jit_elevation.cpp',
+      'unit/server/test_auth_sso_identity.cpp',
       'unit/server/test_auth_routes_hardened.cpp',
       'unit/server/test_settings_routes_mfa.cpp',
       'unit/server/test_totp.cpp',
@@ -274,6 +292,7 @@ if build_server
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
       'unit/server/test_nvd.cpp',
+      'unit/server/test_cpe_identity_resolver.cpp',
       'unit/server/test_update_registry.cpp',
       'unit/server/test_https_config.cpp',
       'unit/server/test_response_store.cpp',
@@ -305,6 +324,7 @@ if build_server
       'unit/server/test_schedule_routes.cpp',
       'unit/server/test_schedule_runner.cpp',
       'unit/server/test_rbac_store.cpp',
+      'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_provider.cpp',
       'unit/server/test_oidc_routes.cpp',
       'unit/server/test_saml_provider.cpp',
@@ -383,6 +403,9 @@ if build_server
       'unit/server/test_rest_guaranteed_state.cpp',
       'unit/server/test_discovery_routes.cpp', # A2 discovery surface (Issue 17.1)
       'unit/server/test_security_headers.cpp',
+      'unit/server/test_on_behalf_guard.cpp', # ADR-0022 PR 1.1 reserved-key guard
+      'unit/server/test_grpc_on_behalf_enforce.cpp', # ADR-0022 PR 1.1 gRPC end-to-end enforcement
+      'unit/server/test_principal_class.cpp', # ADR-0022 PR 1.2 actor-class label
       'unit/server/test_insecure_tls_gate.cpp',
       'unit/server/test_settings_routes_users.cpp',
       'unit/server/test_settings_routes_dex_alerts.cpp',
@@ -405,6 +428,8 @@ if build_server
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_vuln_finding_store.cpp',
+      'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_device_inventory_store.cpp',
       'unit/server/test_app_perf_daily_store.cpp',
       'unit/server/test_app_perf_ingestion.cpp',
@@ -412,6 +437,9 @@ if build_server
       'unit/server/test_app_perf_group_reader.cpp',
       'unit/server/test_app_perf_cohort_reader.cpp',
       'unit/server/test_pg_array.cpp',
+      'unit/server/test_scim_store.cpp',
+      'unit/server/test_scim_json.cpp',
+      'unit/server/test_scim_routes.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

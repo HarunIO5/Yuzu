@@ -26,6 +26,7 @@
 #include "ca_store.hpp"
 #include "default_certs.hpp"
 #include "key_provider.hpp"
+#include "scim_routes.hpp"
 #include "x509_ca.hpp"
 #include "compliance_eval.hpp"
 #include "custom_properties_store.hpp"
@@ -36,7 +37,11 @@
 #include "execution_event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
+#include "grpc_on_behalf_interceptor.hpp"
 #include "instruction_store.hpp"
+#include "on_behalf_guard.hpp"
+#include "principal_class.hpp"
+#include "rest_a4_envelope_http.hpp"
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
@@ -90,6 +95,7 @@
 #include "preflight_routes.hpp"
 #include "verify_routes.hpp"
 #include "preflight_run_store.hpp"
+#include "vuln_finding_store.hpp"
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
@@ -293,6 +299,20 @@ public:
           api_rate_limiter_(cfg_.rate_limit), login_rate_limiter_(cfg_.login_rate_limit) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
+        metrics_.describe("yuzu_nvd_total_cves", "Distinct CVEs in the local NVD catalog", "gauge");
+        metrics_.describe("yuzu_nvd_backfill_complete",
+                          "1 when the newest-first NVD backfill has reached its floor, else 0",
+                          "gauge");
+        metrics_.describe("yuzu_nvd_sync_failures_total",
+                          "NVD sync window failures by reason (connection/http_429/http_403/"
+                          "http_other/parse)",
+                          "counter");
+        // Initialise every reason series to 0 so the counter (and its HELP/TYPE)
+        // is present in /metrics on a healthy server — otherwise absent()-style
+        // alerts misfire and Grafana shows "No data" until the first failure (sre).
+        for (auto r : kNvdCountedReasons) {
+            metrics_.counter("yuzu_nvd_sync_failures_total", {{"reason", nvd_reason_label(r)}});
+        }
         metrics_.describe("yuzu_server_default_certs_active",
                           "1 when running with built-in per-install default certificates, else 0",
                           "gauge");
@@ -311,8 +331,32 @@ public:
                           "histogram");
         metrics_.describe("yuzu_grpc_requests_total", "Total gRPC requests by method and status",
                           "counter");
-        metrics_.describe("yuzu_http_requests_total", "Total HTTP requests by path and status",
+        metrics_.describe("yuzu_http_requests_total",
+                          "Total HTTP requests by method, status, and principal_class",
                           "counter");
+        // Pre-seed the closed principal_class dimension (docs/observability-
+        // conventions.md — every value of a closed-set label is initialised at
+        // startup, matching yuzu_onbehalf_rejected_total below). method/status
+        // are NOT closed sets, so a single representative GET/200 point per
+        // class is the seed — not a cross-product, which would be unbounded.
+        // "engine" is deliberately excluded: it is Phase-4-reserved and never
+        // emitted today (principal_class.hpp), so pre-seeding it now would
+        // advertise a series that cannot occur until that phase ships.
+        for (auto pc : {"human", "agent", "none"}) {
+            metrics_.counter("yuzu_http_requests_total",
+                             {{"method", "GET"}, {"status", "200"}, {"principal_class", pc}});
+        }
+        // ADR-0022 Interim rules (execution-plan PR 1.1): rejected on-behalf-of
+        // assertions, by ingress surface. Pre-seeded to 0 per
+        // docs/observability-conventions.md so absent() alerts stay meaningful.
+        metrics_.describe("yuzu_onbehalf_rejected_total",
+                          "Requests rejected for carrying a reserved on-behalf-of "
+                          "header/metadata key (ADR-0022) by surface",
+                          "counter");
+        metrics_.counter("yuzu_onbehalf_rejected_total",
+                         {{"surface", "http"}, {"event", "security"}});
+        metrics_.counter("yuzu_onbehalf_rejected_total",
+                         {{"surface", "grpc"}, {"event", "security"}});
         // PostgreSQL substrate pool metrics (#1320 PR 3 / #1368 observability).
         // Gauges are sampled every recompute cycle; counters/histogram are fed
         // live by the pool's observer hooks wired at pool construction.
@@ -713,6 +757,43 @@ public:
         // "Sign out everywhere" which also revokes API tokens).
         metrics_.describe("yuzu_auth_sessions_revoked_total",
                           "Total session revocations, by caller, result, and scope", "counter");
+        // Durable SSO identity provisioning observability (#1852 governance
+        // round, sec-LOW/UP-5). Incremented on every successful
+        // upsert_sso_identity call (first-provision AND re-login refresh),
+        // labelled by source so an IdP-side provisioning flood is visible
+        // independently of ordinary login volume.
+        metrics_.describe("yuzu_auth_sso_provision_total",
+                          "Total durable SSO identity provision/refresh upserts, by source",
+                          "counter");
+        // SCIM v2 provisioning observability (governance hardening round,
+        // M-METRICS). Registered unconditionally (like every other describe()
+        // in this constructor) even when --scim-enable is off, so Prometheus
+        // alert rules can be authored up front; the series simply never
+        // increments on a disabled surface.
+        metrics_.describe("yuzu_scim_requests_total",
+                          "Total /scim/v2/Users requests, by op "
+                          "(create|get|list|replace|patch|delete) and status (2xx|4xx|5xx)",
+                          "counter");
+        metrics_.describe("yuzu_scim_auth_failures_total",
+                          "Total /scim/v2/* requests rejected by the bearer gate — a "
+                          "credential-guess/replay signal against a surface that can "
+                          "provision/deprovision operator accounts",
+                          "counter");
+        metrics_.describe("yuzu_scim_audit_write_failures_total",
+                          "Total SCIM audit rows that failed to persist, by action. Every "
+                          "action on this surface, including the three termination actions "
+                          "(deactivated/deleted/reactivated), is set-and-proceed: the mutation "
+                          "already committed, so a lost audit row does not roll it back. This "
+                          "metric is the CC6.8 evidence-integrity alert signal — a sustained "
+                          "non-zero rate means the SCIM audit trail has gaps, not that the "
+                          "mutation itself failed",
+                          "counter");
+        metrics_.describe("yuzu_scim_provenance_denied_total",
+                          "Total SCIM mutations refused because the target account's "
+                          "provisioning_source is not 'scim' (or its role was elevated outside "
+                          "SCIM's ownership) — SCIM attempting to touch an account it does not "
+                          "own is a misconfigured-IdP or compromised-IdP signal",
+                          "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -1155,8 +1236,11 @@ public:
         nvd_db_ = std::make_shared<NvdDatabase>(nvd_path);
 
         if (cfg_.nvd_sync_enabled && nvd_db_->is_open()) {
-            nvd_sync_ = std::make_unique<NvdSyncManager>(nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy,
-                                                         cfg_.nvd_sync_interval);
+            nvd_sync_ = std::make_unique<NvdSyncManager>(
+                nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy, cfg_.nvd_sync_interval,
+                cfg_.nvd_backfill_years);
+            // Failure counts are surfaced via SyncStatus and emitted from the /metrics
+            // scrape (pull model, #1909) — no sync-thread→metrics_ callback.
             // #1867: do NOT start the background thread here. Its first action is
             // an uncancellable NVD fetch; if a LATER ctor step fails closed (e.g.
             // the Postgres substrate probe below sets startup_failed_), ~ServerImpl
@@ -1274,6 +1358,19 @@ public:
             if (!deployment_run_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: deployment-run store migration/open failed "
                               "(database reachable but the deployment_run_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            }
+        }
+
+        // VulnFindingStore — born-on-PG CAVM findings + coverage projection.
+        // Same fail-CLOSED construction posture as the run stores (ADR-0012 §1).
+        // DORMANT: no matching engine writes to it yet (PR 4).
+        if (pg_pool_ && !startup_failed_) {
+            vuln_finding_store_ = std::make_unique<VulnFindingStore>(*pg_pool_);
+            if (!vuln_finding_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: vuln-finding store migration/open failed "
+                              "(database reachable but the vuln_finding_store schema could not be "
                               "created/opened)");
                 startup_failed_ = true;
             }
@@ -2722,6 +2819,16 @@ public:
         }
 
         grpc::ServerBuilder builder;
+        // ADR-0022 Interim rules (execution-plan PR 1.1): one interceptor on the
+        // ONE builder — covers agent, management, and gateway-upstream services
+        // and every future RPC method by construction (never a per-method check).
+        {
+            std::vector<std::unique_ptr<grpc::experimental::ServerInterceptorFactoryInterface>>
+                interceptor_factories;
+            interceptor_factories.push_back(
+                std::make_unique<OnBehalfRejectInterceptorFactory>(&metrics_));
+            builder.experimental().SetInterceptorCreators(std::move(interceptor_factories));
+        }
         builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 60000);
         builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 20000);
         builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
@@ -2749,6 +2856,9 @@ public:
             return;
         }
 
+        spdlog::info("[ADR-0022] on-behalf-of guard active: reserved headers rejected on "
+                     "HTTP (excl. health probes) and gRPC ingress; see "
+                     "docs/auth-architecture.md");
         spdlog::info("Yuzu Server listening on {} (agents) and {} (management)",
                      cfg_.listen_address, cfg_.management_address);
         if (gateway_service_) {
@@ -2770,6 +2880,26 @@ public:
             oidc_provider_, saml_provider_.get());
 
         start_web_server();
+
+        // M/H3 follow-up (2026-07-10 review): start_web_server() can set
+        // startup_failed_ (SCIM boot failure) and return before launching
+        // the web listener, but by this point the agent/management gRPC
+        // listeners are already live (BuildAndStart above). Re-check here,
+        // before spinning up any more threads or reaching
+        // agent_server_->Wait() below, so a SCIM boot failure genuinely
+        // halts the process instead of serving on the gRPC ports with a
+        // broken web/SCIM surface. stop() is safe to call this early — every
+        // thread/store it joins or resets is joinable()/nullptr-guarded, and
+        // it also runs from ~ServerImpl (guarded against double-entry by
+        // stop_entered_), so calling it here and letting the destructor run
+        // again afterward is a deliberate no-op the second time.
+        if (startup_failed_) {
+            spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
+                         "(SCIM boot failure); stopping the already-started agent/management "
+                         "gRPC listeners.");
+            stop();
+            return;
+        }
 
         // Start certificate hot-reload watcher
         if (cfg_.cert_reload_enabled && cfg_.https_enabled && web_server_) {
@@ -3315,6 +3445,10 @@ public:
         // (no background thread in slice 1, but keep the ADR-0012 teardown
         // discipline so a future DeploymentRunner can't UAF).
         deployment_run_store_.reset();
+        // VulnFindingStore borrows pg_pool_ — drop before the pool (no background
+        // thread this PR; keep the ADR-0012 teardown discipline so a future engine
+        // can't UAF).
+        vuln_finding_store_.reset();
         // Same discipline for the software-inventory store (gov cpp-safety): null the
         // borrowed raw pointers in both ingest services, then drop the store, BEFORE
         // the pool — otherwise the store briefly holds a dangling PgPool& after the
@@ -4615,9 +4749,58 @@ private:
             // sharing a source-IP bucket with authed REST traffic cannot
             // 429-starve the health probe. The endpoints themselves are
             // strictly read-only and documented as unauthenticated.
+            // Liveness/readiness probes are EXEMPT from the on-behalf-of guard
+            // below — a RECORDED ADR-0022 exception (documented in
+            // docs/auth-architecture.md; ledger entry lands with the ADR).
+            // Governance Gate 5 (CH-3/UP-5): a mesh/SSO proxy that stamps a
+            // reserved header on every request must not be able to 403 the
+            // probes and crash-loop the pod — a probe performs no
+            // identity-bearing action, nothing consumes the header on this
+            // path, and a bricked orchestrator hides the misconfiguration the
+            // guard exists to surface. Every other path rejects below.
             if (req.path == "/livez" || req.path == "/readyz" || req.path == "/health" ||
                 req.path == "/api/health") {
                 return httplib::Server::HandlerResponse::Unhandled;
+            }
+
+            // ADR-0022 Interim rules (execution-plan PR 1.1): the server accepts
+            // NO on-behalf-of assertion on any surface until server-verifiable
+            // delegation ships (Phase 5) — and client-asserted delegation stays
+            // rejected permanently even then. Reject (not ignore) before auth,
+            // the unauthenticated allowlist, and the rate limiter, so REST, MCP
+            // (same httplib instance), fragments, and static all reject; the four
+            // probe paths above are the single recorded exception.
+            // Pre-limiter placement means a reserved-header flood gets per-request
+            // 403s, not 429s — the scan is cheaper than the limiter lookup, and
+            // the warn is throttled in note_rejection so the flood can't fill the
+            // disk; the counter records every event. Log lines carry the CANONICAL
+            // reserved spelling plus sanitized method/path (httplib percent-decodes
+            // req.path, so raw control chars would otherwise forge security-log
+            // lines). Reserved names + rationale: on_behalf_guard.hpp; the agent
+            // gRPC channel gets the same guard via grpc_on_behalf_interceptor.hpp.
+            if (auto reserved = onbehalf::find_reserved_key(req.headers)) {
+                if (onbehalf::note_rejection(metrics_, "http")) {
+                    spdlog::warn(
+                        "[ADR-0022] rejected {} {} carrying reserved on-behalf-of "
+                        "header '{}' from {} (1 log per {} rejections; counter "
+                        "records all)",
+                        onbehalf::sanitize_for_log(req.method, 16),
+                        onbehalf::sanitize_for_log(req.path), *reserved,
+                        onbehalf::sanitize_for_log(req.remote_addr, 64),
+                        onbehalf::kLogEvery);
+                }
+                res.status = 403;
+                res.set_content(
+                    detail::a4_denial(
+                        res, 403,
+                        "on-behalf-of assertions are not accepted on any surface (ADR-0022); "
+                        "remove the reserved header",
+                        detail::A4ErrorOpts{
+                            .remediation = "remove the reserved header; see "
+                                           "docs/auth-architecture.md 'On-behalf-of "
+                                           "assertions rejected' (ADR-0022)"}),
+                    "application/json");
+                return httplib::Server::HandlerResponse::Handled;
             }
 
             // Rate limiting — check before auth to protect against brute force.
@@ -4685,17 +4868,11 @@ private:
             // rationale to /auth/oidc/start + /auth/callback).  Without these
             // exemptions, a non-authenticated user trying to start SSO would be
             // redirected to /login before the SAML flow handler runs.
-            if (req.path == "/login" || req.path == "/login/mfa" ||
-                req.path == "/login/mfa/enroll" || req.path == "/health" ||
-                req.path == "/api/health" || req.path == "/auth/oidc/start" ||
-                req.path == "/auth/callback" || req.path == "/api/v1/openapi.json" ||
-                req.path == "/auth/saml/start" || req.path == "/saml/acs" ||
-                // PKI PR4: the CA root cert + CRL are public by design — clients
-                // and browsers need them to establish trust / check revocation
-                // before they have any session. Exact-match only; /api/v1/ca/issued
-                // and /api/v1/ca/revoke remain Security-gated below.
-                req.path == "/api/v1/ca/root" || req.path == "/api/v1/ca/crl" ||
-                req.path.starts_with("/static/")) {
+            // The exact exempt-path decision lives in `is_login_exempt_path`
+            // (web_utils.hpp) so it has direct unit coverage (H1, 2026-07-08
+            // SCIM review) — this call site runs AFTER the rate limiter
+            // above, so rate-limiting stays in effect for every exempt path.
+            if (is_login_exempt_path(req.path)) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
@@ -4780,9 +4957,14 @@ private:
                 res.set_header("Access-Control-Max-Age", "86400");
             }
 
+            // principal_class: bounded presentation-level actor class (ADR-0022,
+            // execution-plan PR 1.2) — human / agent / none today, engine reserved for
+            // Phase 4. See principal_class.hpp for the classification contract.
             metrics_
                 .counter("yuzu_http_requests_total",
-                         {{"method", req.method}, {"status", std::to_string(res.status)}})
+                         {{"method", req.method},
+                          {"status", std::to_string(res.status)},
+                          {"principal_class", std::string(principal_class_of(req))}})
                 .increment();
         });
 
@@ -4794,6 +4976,33 @@ private:
                     .set(static_cast<double>(mgmt_group_store_->count_groups()));
                 metrics_.gauge("yuzu_server_group_members_total")
                     .set(static_cast<double>(mgmt_group_store_->count_all_members()));
+            }
+            // Refresh NVD backfill gauges (multi-hour background job — needs to be
+            // observable; governance sre BLOCKING).
+            if (nvd_db_ && nvd_db_->is_open()) {
+                metrics_.gauge("yuzu_nvd_total_cves")
+                    .set(static_cast<double>(nvd_db_->total_cve_count()));
+                if (nvd_sync_) {
+                    auto st = nvd_sync_->status();
+                    metrics_.gauge("yuzu_nvd_backfill_complete").set(st.backfill_complete ? 1 : 0);
+                    // Pull model (#1909): the manager holds the authoritative monotonic
+                    // per-reason failure counts; emit them as yuzu_nvd_sync_failures_total by
+                    // incrementing the exported series by the delta since the last scrape
+                    // (Counter has no set()). No sync-thread→metrics_ callback → no teardown race.
+                    // The whole loop is serialized so two CONCURRENT /metrics scrapes (an HA
+                    // Prometheus pair) can't both read the same value(), compute the same delta,
+                    // and double-increment the counter (which would then stall until the real
+                    // tally re-exceeds it).
+                    std::lock_guard<std::mutex> emit_lock{nvd_metrics_scrape_mu_};
+                    for (auto r : kNvdCountedReasons) {
+                        const int i = nvd_reason_index(r);
+                        auto& c = metrics_.counter("yuzu_nvd_sync_failures_total",
+                                                   {{"reason", nvd_reason_label(r)}});
+                        const double delta = static_cast<double>(st.failure_counts[i]) - c.value();
+                        if (delta > 0)
+                            c.increment(delta);
+                    }
+                }
             }
             res.set_content(metrics_.serialize(), "text/plain; version=0.0.4; charset=utf-8");
         });
@@ -4856,6 +5065,7 @@ private:
                 offline_endpoint_store_ && offline_endpoint_store_->is_open();
             bool software_inventory_ok =
                 software_inventory_store_ && software_inventory_store_->is_open();
+            bool vuln_finding_ok = vuln_finding_store_ && vuln_finding_store_->is_open();
             bool app_perf_daily_ok = app_perf_daily_store_ && app_perf_daily_store_->is_open();
             bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
             bool device_inventory_ok =
@@ -4866,8 +5076,9 @@ private:
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
                                  guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
-                                 offline_endpoint_ok && software_inventory_ok && app_perf_daily_ok &&
-                                 app_perf_fleet_ok && device_inventory_ok && approval_ok;
+                                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
+                                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok &&
+                                 approval_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4885,6 +5096,7 @@ private:
                   {"ca", ca_ok ? "ok" : "error"},
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
                   {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
+                  {"vuln_finding_store", vuln_finding_ok ? "ok" : "error"},
                   {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"},
                   {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"},
                   {"device_inventory_store", device_inventory_ok ? "ok" : "error"}}},
@@ -5052,6 +5264,11 @@ private:
                 // ingest and no readiness signal — surface it (gov Pattern E).
                 {"software_inventory_store",
                  software_inventory_store_ && software_inventory_store_->is_open()},
+                // CAVM born-on-PG store (ADR-0012). Fail-closed at boot; a
+                // not-open post-boot state means the PR-4 matching engine would
+                // silently no-op findings persistence — surface it (Pattern E).
+                {"vuln_finding_store",
+                 vuln_finding_store_ && vuln_finding_store_->is_open()},
                 {"app_perf_daily_store",
                  app_perf_daily_store_ && app_perf_daily_store_->is_open()},
                 {"app_perf_fleet_store",
@@ -5082,6 +5299,19 @@ private:
                 // it is not on the request path, so report ok.
                 {"ca_store", !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open())},
                 {"ca_root", !cfg_.using_default_certs || (ca_store_ && ca_store_->has_root())},
+                // SRE Gate 6 HC-1: ScimStore is only constructed when
+                // --scim-enable is set (opt-in, mirrors the ca_store pattern
+                // above); a failed open/migration would otherwise silently
+                // reject every /scim/v2/* request while /readyz reported
+                // "ready". H3 (2026-07-08 review, defense-in-depth): also
+                // requires has_token() — the primary fix is that a failed
+                // set_token() at boot now sets startup_failed_ (server never
+                // reaches run()'s serve loop at all), but this term keeps
+                // /readyz honest on its own terms too, independent of that
+                // guard.
+                {"scim_store", !cfg_.scim_enable ||
+                                   (scim_store_ && scim_store_->is_open() &&
+                                    scim_store_->has_token())},
             };
 
             std::string failed_list;
@@ -5559,8 +5789,17 @@ private:
             auto session = require_auth(req, res);
             if (!session)
                 return;
+            // #1837: `username` is the STABLE authorization principal (an
+            // opaque `oidc:<iss>#<sub>` id for SSO sessions) — never render
+            // it alone as the nav-bar identity. `display_name` is the
+            // human-readable label consumed by every page's nav/context
+            // bar JS below; falls back to `username` for a legacy session
+            // created before this field existed.
             auto j = nlohmann::json(
-                {{"username", session->username}, {"role", auth::role_to_string(session->role)}});
+                {{"username", session->username},
+                {"display_name",
+                 session->display_name.empty() ? session->username : session->display_name},
+                {"role", auth::role_to_string(session->role)}});
             // Add RBAC role if enabled
             if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
                 j["rbac_enabled"] = true;
@@ -5865,13 +6104,20 @@ private:
                                  return;
                              }
                              nlohmann::json j;
-                             j["enabled"] = true;
+                             // "enabled" reflects whether the sync manager exists, not
+                             // merely whether the DB file is open: under --no-nvd-sync the
+                             // catalog DB is still open (for matching) but sync is off, so
+                             // reporting enabled=true then 503-ing POST /api/nvd/sync was
+                             // contradictory (#1889 review r2).
+                             j["enabled"] = (nvd_sync_ != nullptr);
                              j["total_cves"] = nvd_db_->total_cve_count();
                              if (nvd_sync_) {
                                  auto st = nvd_sync_->status();
                                  j["syncing"] = st.syncing;
                                  j["last_sync_time"] = st.last_sync_time;
                                  j["last_error"] = st.last_error;
+                                 j["backfill_complete"] = st.backfill_complete;
+                                 j["backfill_oldest_published"] = st.backfill_oldest_published;
                              }
                              res.set_content(j.dump(), "application/json");
                          });
@@ -5887,8 +6133,10 @@ private:
                     "application/json");
                 return;
             }
-            // Run sync in a detached thread so we don't block the HTTP response
-            std::thread([this] { nvd_sync_->sync_now(); }).detach();
+            // Ask the background loop to sync at its next wake and return at once.
+            // (A detached thread here could outlive the manager and use-after-free
+            // db_/fetcher_ during the hours-long backfill — governance BLOCKING.)
+            nvd_sync_->request_sync();
             res.set_content(R"({"status":"sync_started"})", "application/json");
         });
 
@@ -5903,7 +6151,7 @@ private:
                     "application/json");
                 return;
             }
-            // Parse inventory: array of {name, version} or pipe-delimited lines
+            // Parse inventory: JSON body with an "inventory" array of {name, version}.
             std::vector<SoftwareItem> inventory;
             try {
                 auto body = nlohmann::json::parse(req.body);
@@ -9996,6 +10244,63 @@ private:
                 return import_subordinate_chain(intermediate_pem, parent_chain_pem);
             });
 
+        // -- SCIM v2 provisioning (/scim/v2/*) — enterprise IdP auto-(de)provisioning --
+        // Entirely inert when disabled: no store, no routes, no route table
+        // entries at all. main.cpp already refuses to start if --scim-enable is
+        // set without --scim-token or without HTTPS (CC6.2 fail-closed).
+        if (cfg_.scim_enable) {
+            scim_store_ = std::make_unique<ScimStore>(cfg_.db_dir() / "auth.db");
+            if (!scim_store_->is_open()) {
+                // H3 (2026-07-08 review): previously logged-and-continued,
+                // which left /scim/v2/* permanently rejecting every request
+                // (require_bearer always fails against a closed store)
+                // while /readyz's "scim_store" check (below) reported
+                // green — an operator would have no signal that the
+                // surface never came up. Set startup_failed_ instead; the
+                // guard immediately below this block aborts start_web_server()
+                // before the web listener launches, and run() (after its
+                // start_web_server() call) stops the already-started
+                // agent/management gRPC listeners and returns, so main.cpp
+                // exits non-zero on startup_failed() — matching main.cpp's
+                // own "refuses to start without a token" fail-closed posture
+                // for this same feature.
+                spdlog::error("SCIM: failed to open auth.db for the SCIM resource/token store — "
+                             "refusing to start.");
+                startup_failed_ = true;
+            } else if (!scim_store_->set_token(cfg_.scim_token, "boot")) {
+                // H3: same reasoning — a persist failure here is just as
+                // fatal to the surface as a closed store (require_bearer
+                // has no token to validate against), but is_open() alone
+                // would still read true, so this branch needs its own
+                // fail-closed guard rather than relying on the store-open
+                // check above. See the comment on the is_open() branch above
+                // for how startup_failed_ actually halts serving.
+                spdlog::error("SCIM: failed to store the configured --scim-token — "
+                             "refusing to start.");
+                startup_failed_ = true;
+            }
+            scim_routes_ = std::make_unique<ScimRoutes>();
+            scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
+                                          audit_store_.get());
+        }
+
+        // M/H3 follow-up (2026-07-10 review): a SCIM boot failure above set
+        // startup_failed_, but nothing checked it here — start_web_server()
+        // continued registering every other route and unconditionally
+        // launched the web listener thread below, and run() went on to
+        // agent_server_->Wait() with no re-check. The server ended up
+        // SERVING (agent gRPC + web) despite "refusing to start". Abort now:
+        // skip the rest of route registration and never launch the web
+        // listener. run() re-checks startup_failed_ immediately after its
+        // start_web_server() call and stops the already-started agent/
+        // management gRPC listeners before reaching agent_server_->Wait().
+        if (startup_failed_) {
+            spdlog::critical(
+                "start_web_server(): aborting — SCIM boot failure above set startup_failed_; "
+                "the web listener will not be started.");
+            return;
+        }
+
         // -- A2 discovery surface (roadmap Issue 17.1): /api/v1/discover/* --------
         // Agentic-first (A1/A2, docs/agentic-first-principle.md) — RBAC permission
         // catalog, published instruction definitions, REST route catalog (subset of
@@ -10460,6 +10765,9 @@ private:
             listen_port = cfg_.https_port;
 
             // Start HTTP→HTTPS redirect server
+            // No on_behalf_guard here (ADR-0022): this instance routes nothing —
+            // every request gets a 301 and the re-request hits the guarded main
+            // listener, so this is not a bypass of the pre-routing chokepoint.
             if (cfg_.https_redirect) {
                 redirect_server_ = std::make_unique<httplib::Server>();
                 auto https_port = cfg_.https_port;
@@ -10667,6 +10975,9 @@ private:
     // NVD CVE feed
     std::shared_ptr<NvdDatabase> nvd_db_;
     std::unique_ptr<NvdSyncManager> nvd_sync_;
+    // Serializes the /metrics emit of yuzu_nvd_sync_failures_total so two concurrent scrapes
+    // can't double-apply the same per-reason delta (#1912 review).
+    mutable std::mutex nvd_metrics_scrape_mu_;
 
     // OTA agent updates
     std::unique_ptr<UpdateRegistry> update_registry_;
@@ -10685,6 +10996,10 @@ private:
     /// declared after it so it destructs before the pool; reset in stop().
     std::unique_ptr<PreflightRunStore> preflight_run_store_;
     std::unique_ptr<DeploymentRunStore> deployment_run_store_;
+    /// Born-on-PG CAVM findings + per-agent coverage projection (ADR-0012).
+    /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
+    /// DORMANT this PR: constructed + wired into /readyz+/healthz, no engine yet.
+    std::unique_ptr<VulnFindingStore> vuln_finding_store_;
     std::unique_ptr<AuditStore> audit_store_;
     std::unique_ptr<TagStore> tag_store_;
 
@@ -10823,6 +11138,12 @@ private:
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
     std::unique_ptr<CaRoutes> ca_routes_; // PKI PR4: /api/v1/ca/*
+    // SCIM v2 provisioning (/scim/v2/*) — only constructed when --scim-enable.
+    // ScimStore opens its OWN connection to the SAME auth.db AuthDB manages
+    // (see scim_store.hpp); scim_routes_ borrows non-owning ScimStore*/
+    // AuthManager*/AuditStore* pointers, all of which outlive it.
+    std::unique_ptr<ScimStore> scim_store_;
+    std::unique_ptr<ScimRoutes> scim_routes_;
     std::unique_ptr<DiscoverRoutes> discover_routes_; // A2: /api/v1/discover/* (Issue 17.1)
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
