@@ -552,7 +552,10 @@ yuzu_server_core_dep = declare_dependency(
   # violation). main.cpp transitively includes <httplib.h> via scim_routes.hpp
   # without this propagated, which corrupted httplib::Client objects on first
   # use (SIGSEGV in NvdClient::fetch_paginated's first request).
-  compile_args: https_cpp_args,
+  # CPPHTTPLIB_LISTEN_BACKLOG doesn't affect class layout (no ODR hazard), but
+  # is propagated for the same reason: without it, a consumer TU falls back to
+  # httplib's default listen() backlog of 5 instead of the intended 128.
+  compile_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'],
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
                  sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
                  libpq_dep, yuzu_key_provider_dep] + auth_crypto_deps + https_deps
