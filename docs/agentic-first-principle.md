@@ -1,6 +1,6 @@
 # Agentic-First Principle
 
-**Version:** 1.0 | **Date:** 2026-05-01 | **Status:** Architectural rule (proposed)
+**Version:** 1.1 | **Date:** 2026-05-01 (A1–A4), 2026-07-11 (A5 added) | **Status:** Architectural rule (proposed)
 
 ## What this document is
 
