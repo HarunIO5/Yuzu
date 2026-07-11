@@ -413,16 +413,21 @@ state, schema, and contract consistency. Check:
    in the UI)? A dashboard fragment is not an API twin.
 
 9. **A5 agentic context contract** (exec-plan Decision 16) — for any
-   new or materially changed MCP tool: standard spec annotations
-   (`title`/`readOnlyHint`/`destructiveHint`/`idempotentHint`/
-   `openWorldHint`; destructive/idempotent semantics machine-readable,
-   never prose-only), decision-grade description (when to use, workflow
-   chaining, empty-result meaning), bounded documented input schema,
-   typed output schema for stable shapes, honest `retry_after_ms` on
+   new or materially changed MCP tool ("material" = any change to
+   tier, securable/operation, dispatch behavior, side-effect set, or
+   spec-visible `tools/list`/`initialize` output — per-se, not
+   arguable): standard spec annotations (`title`/`readOnlyHint`/
+   `destructiveHint`/`idempotentHint`/`openWorldHint`; destructive/
+   idempotent semantics machine-readable, never prose-only),
+   decision-grade description (when to use, workflow chaining,
+   empty-result meaning), bounded documented input schema, typed
+   output schema for stable shapes, honest `retry_after_ms` on
    retryable errors; if the PR adds a tool family or reshapes the
    operating model, the `initialize.instructions` blob is updated in
    the same PR. Contract text: `docs/agentic-first-principle.md` §A5.
-   security-guardian co-checks annotation truthfulness against tier.
+   security-guardian co-checks `readOnlyHint`/`destructiveHint`/
+   `idempotentHint` truthfulness against tier + dispatch behavior —
+   a false safe-direction hint is a BLOCKING (HIGH) finding.
 
 ## Output format
 
