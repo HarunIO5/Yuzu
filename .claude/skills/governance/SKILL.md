@@ -503,7 +503,7 @@ Launch all three in one message: **compliance-officer**, **sre**, **enterprise-r
 Each agent gets the same Gate 1-5 context and focuses on a different aspect:
 - **compliance-officer** — SOC 2 control alignment, evidence chain, audit traceability
 - **sre** — observability (metrics, alerts), recovery paths, health probes, capacity
-- **enterprise-readiness** — customer-facing assurance, pilot-visible rough edges, upgrade notes, breaking changes doc coverage
+- **enterprise-readiness** — customer-facing assurance, pilot-visible rough edges, upgrade notes, breaking changes doc coverage; also reviews the A5 exception ledger (`docs/agentic-first-principle.md` §A5 Exceptions) — every entry must carry an issue number + revisit-by date; stale or undated entries are findings
 
 Use the same structural preamble as Gate 4 agents, vary the "Your job" stanza to the agent's domain.
 
