@@ -30,6 +30,8 @@ Here are the key concepts you will use in this tutorial:
 
 - **InstructionSet** -- A permission boundary that groups related definitions together and declares which roles can author, execute, and approve the definitions it contains.
 
+:memo: **Note:** Every step will can be completed via the **Visual interface** or the **Command Line**
+
 Let's build all of this up, one step at a time.
 
 ---
@@ -38,7 +40,26 @@ Let's build all of this up, one step at a time.
 
 Start with the simplest possible instruction definition -- a read-only question that calls the `os_info` plugin's `os_name` action to return the operating system name from every targeted endpoint.
 
-### Define it in YAML
+### Visual Interface - Use the GUI to create the definition
+
+Start by going to the instructions page and clicking the new definitions button. Then enter in the following the details in the appropriate fields
+
+<img width="1763" height="486" alt="image" src="https://github.com/user-attachments/assets/a83c4474-adb9-4601-bd65-c01b59642a96" />
+
+### Visual Interface - Validate & save the Yaml definitions
+
+Click the validate yaml before saving the instruction definition
+
+<img width="1763" height="667" alt="image" src="https://github.com/user-attachments/assets/fed45c5a-93ac-46f2-9dcf-56fb230580f9" />
+
+### Visual Interface - Execute it
+
+Go to the executions tab, find the instructions definition we just saved in the dropdown and click the execute button
+
+<img width="1763" height="486" alt="image" src="https://github.com/user-attachments/assets/61233107-fbfd-4070-9529-0492d770b265" />
+
+
+### Command Line - Define it in YAML
 
 Create a file called `hello-system-info.yaml`:
 
@@ -60,7 +81,7 @@ spec:
 
 This YAML is the canonical authoring format. The server's import API accepts JSON, so you convert the relevant fields when posting.
 
-### Import it via the API
+### Command Line - Import it via the API
 
 ```bash
 curl -s -X POST http://localhost:8080/api/instructions/import \
@@ -83,12 +104,6 @@ Expected response:
 ```
 
 The server assigns a unique ID and persists the definition in its SQLite store. An audit event is recorded: who imported it, when, and from where.
-
-### Or Use the GUI to create the definition
-
-Start by going to the instructions page and click the new definitions button. Then enter in the following the fields
-
-<img width="1763" height="486" alt="image" src="https://github.com/user-attachments/assets/a83c4474-adb9-4601-bd65-c01b59642a96" />
 
 ### Verify the definition exists
 
@@ -120,7 +135,7 @@ Expected response:
 }
 ```
 
-### Execute it
+### Command Line - Execute it
 
 Now dispatch the command to all connected agents:
 
