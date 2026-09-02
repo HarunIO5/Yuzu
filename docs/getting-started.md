@@ -84,6 +84,12 @@ Expected response:
 
 The server assigns a unique ID and persists the definition in its SQLite store. An audit event is recorded: who imported it, when, and from where.
 
+### Or Use the GUI to create the definition
+
+Start by going to the instructions page and click the new definitions button. Then enter in the following the fields
+
+<img width="1763" height="486" alt="image" src="https://github.com/user-attachments/assets/a83c4474-adb9-4601-bd65-c01b59642a96" />
+
 ### Verify the definition exists
 
 ```bash
