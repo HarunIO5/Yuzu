@@ -30,7 +30,7 @@ Here are the key concepts you will use in this tutorial:
 
 - **InstructionSet** -- A permission boundary that groups related definitions together and declares which roles can author, execute, and approve the definitions it contains.
 
-:memo: **Note:** Every step will can be completed via the **Visual interface** or the **Command Line**
+:memo: **Note:** Every step will be completed via the **Visual interface** or the **Command Line**
 
 Let's build all of this up, one step at a time.
 
@@ -46,7 +46,7 @@ Start by going to the instructions page and clicking the new definitions button.
 
 <img width="1763" height="486" alt="image" src="https://github.com/user-attachments/assets/a83c4474-adb9-4601-bd65-c01b59642a96" />
 
-### Visual Interface - Validate & save the Yaml definitions
+### Visual Interface - Validate & save the YAML definitions
 
 Click the validate yaml before saving the instruction definition
 
@@ -56,8 +56,11 @@ Click the validate yaml before saving the instruction definition
 
 Go to the executions tab, find the instructions definition we just saved in the dropdown and click the execute button
 
-<img width="1763" height="486" alt="image" src="https://github.com/user-attachments/assets/61233107-fbfd-4070-9529-0492d770b265" />
+<img width="1757" height="333" alt="image" src="https://github.com/user-attachments/assets/d0bab073-b8a2-4aa9-8700-6fee3b7c31ad" />
 
+Expected Responses:
+
+<img width="1787" height="616" alt="image" src="https://github.com/user-attachments/assets/d24e48da-94c1-47b2-9f18-9a62b1416a34" />
 
 ### Command Line - Define it in YAML
 
@@ -159,7 +162,7 @@ Expected response:
 }
 ```
 
-### View the results
+### Command Line - View the results
 
 ```bash
 curl -s "http://localhost:8080/api/responses/os_info-a1b2c3d4e5f6g7h8" \
@@ -201,7 +204,47 @@ Expected response:
 
 The first example had no inputs -- it ran the same action on every agent. Most real-world instructions need parameters. Let's create a definition that inspects a specific service by name.
 
-### Define it in YAML
+### Visual Interface - Define it in YAML
+
+Start by going to the instructions page and clicking the new definitions button. Then enter in the following the details in the appropriate fields
+
+<img width="1760" height="477" alt="image" src="https://github.com/user-attachments/assets/9981de85-2bb1-40fa-a5dc-b4d476d19fc8" />
+
+Add the following parameter information to the bottom of the YAML.
+
+```yaml
+parameters:
+    type: object
+    required: [serviceName]
+    properties:
+      serviceName:
+        type: string
+        displayName: Service Name
+        description: The name of the service to inspect.
+        validation:
+          maxLength: 256
+  readablePayload: "Inspect service '${serviceName}'"
+```
+
+<img width="1764" height="868" alt="image" src="https://github.com/user-attachments/assets/4ae2dbb4-acd1-410d-b6ad-e1327f7b6a83" />
+
+### Visual Interface - Validate & Save the YAML definitions
+
+Click the validate yaml before saving the instruction definition
+
+<img width="1758" height="913" alt="image" src="https://github.com/user-attachments/assets/fec0d4a5-e266-4328-b8d2-94eb02dae532" />
+
+### Visual Interface - Execute it
+
+Go to the executions tab, find the instructions definition we just saved in the dropdown and click the execute button
+
+<img width="1771" height="458" alt="image" src="https://github.com/user-attachments/assets/dc27e384-eb9b-4b3d-812e-813d937264a7" />
+
+Expected Results:
+
+<img width="1780" height="654" alt="image" src="https://github.com/user-attachments/assets/1e40cdc8-5fca-4c42-be96-bc924f7d5ada" />
+
+### Command Line - Define it in YAML
 
 Create a file called `service-inspect.yaml`:
 
